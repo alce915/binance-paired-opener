@@ -92,6 +92,8 @@ class MarketStreamController:
 
     def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
         self._subscribers.discard(queue)
+        if not self._subscribers and self._market_task is not None and not self._market_task.done():
+            asyncio.create_task(self.disconnect())
 
     async def connect(self, symbol: str) -> dict[str, Any]:
         symbol = symbol.upper()
@@ -416,6 +418,7 @@ class MarketStreamController:
 
 def format_sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
 
 
 

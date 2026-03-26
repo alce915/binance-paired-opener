@@ -73,6 +73,7 @@ class AccountRuntimeManager:
             if normalized not in self._settings.accounts:
                 raise ValueError(f"Unknown account {account_id}")
             await current_runtime.market.disconnect()
+            await current_runtime.service.close()
             await current_runtime.gateway.close()
             self._settings.persist_active_account(normalized)
             next_runtime = self._build_runtime(self._settings.active_account)
@@ -85,4 +86,6 @@ class AccountRuntimeManager:
 
     async def close(self) -> None:
         await self._runtime.market.disconnect()
+        await self._runtime.service.close()
         await self._runtime.gateway.close()
+

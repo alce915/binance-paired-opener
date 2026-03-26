@@ -496,6 +496,27 @@ async def test_abort_session_does_not_mark_status_aborted_before_task_exits(tmp_
             await task
 
 
+@pytest.mark.asyncio
+async def test_service_close_cancels_managed_tasks(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "service-close.db")
+    gateway = SimpleGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    async def blocker() -> None:
+        await asyncio.Future()
+
+    task = asyncio.create_task(blocker())
+    service._managed["test-session"] = ManagedSession(symbol="BTCUSDT", control=SessionControl(), task=task)
+
+    await service.close(timeout_seconds=0.05)
+
+    assert task.cancelled()
+    assert service._managed == {}
+
+
+
 
 @pytest.mark.asyncio
 async def test_create_session_rejects_open_amount_above_available_balance_ratio(tmp_path: Path) -> None:
@@ -650,6 +671,7 @@ async def test_create_single_close_session_align_mode_uses_larger_side_differenc
     assert payload["close_mode"] == "align"
     assert payload["selected_position_side"] == PositionSide.LONG.value
     assert Decimal(payload["target_close_qty"]) == Decimal("0.100")
+    await service.close()
 
 
 @pytest.mark.asyncio
@@ -713,6 +735,7 @@ async def test_create_single_open_session_align_mode_uses_smaller_side_differenc
     assert payload["selected_position_side"] == PositionSide.LONG.value
     assert Decimal(payload["target_open_qty"]) == Decimal("0.150")
     assert payload["leverage"] == 50
+    await service.close()
 
 
 @pytest.mark.asyncio

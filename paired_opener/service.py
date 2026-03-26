@@ -73,6 +73,25 @@ class OpenSessionService:
                 {"error": "Service restarted before session completion", "status": SessionStatus.EXCEPTION.value},
             )
 
+
+    async def close(self, *, timeout_seconds: float = 5.0) -> None:
+        managed_items = list(self._managed.items())
+        if not managed_items:
+            return
+        for _, managed in managed_items:
+            managed.control.paused = False
+            managed.control.aborted = True
+        tasks = [managed.task for _, managed in managed_items if not managed.task.done()]
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        self._managed.clear()
+
     async def create_session(self, request: OpenSessionRequest) -> OpenSession:
         return await self.create_open_session(request)
 

@@ -57,6 +57,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         self._rules_cache: dict[str, SymbolRules] = {}
         self._quote_cache: dict[str, Quote] = {}
         self._order_cache: dict[str, ExchangeOrder] = {}
+        self._symbol_leverage_cache: dict[str, int] = {}
         self._quote_tasks: dict[str, asyncio.Task[None]] = {}
         self._user_stream_task: asyncio.Task[None] | None = None
         self._listen_key: str | None = None
@@ -183,6 +184,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         payload = await self._signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
         if int(payload.get("leverage", 0)) != leverage:
             raise ExchangeStateError(f"Leverage mismatch for {symbol}: {payload}")
+        self._symbol_leverage_cache[symbol.upper()] = leverage
 
     async def get_symbol_rules(self, symbol: str) -> SymbolRules:
         symbol = symbol.upper()
@@ -253,19 +255,26 @@ class BinanceFuturesGateway(ExchangeGateway):
         }
 
     async def get_symbol_leverage(self, symbol: str) -> int:
+        target = symbol.upper()
+        cached = self._symbol_leverage_cache.get(target)
+        if cached is not None:
+            return cached
         if not self._account.api_key or not self._account.api_secret:
+            self._symbol_leverage_cache[target] = 1
             return 1
         try:
             payload = await self._signed_request("GET", "/papi/v1/um/positionRisk", use_papi=True)
         except Exception:
+            self._symbol_leverage_cache[target] = 1
             return 1
-        target = symbol.upper()
         for item in payload:
             if str(item.get("symbol", "")).upper() != target:
                 continue
             leverage = int(item.get("leverage") or 0)
             if leverage > 0:
+                self._symbol_leverage_cache[target] = leverage
                 return leverage
+        self._symbol_leverage_cache[target] = 1
         return 1
 
     async def get_account_overview(self) -> dict[str, Any]:
@@ -635,4 +644,5 @@ class BinanceFuturesGateway(ExchangeGateway):
         order = self._to_order(payload)
         self._order_cache[order.order_id] = order
         return order
+
 

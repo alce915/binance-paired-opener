@@ -152,3 +152,19 @@ async def test_run_simulation_blocks_when_open_amount_exceeds_available_balance_
     assert payload["status"] == "blocked"
     assert payload["rounds_completed"] == 0
 
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_without_subscribers_stops_market_loop() -> None:
+    gateway = SlowGateway()
+    controller = MarketStreamController(gateway)
+    queue = await controller.subscribe()
+    await controller.connect("BTCUSDT")
+    await gateway.started.wait()
+
+    controller.unsubscribe(queue)
+    await asyncio.sleep(0.05)
+
+    assert controller._state["status"] == "disconnected"
+    assert controller._market_task is None
+
