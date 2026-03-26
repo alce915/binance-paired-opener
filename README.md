@@ -1,74 +1,108 @@
-﻿# Binance Paired Opener
+# Binance Paired Opener
 
-鍩轰簬 Binance USD-M Futures 鐨勫弻鍚戦厤瀵瑰紑鍗曟湇鍔★紝褰撳墠鍖呭惈涓ゅ鐙珛鍏ュ彛锛?
-- 寮€鍗曟帶鍒跺彴涓庡紑鍗?API锛岄粯璁ょ鍙?`8000`
-- 璐︽埛鐩戞帶鎺у埗鍙颁笌鐩戞帶 API锛岄粯璁ょ鍙?`8010`
+基于 Binance USD-M Futures 的交易控制台与执行服务。
 
-## 瀹夎
+当前项目包含两套独立入口：
+- 开单控制台与交易 API，默认端口 `8000`
+- 账户监控控制台与监控 API，默认端口 `8010`
+
+## 安装
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e .[dev]
-Copy-Item .env.example .env
 ```
 
-## 鍚姩寮€鍗曟湇鍔?
-鍛戒护琛岋細
+## 主要功能
+
+- 双向开仓
+- 双向平仓
+- 单向开仓
+- 单向平仓
+- Binance 账户概览与当前持仓展示
+- 订单簿、SSE 推送、模拟执行
+- 多账户切换
+
+## 启动开单服务
+
+命令行：
 
 ```powershell
 paired-opener-api
 ```
 
-鑴氭湰锛?
+脚本：
+
 ```powershell
 scripts\restart_service.bat
 ```
 
-璁块棶鍦板潃锛?
-- 寮€鍗曟帶鍒跺彴: `http://127.0.0.1:8000/`
-- OpenAPI: `http://127.0.0.1:8000/docs`
+访问地址：
+- 控制台：`http://127.0.0.1:8000/`
+- OpenAPI：`http://127.0.0.1:8000/docs`
 
-## 鍚姩鐙珛鐩戞帶鏈嶅姟
+## 启动账户监控服务
 
-鍛戒护琛岋細
+命令行：
 
 ```powershell
 paired-opener-monitor-api
 ```
 
-鑴氭湰锛?
+脚本：
+
 ```powershell
 scripts\restart_monitor_service.bat
 ```
 
-璁块棶鍦板潃锛?
-- 鐩戞帶鎺у埗鍙? `http://127.0.0.1:8010/`
-- 鍋ュ悍妫€鏌? `http://127.0.0.1:8010/healthz`
-- 鐩戞帶蹇収鎺ュ彛: `http://127.0.0.1:8010/api/accounts`
-- 鐩戞帶 SSE: `http://127.0.0.1:8010/stream/accounts`
+访问地址：
+- 监控控制台：`http://127.0.0.1:8010/`
+- 健康检查：`http://127.0.0.1:8010/healthz`
+- 账户快照：`http://127.0.0.1:8010/api/accounts`
+- SSE：`http://127.0.0.1:8010/stream/accounts`
 
-## 璐︽埛閰嶇疆
+## 配置说明
 
-鐩戞帶鏈嶅姟鏀寔閫氳繃閰嶇疆鏂囦欢鏂板璐︽埛锛?
-- 绀轰緥鏂囦欢: `config\binance_accounts.example.json`
-- 瀹為檯鏂囦欢: `config\binance_accounts.json`
+### 开单系统账户配置
 
-## CLI 绀轰緥
+公开仓库中只保留模板文件：
+
+- `config\binance_api.env`
+
+请在本机私有环境中填写真实值，不要把真实 API Key / Secret 提交到 Git。
+
+### 监控系统账户配置
+
+监控子项目支持单独的配置文件：
+
+- 示例：`config\binance_accounts.example.json`
+- 本地私有配置：`config\binance_accounts.json`
+
+其中 `config\binance_accounts.json` 已被 `.gitignore` 排除，不会进入公开仓库。
+
+## 常用 CLI 示例
 
 ```powershell
 paired-opener create BTCUSDT long 50 3 0.001
 paired-opener list
 ```
 
-## 甯歌鎺掓煡
+## 测试
 
-- `http://127.0.0.1:8010/` 鏃犳硶璁块棶锛氶€氬父鏄洃鎺ф湇鍔℃湭鍚姩锛屽厛鎵ц `scripts\restart_monitor_service.bat`
-- `8010` 绔彛琚崰鐢細鏂拌剼鏈細鍏堝皾璇曢噴鏀剧洃鍚繘绋嬶紝鍐嶅惎鍔ㄧ洃鎺ф湇鍔?- 鍋ュ悍妫€鏌ュけ璐ワ細鍏堣闂?`http://127.0.0.1:8010/healthz`锛屽啀鏌ョ湅 `monitor.runtime.log`
-- 鏃ф湇鍔′笉鍙楀奖鍝嶏細`scripts\restart_service.bat` 鍙礋璐?`8000`锛屼笉浼氬惎鍔ㄦ垨鍋滄 `8010`
+```powershell
+python -m pytest -q
+```
 
-## 娉ㄦ剰
+## 常见排查
 
-- 鏈郴缁熶笉浼氫繚璇佲€滀笉鐖嗕粨鈥濓紝鍙礋璐ｆ寜绛栫暐鎵ц寮€鍗曘€佹暟閲忓榻愪笌寮傚父瀹¤
-- 褰撳墠鐗堟湰鑱氱劍寮€鍗曢摼璺笌璐︽埛鐩戞帶锛屼笉鍖呭惈瀹屾暣骞充粨銆佸噺浠撲笌椋庢帶鎵樼鑳藉姏
-- 鎺ュ叆涓荤綉鍓嶏紝寤鸿鍏堝湪娴嬭瘯鐜楠岃瘉璐︽埛妯″紡銆佸弬鏁般€佽疆璇㈤鐜囦笌鏉冮檺閰嶇疆
+- `8000` 控制台无法访问：先执行 `scripts\restart_service.bat`
+- `8010` 控制台无法访问：先执行 `scripts\restart_monitor_service.bat`
+- 监控接口异常：先访问 `http://127.0.0.1:8010/healthz`
+- Binance 主网接口返回 `451`：通常是当前出口 IP 被地区限制拦截
+
+## 注意
+
+- 本系统不保证“不爆仓”，只负责按策略执行、数量对齐与审计记录
+- 公开仓库中的配置文件均为模板，真实账户密钥应在本地私有环境中维护
+- 如果历史上真实 Binance API Key / Secret 已进入过本地文件，建议立即轮换
