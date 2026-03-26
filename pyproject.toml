@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binance-paired-opener"
+version = "0.1.0"
+description = "Binance USD-M paired opening service for hedged futures sessions."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "httpx>=0.28,<1.0",
+  "pydantic>=2.9,<3.0",
+  "pydantic-settings>=2.5,<3.0",
+  "typer>=0.12,<1.0",
+  "uvicorn>=0.32,<1.0",
+  "websockets>=13,<16",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9.0",
+  "pytest-asyncio>=0.24,<1.0",
+]
+
+[project.scripts]
+paired-opener-api = "paired_opener.main:run"
+paired-opener-monitor-api = "paired_opener.monitor_main:run"
+paired-opener = "paired_opener.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+include = ["paired_opener*"]
+
+[tool.setuptools.package-data]
+paired_opener = ["static/*.html"]
+

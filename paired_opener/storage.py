@@ -1,0 +1,368 @@
+﻿from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from paired_opener.domain import OpenSession, RoundExecution, SessionStatus
+
+
+def _json_dumps(payload: dict[str, Any]) -> str:
+    def encode(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if hasattr(value, "value"):
+            return value.value
+        return value
+
+    return json.dumps(payload, default=encode, ensure_ascii=True, sort_keys=True)
+
+
+def _json_loads(payload: str) -> dict[str, Any]:
+    try:
+        return json.loads(payload) if payload else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+class SqliteRepository:
+    def __init__(self, database_path: Path) -> None:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(database_path, check_same_thread=False)
+        self._connection.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        self._initialize()
+
+    def _initialize(self) -> None:
+        with self._connection:
+            self._connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    session_kind TEXT NOT NULL DEFAULT 'paired_open',
+                    account_id TEXT NOT NULL DEFAULT 'default',
+                    account_name TEXT NOT NULL DEFAULT '默认账户',
+                    symbol TEXT NOT NULL,
+                    trend_bias TEXT NOT NULL,
+                    leverage INTEGER NOT NULL,
+                    round_count INTEGER NOT NULL,
+                    round_qty TEXT NOT NULL,
+                    poll_interval_ms INTEGER NOT NULL,
+                    order_ttl_ms INTEGER NOT NULL,
+                    max_zero_fill_retries INTEGER NOT NULL,
+                    market_fallback_attempts INTEGER NOT NULL,
+                    round_interval_seconds INTEGER NOT NULL DEFAULT 3,
+                    open_mode TEXT,
+                    close_mode TEXT,
+                    selected_position_side TEXT,
+                    target_open_qty TEXT NOT NULL DEFAULT '0',
+                    target_close_qty TEXT NOT NULL DEFAULT '0',
+                    created_by TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    stage2_carryover_qty TEXT NOT NULL DEFAULT '0',
+                    final_alignment_status TEXT NOT NULL DEFAULT 'not_needed',
+                    final_unaligned_qty TEXT NOT NULL DEFAULT '0',
+                    completed_with_final_alignment INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS rounds (
+                    session_id TEXT NOT NULL,
+                    round_index INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    stage1_filled_qty TEXT NOT NULL,
+                    stage2_filled_qty TEXT NOT NULL,
+                    stage1_zero_fill_retries INTEGER NOT NULL,
+                    stage2_zero_fill_retries INTEGER NOT NULL,
+                    market_fallback_used INTEGER NOT NULL,
+                    notes_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    PRIMARY KEY (session_id, round_index)
+                );
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    round_index INTEGER,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            self._ensure_column("sessions", "session_kind", "TEXT NOT NULL DEFAULT 'paired_open'")
+            self._ensure_column("sessions", "account_id", "TEXT NOT NULL DEFAULT 'default'")
+            self._ensure_column("sessions", "account_name", "TEXT NOT NULL DEFAULT '默认账户'")
+            self._ensure_column("sessions", "round_interval_seconds", "INTEGER NOT NULL DEFAULT 3")
+            self._ensure_column("sessions", "open_mode", "TEXT")
+            self._ensure_column("sessions", "close_mode", "TEXT")
+            self._ensure_column("sessions", "selected_position_side", "TEXT")
+            self._ensure_column("sessions", "target_open_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "target_close_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "stage2_carryover_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "final_alignment_status", "TEXT NOT NULL DEFAULT 'not_needed'")
+            self._ensure_column("sessions", "final_unaligned_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "completed_with_final_alignment", "INTEGER NOT NULL DEFAULT 0")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column in columns:
+            return
+        self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def create_session(self, session: OpenSession) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, session_kind, account_id, account_name, symbol, trend_bias, leverage, round_count, round_qty,
+                    poll_interval_ms, order_ttl_ms, max_zero_fill_retries, market_fallback_attempts,
+                    round_interval_seconds, open_mode, close_mode, selected_position_side, target_open_qty, target_close_qty, created_by, status, created_at, updated_at, last_error,
+                    stage2_carryover_qty, final_alignment_status, final_unaligned_qty, completed_with_final_alignment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.session_id,
+                    session.spec.session_kind.value,
+                    session.account_id,
+                    session.account_name,
+                    session.spec.symbol,
+                    session.spec.trend_bias.value,
+                    session.spec.leverage,
+                    session.spec.round_count,
+                    str(session.spec.round_qty),
+                    session.spec.poll_interval_ms,
+                    session.spec.order_ttl_ms,
+                    session.spec.max_zero_fill_retries,
+                    session.spec.market_fallback_attempts,
+                    session.spec.round_interval_seconds,
+                    session.spec.open_mode.value if session.spec.open_mode else None,
+                    session.spec.close_mode.value if session.spec.close_mode else None,
+                    session.spec.selected_position_side.value if session.spec.selected_position_side else None,
+                    str(session.spec.target_open_qty),
+                    str(session.spec.target_close_qty),
+                    session.spec.created_by,
+                    session.status.value,
+                    session.created_at.isoformat(),
+                    session.updated_at.isoformat(),
+                    session.last_error,
+                    str(session.stage2_carryover_qty),
+                    session.final_alignment_status.value,
+                    str(session.final_unaligned_qty),
+                    int(session.completed_with_final_alignment),
+                ),
+            )
+
+    def update_session_status(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        *,
+        last_error: str | None = None,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE sessions SET status = ?, updated_at = ?, last_error = ? WHERE session_id = ?",
+                (status.value, datetime.now(UTC).isoformat(), last_error, session_id),
+            )
+
+    def update_session_runtime(self, session: OpenSession) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?,
+                    stage2_carryover_qty = ?,
+                    final_alignment_status = ?,
+                    final_unaligned_qty = ?,
+                    completed_with_final_alignment = ?
+                WHERE session_id = ?
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    str(session.stage2_carryover_qty),
+                    session.final_alignment_status.value,
+                    str(session.final_unaligned_qty),
+                    int(session.completed_with_final_alignment),
+                    session.session_id,
+                ),
+            )
+
+    def upsert_round(self, execution: RoundExecution) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO rounds (
+                    session_id, round_index, status, stage1_filled_qty, stage2_filled_qty,
+                    stage1_zero_fill_retries, stage2_zero_fill_retries, market_fallback_used,
+                    notes_json, started_at, ended_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, round_index) DO UPDATE SET
+                    status = excluded.status,
+                    stage1_filled_qty = excluded.stage1_filled_qty,
+                    stage2_filled_qty = excluded.stage2_filled_qty,
+                    stage1_zero_fill_retries = excluded.stage1_zero_fill_retries,
+                    stage2_zero_fill_retries = excluded.stage2_zero_fill_retries,
+                    market_fallback_used = excluded.market_fallback_used,
+                    notes_json = excluded.notes_json,
+                    started_at = excluded.started_at,
+                    ended_at = excluded.ended_at
+                """,
+                (
+                    execution.session_id,
+                    execution.round_index,
+                    execution.status.value,
+                    str(execution.stage1_filled_qty),
+                    str(execution.stage2_filled_qty),
+                    execution.stage1_zero_fill_retries,
+                    execution.stage2_zero_fill_retries,
+                    int(execution.market_fallback_used),
+                    _json_dumps(execution.notes),
+                    execution.started_at.isoformat(),
+                    execution.ended_at.isoformat() if execution.ended_at else None,
+                ),
+            )
+
+    def add_event(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        round_index: int | None = None,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO events (session_id, round_index, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, round_index, event_type, _json_dumps(payload), datetime.now(UTC).isoformat()),
+            )
+
+    def get_session(self, session_id: str, account_id: str | None = None) -> dict[str, Any] | None:
+        if account_id is None:
+            row = self._connection.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT * FROM sessions WHERE session_id = ? AND account_id = ?",
+                (session_id, account_id),
+            ).fetchone()
+        if row is None:
+            return None
+        session = self._deserialize_session_row(row)
+        session["rounds"] = self.list_rounds(session_id)
+        session["events"] = self.list_events(session_id)
+        return session
+
+    def fail_incomplete_sessions(self, reason: str) -> list[str]:
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                "SELECT session_id FROM sessions WHERE status IN (?, ?, ?)",
+                (
+                    SessionStatus.PENDING.value,
+                    SessionStatus.RUNNING.value,
+                    SessionStatus.PAUSED.value,
+                ),
+            ).fetchall()
+            session_ids = [row["session_id"] for row in rows]
+            if not session_ids:
+                return []
+            now = datetime.now(UTC).isoformat()
+            self._connection.executemany(
+                "UPDATE sessions SET status = ?, updated_at = ?, last_error = ? WHERE session_id = ?",
+                [(SessionStatus.EXCEPTION.value, now, reason, session_id) for session_id in session_ids],
+            )
+            return session_ids
+
+    def list_sessions(self, account_id: str | None = None) -> list[dict[str, Any]]:
+        if account_id is None:
+            rows = self._connection.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
+        else:
+            rows = self._connection.execute(
+                "SELECT * FROM sessions WHERE account_id = ? ORDER BY created_at DESC",
+                (account_id,),
+            ).fetchall()
+        return [self._deserialize_session_row(row) for row in rows]
+
+    def list_rounds(self, session_id: str) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            "SELECT * FROM rounds WHERE session_id = ? ORDER BY round_index ASC",
+            (session_id,),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["notes"] = _json_loads(payload.pop("notes_json", "{}"))
+            payload["market_fallback_used"] = bool(payload.get("market_fallback_used"))
+            items.append(payload)
+        return items
+
+    def list_events(self, session_id: str) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            "SELECT * FROM events WHERE session_id = ? ORDER BY event_id ASC",
+            (session_id,),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["payload"] = _json_loads(payload.pop("payload_json", "{}"))
+            items.append(payload)
+        return items
+
+    def has_active_symbol_session(self, symbol: str, account_id: str | None = None) -> bool:
+        if account_id is None:
+            row = self._connection.execute(
+                "SELECT 1 FROM sessions WHERE symbol = ? AND status IN (?, ?, ?) LIMIT 1",
+                (
+                    symbol,
+                    SessionStatus.PENDING.value,
+                    SessionStatus.RUNNING.value,
+                    SessionStatus.PAUSED.value,
+                ),
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT 1 FROM sessions WHERE symbol = ? AND account_id = ? AND status IN (?, ?, ?) LIMIT 1",
+                (
+                    symbol,
+                    account_id,
+                    SessionStatus.PENDING.value,
+                    SessionStatus.RUNNING.value,
+                    SessionStatus.PAUSED.value,
+                ),
+            ).fetchone()
+        return row is not None
+
+    def has_active_sessions(self, account_id: str | None = None) -> bool:
+        if account_id is None:
+            row = self._connection.execute(
+                "SELECT 1 FROM sessions WHERE status IN (?, ?, ?) LIMIT 1",
+                (
+                    SessionStatus.PENDING.value,
+                    SessionStatus.RUNNING.value,
+                    SessionStatus.PAUSED.value,
+                ),
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT 1 FROM sessions WHERE account_id = ? AND status IN (?, ?, ?) LIMIT 1",
+                (
+                    account_id,
+                    SessionStatus.PENDING.value,
+                    SessionStatus.RUNNING.value,
+                    SessionStatus.PAUSED.value,
+                ),
+            ).fetchone()
+        return row is not None
+
+    def _deserialize_session_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["completed_with_final_alignment"] = bool(payload.get("completed_with_final_alignment"))
+        return payload
+
+

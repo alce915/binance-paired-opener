@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Binance Account Monitor</title>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --panel: rgba(255,255,255,0.88);
+      --line: rgba(46, 32, 14, 0.12);
+      --text: #241b12;
+      --muted: #7c6d5d;
+      --accent: #b66c2f;
+      --good: #1f7a48;
+      --warn: #b07a00;
+      --bad: #b54636;
+      --shadow: 0 18px 45px rgba(48, 31, 12, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(255, 210, 140, 0.45), transparent 30%),
+        linear-gradient(180deg, #fbf7f1 0%, #f1e8dc 100%);
+      min-height: 100vh;
+    }
+    .shell {
+      width: min(1240px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+    .hero, .toolbar, .card, .group, .account {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      padding: 28px;
+      display: grid;
+      gap: 12px;
+    }
+    .hero h1 { margin: 0; font-size: clamp(28px, 4vw, 44px); }
+    .hero p { margin: 0; color: var(--muted); line-height: 1.6; max-width: 780px; }
+    .toolbar {
+      margin-top: 18px;
+      padding: 16px 20px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .badge {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(182,108,47,0.12);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 13px;
+    }
+    .badge::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .status-ok { color: var(--good); background: rgba(31,122,72,0.12); }
+    .status-partial { color: var(--warn); background: rgba(176,122,0,0.12); }
+    .status-error { color: var(--bad); background: rgba(181,70,54,0.12); }
+    .summary {
+      margin-top: 18px;
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+    .card { padding: 18px; }
+    .label { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+    .value { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; }
+    .groups { margin-top: 20px; display: grid; gap: 18px; }
+    .group { overflow: hidden; }
+    .group-head {
+      padding: 18px 22px;
+      background: rgba(255,248,239,0.84);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .group-head h2 { margin: 0; }
+    .group-summary {
+      padding: 18px 22px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+    }
+    .account-list {
+      padding: 0 22px 22px;
+      display: grid;
+      gap: 14px;
+    }
+    .account { overflow: hidden; }
+    .account-head {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .account-head h3 { margin: 0; }
+    .account-grid {
+      padding: 16px 18px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      border: 1px solid rgba(46, 32, 14, 0.08);
+      border-radius: 18px;
+      padding: 14px;
+      background: rgba(255,255,255,0.7);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(46,32,14,0.06);
+      text-align: left;
+    }
+    th { color: var(--muted); }
+    .section { padding: 0 18px 18px; }
+    .section h4 { margin: 0 0 12px; color: var(--muted); font-size: 13px; text-transform: uppercase; }
+    .empty { color: var(--muted); padding: 10px 0; }
+    .mono { font-family: Consolas, monospace; }
+    @media (max-width: 768px) {
+      .shell { width: min(100vw - 20px, 1240px); }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="badge" id="connectionBadge">connecting</div>
+      <h1>Binance Account Monitor</h1>
+      <p>Independent grouped monitor for Binance unified accounts. Main accounts are management groups, child accounts carry the actual API credentials.</p>
+    </section>
+
+    <section class="toolbar">
+      <div id="messageText">Waiting for monitor data</div>
+      <div class="mono" id="updatedAt">-</div>
+    </section>
+
+    <section class="summary" id="summaryCards"></section>
+    <section class="groups" id="groupsContainer"></section>
+  </main>
+
+  <script>
+    const summaryCards = document.getElementById('summaryCards');
+    const groupsContainer = document.getElementById('groupsContainer');
+    const connectionBadge = document.getElementById('connectionBadge');
+    const messageText = document.getElementById('messageText');
+    const updatedAt = document.getElementById('updatedAt');
+    const query = new URLSearchParams(window.location.search);
+    const accountIds = query.get('account_ids');
+    const groupsUrl = accountIds ? `/api/monitor/groups?account_ids=${encodeURIComponent(accountIds)}` : '/api/monitor/groups';
+    const streamUrl = accountIds ? `/stream/monitor?account_ids=${encodeURIComponent(accountIds)}` : '/stream/monitor';
+
+    function fmt(value) {
+      const number = Number(value || 0);
+      return Number.isFinite(number) ? number.toLocaleString('en-US', { maximumFractionDigits: 8 }) : String(value ?? '-');
+    }
+
+    function fmtTime(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString('en-US', { hour12: false });
+    }
+
+    function renderSummary(summary = {}) {
+      const cards = [
+        ['Accounts', summary.account_count],
+        ['Healthy', summary.success_count],
+        ['Errors', summary.error_count],
+        ['Equity', fmt(summary.equity)],
+        ['Margin', fmt(summary.margin)],
+        ['Available', fmt(summary.available_balance)],
+        ['UPnL', fmt(summary.unrealized_pnl)],
+        ['Income', fmt(summary.total_income)],
+        ['Interest', fmt(summary.total_interest)],
+      ];
+      summaryCards.innerHTML = cards.map(([label, value]) => `
+        <article class="card">
+          <div class="label">${label}</div>
+          <div class="value">${value ?? 0}</div>
+        </article>
+      `).join('');
+    }
+
+    function renderRows(headers, rows, formatter) {
+      if (!rows || rows.length === 0) {
+        return '<div class="empty">No data</div>';
+      }
+      return `
+        <table>
+          <thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead>
+          <tbody>${rows.map((row) => formatter(row)).join('')}</tbody>
+        </table>
+      `;
+    }
+
+    function renderAccount(account) {
+      const totals = account.totals || {};
+      const interest = account.interest_summary || {};
+      const income = account.income_summary || {};
+      const statusClass = account.status === 'ok' ? 'status-ok' : 'status-error';
+      return `
+        <article class="account">
+          <div class="account-head">
+            <div>
+              <h3>${account.child_account_name || account.account_name || account.account_id}</h3>
+              <div class="mono">${account.account_id} | ${account.account_status || '-'}</div>
+            </div>
+            <div class="badge ${statusClass}">${account.status || 'unknown'}</div>
+          </div>
+          <div class="account-grid">
+            ${[
+              ['Equity', fmt(totals.equity)],
+              ['Margin', fmt(totals.margin)],
+              ['Available', fmt(totals.available_balance)],
+              ['UPnL', fmt(totals.unrealized_pnl)],
+              ['Income', fmt(totals.total_income)],
+              ['Interest', fmt(totals.total_interest)],
+            ].map(([label, value]) => `
+              <div class="metric">
+                <div class="label">${label}</div>
+                <div class="value">${value}</div>
+              </div>
+            `).join('')}
+          </div>
+          <div class="section">
+            <h4>Positions</h4>
+            ${renderRows(
+              ['Symbol', 'Side', 'Qty', 'Entry', 'Mark', 'UPnL', 'Notional', 'Lev'],
+              account.positions || [],
+              (row) => `
+                <tr>
+                  <td class="mono">${row.symbol || '-'}</td>
+                  <td>${row.position_side || '-'}</td>
+                  <td>${fmt(row.qty)}</td>
+                  <td>${fmt(row.entry_price)}</td>
+                  <td>${fmt(row.mark_price)}</td>
+                  <td>${fmt(row.unrealized_pnl)}</td>
+                  <td>${fmt(row.notional)}</td>
+                  <td>${row.leverage || 0}x</td>
+                </tr>
+              `
+            )}
+          </div>
+          <div class="section">
+            <h4>Assets</h4>
+            ${renderRows(
+              ['Asset', 'Wallet', 'Available', 'Margin Balance', 'Cross UPnL', 'Withdrawable'],
+              account.assets || [],
+              (row) => `
+                <tr>
+                  <td class="mono">${row.asset || '-'}</td>
+                  <td>${fmt(row.wallet_balance)}</td>
+                  <td>${fmt(row.available_balance)}</td>
+                  <td>${fmt(row.margin_balance)}</td>
+                  <td>${fmt(row.cross_unrealized_pnl)}</td>
+                  <td>${fmt(row.max_withdraw_amount)}</td>
+                </tr>
+              `
+            )}
+          </div>
+          <div class="section">
+            <h4>Income & Interest</h4>
+            <div class="empty">
+              Income window ${income.window_days || 0}d, records ${income.records || 0}, total ${fmt(income.total_income)}.<br>
+              Interest window ${interest.window_days || 0}d, records ${interest.records || 0}, total ${fmt(interest.total_interest)}.
+            </div>
+          </div>
+        </article>
+      `;
+    }
+
+    function renderGroup(group) {
+      return `
+        <section class="group">
+          <div class="group-head">
+            <div>
+              <h2>${group.main_account_name || group.main_account_id}</h2>
+              <div class="mono">${group.main_account_id}</div>
+            </div>
+            <div class="badge">${group.summary.account_count || 0} accounts</div>
+          </div>
+          <div class="group-summary">
+            ${[
+              ['Equity', fmt(group.summary.equity)],
+              ['Margin', fmt(group.summary.margin)],
+              ['Available', fmt(group.summary.available_balance)],
+              ['UPnL', fmt(group.summary.unrealized_pnl)],
+              ['Income', fmt(group.summary.total_income)],
+              ['Interest', fmt(group.summary.total_interest)],
+            ].map(([label, value]) => `
+              <div class="metric">
+                <div class="label">${label}</div>
+                <div class="value">${value}</div>
+              </div>
+            `).join('')}
+          </div>
+          <div class="account-list">
+            ${(group.accounts || []).map(renderAccount).join('')}
+          </div>
+        </section>
+      `;
+    }
+
+    function render(payload) {
+      const status = payload.status || 'idle';
+      connectionBadge.textContent = status;
+      connectionBadge.className = `badge ${status === 'ok' ? 'status-ok' : status === 'partial' ? 'status-partial' : status === 'error' ? 'status-error' : ''}`;
+      messageText.textContent = payload.message || '-';
+      updatedAt.textContent = `Updated ${fmtTime(payload.updated_at)}`;
+      renderSummary(payload.summary || {});
+      const groups = payload.groups || [];
+      groupsContainer.innerHTML = groups.length ? groups.map(renderGroup).join('') : '<section class="group"><div class="group-head"><h2>No groups</h2></div></section>';
+    }
+
+    async function bootstrap() {
+      try {
+        const response = await fetch(groupsUrl, { cache: 'no-store' });
+        if (response.ok) {
+          render(await response.json());
+        }
+      } catch (error) {
+        messageText.textContent = `Bootstrap failed: ${error}`;
+      }
+      const source = new EventSource(streamUrl);
+      source.addEventListener('monitor_snapshot', (event) => {
+        render(JSON.parse(event.data));
+      });
+      source.onerror = () => {
+        connectionBadge.textContent = 'reconnecting';
+        connectionBadge.className = 'badge status-partial';
+      };
+    }
+
+    bootstrap();
+  </script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+﻿# >>> codex git-sync >>>
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+config/active_account.json
+config/binance_accounts.json
+*.db
+.pytest_cache/
+*.egg-info/
+tmp_*.py
+tmp_*.txt
+binance-account-monitor/config/binance_monitor_accounts.json
+node_modules/
+dist/
+build/
+.idea/
+.vscode/
+# <<< codex git-sync <<<
+
+
+
+
+
+
+
+

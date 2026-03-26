@@ -1,0 +1,43 @@
+{
+  "main_accounts": [
+    {
+      "main_id": "group_a",
+      "name": "Main Group A",
+      "children": [
+        {
+          "account_id": "sub1",
+          "name": "Sub Account 1",
+          "api_key": "replace-with-api-key-1",
+          "api_secret": "replace-with-api-secret-1",
+          "use_testnet": false,
+          "rest_base_url": "",
+          "ws_base_url": ""
+        },
+        {
+          "account_id": "sub2",
+          "name": "Sub Account 2",
+          "api_key": "replace-with-api-key-2",
+          "api_secret": "replace-with-api-secret-2",
+          "use_testnet": true,
+          "rest_base_url": "",
+          "ws_base_url": ""
+        }
+      ]
+    },
+    {
+      "main_id": "group_b",
+      "name": "Main Group B",
+      "children": [
+        {
+          "account_id": "sub1",
+          "name": "Sub Account 1",
+          "api_key": "replace-with-api-key-3",
+          "api_secret": "replace-with-api-secret-3",
+          "use_testnet": false,
+          "rest_base_url": "",
+          "ws_base_url": ""
+        }
+      ]
+    }
+  ]
+}

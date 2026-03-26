@@ -1,0 +1,1442 @@
+﻿const logsBody = document.getElementById("logsBody");
+const asksContainer = document.getElementById("asksContainer");
+const bidsContainer = document.getElementById("bidsContainer");
+const connectionToggle = document.getElementById("connectionToggle");
+const accountSelect = document.getElementById("accountSelect");
+const accountBadge = document.getElementById("accountBadge");
+const orderBookInput = document.getElementById("orderBookInput");
+const executionSymbol = document.getElementById("executionSymbol");
+const closeExecutionSymbol = document.getElementById("closeExecutionSymbol");
+const singleOpenExecutionSymbol = document.getElementById("singleOpenExecutionSymbol");
+const confirmSymbolBtn = document.getElementById("confirmSymbolBtn");
+const editWhitelistBtn = document.getElementById("editWhitelistBtn");
+const positionsList = document.getElementById("positionsList");
+const createBtn = document.getElementById("createBtn");
+const createCloseBtn = document.getElementById("createCloseBtn");
+const createSingleOpenBtn = document.getElementById("createSingleOpenBtn");
+const createSingleCloseBtn = document.getElementById("createSingleCloseBtn");
+const simulateBtn = document.getElementById("simulateBtn");
+const minNotionalHint = document.getElementById("minNotionalHint");
+const closeValidationHint = document.getElementById("closeValidationHint");
+const singleOpenValidationHint = document.getElementById("singleOpenValidationHint");
+const singleOpenLeverageInput = document.getElementById("singleOpenLeverage");
+const singleCloseValidationHint = document.getElementById("singleCloseValidationHint");
+const modeButtons = {
+  paired_open: document.getElementById("modePairedOpen"),
+  paired_close: document.getElementById("modePairedClose"),
+  single_open: document.getElementById("modeSingleOpen"),
+  single_close: document.getElementById("modeSingleClose"),
+};
+const modePanels = {
+  paired_open: document.getElementById("pairedOpenPanel"),
+  paired_close: document.getElementById("pairedClosePanel"),
+  single_open: document.getElementById("singleOpenPanel"),
+  single_close: document.getElementById("singleClosePanel"),
+};
+let eventSource = null;
+let executionMode = "paired_open";
+let activeSymbol = executionSymbol.value || "BTCUSDT";
+let currentAccount = { id: "default", name: "默认账户" };
+let availableAccounts = [];
+let whitelistSymbols = [];
+let temporaryCustomSymbol = null;
+let latestReferencePrice = 0;
+let latestAvailableBalance = null;
+let currentPositions = [];
+let currentSymbolInfo = { symbol: activeSymbol, min_notional: 0, allowed: true };
+let symbolInfoReady = false;
+let activeSessionId = null;
+let activeSessionPoller = null;
+const seenSessionEventIds = new Set();
+
+function nowTime() {
+  return new Date().toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function request(path, options = {}) {
+  return fetch(path, options).then(async (response) => {
+    const text = await response.text();
+    if (!response.ok) {
+      let message = text;
+      try {
+        const payload = JSON.parse(text);
+        if (payload && typeof payload === "object") {
+          message = payload.detail || payload.message || text;
+        }
+      } catch {}
+      throw new Error(message);
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  });
+}
+
+function formatNumber(value, digits = 8) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "0";
+  return numeric.toLocaleString("zh-CN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits,
+  });
+}
+
+function normalizeSymbol(value) {
+  return (value || "BTCUSDT").trim().toUpperCase();
+}
+
+function inferBaseAsset(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const knownQuoteAssets = ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "BNB", "EUR", "TRY"];
+  for (const quoteAsset of knownQuoteAssets) {
+    if (normalized.endsWith(quoteAsset) && normalized.length > quoteAsset.length) {
+      return normalized.slice(0, normalized.length - quoteAsset.length);
+    }
+  }
+  return normalized;
+}
+
+function updateSymbolUnits(symbol) {
+  const baseAsset = inferBaseAsset(symbol);
+  ["openRoundQtyUnit", "closeQtyUnit", "closeRoundQtyUnit", "singleOpenQtyUnit", "singleOpenRoundQtyUnit", "singleCloseQtyUnit", "singleCloseRoundQtyUnit"].forEach((id) => {
+    const element = document.getElementById(id);
+    if (element) element.textContent = baseAsset;
+  });
+}
+
+function syncTrendSelectTone(selectElement) {
+  if (!selectElement) return;
+  selectElement.classList.remove("trend-long", "trend-short");
+  selectElement.style.color = "";
+  selectElement.style.borderColor = "";
+  selectElement.style.backgroundColor = "";
+  selectElement.style.fontWeight = "700";
+  if (selectElement.value === "long") {
+    selectElement.classList.add("trend-long");
+    selectElement.style.color = "#21986f";
+    selectElement.style.borderColor = "rgba(33, 152, 111, 0.55)";
+    selectElement.style.backgroundColor = "#f8fffb";
+  } else if (selectElement.value === "short") {
+    selectElement.classList.add("trend-short");
+    selectElement.style.color = "#c6514d";
+    selectElement.style.borderColor = "rgba(198, 81, 77, 0.55)";
+    selectElement.style.backgroundColor = "#fff9f9";
+  }
+}
+
+function syncPositionSideTone(selectElement) {
+  if (!selectElement) return;
+  selectElement.classList.remove("side-long", "side-short");
+  selectElement.style.color = "";
+  selectElement.style.borderColor = "";
+  selectElement.style.backgroundColor = "";
+  selectElement.style.fontWeight = "700";
+  if (selectElement.value === "LONG") {
+    selectElement.classList.add("side-long");
+    selectElement.style.color = "#21986f";
+    selectElement.style.borderColor = "rgba(33, 152, 111, 0.55)";
+    selectElement.style.backgroundColor = "#f8fffb";
+  } else if (selectElement.value === "SHORT") {
+    selectElement.classList.add("side-short");
+    selectElement.style.color = "#c6514d";
+    selectElement.style.borderColor = "rgba(198, 81, 77, 0.55)";
+    selectElement.style.backgroundColor = "#fff9f9";
+  }
+}
+
+function formatModeLabel(mode) {
+  switch (String(mode || "paired_open")) {
+    case "paired_close":
+      return "双向平仓";
+    case "single_open":
+      return "单向开仓";
+    case "single_close":
+      return "单向平仓";
+    default:
+      return "双向开仓";
+  }
+}
+
+function isTerminalSession(status) {
+  return ["completed", "completed_with_skips", "aborted", "exception"].includes(String(status || ""));
+}
+
+function formatAlignmentStatus(status) {
+  switch (String(status || "not_needed")) {
+    case "carryover_pending":
+      return "待最终对齐";
+    case "market_aligned":
+      return "市价对齐完成";
+    case "flattened_both_sides":
+      return "双边清仓对齐";
+    case "failed":
+      return "最终对齐失败";
+    default:
+      return "未触发";
+  }
+}
+
+function setCurrentAccount(accountId, accountName, syncSelect = true) {
+  currentAccount = {
+    id: String(accountId || currentAccount.id || "default").trim().toLowerCase(),
+    name: String(accountName || currentAccount.name || "默认账户").trim() || "默认账户",
+  };
+  accountBadge.textContent = currentAccount.name;
+  if (syncSelect && availableAccounts.length > 0) {
+    accountSelect.value = currentAccount.id;
+  }
+}
+
+function renderAccountOptions(accounts) {
+  availableAccounts = Array.isArray(accounts) ? accounts : [];
+  accountSelect.innerHTML = "";
+  availableAccounts.forEach((account) => {
+    const option = document.createElement("option");
+    option.value = account.id;
+    option.textContent = account.name;
+    accountSelect.appendChild(option);
+  });
+  accountBadge.hidden = true;
+  accountSelect.hidden = availableAccounts.length === 0;
+  accountSelect.disabled = availableAccounts.length <= 1;
+  const activeAccount = availableAccounts.find((account) => account.is_active) || availableAccounts[0];
+  if (activeAccount) {
+    setCurrentAccount(activeAccount.id, activeAccount.name, true);
+  }
+}
+
+async function loadAccounts() {
+  const payload = await request("/config/accounts");
+  renderAccountOptions(payload.accounts || []);
+  return payload.accounts || [];
+}
+
+function rebuildSymbolOptions(selectedSymbol = activeSymbol) {
+  const normalizedSelected = normalizeSymbol(selectedSymbol);
+  const options = [...whitelistSymbols];
+  if (temporaryCustomSymbol && !options.includes(temporaryCustomSymbol)) {
+    options.push(temporaryCustomSymbol);
+  }
+  if (!options.length && normalizedSelected) {
+    options.push(normalizedSelected);
+  }
+  options.sort((left, right) => left.localeCompare(right));
+  orderBookInput.innerHTML = "";
+  options.forEach((symbol) => {
+    const option = document.createElement("option");
+    option.value = symbol;
+    option.textContent = symbol === temporaryCustomSymbol && !whitelistSymbols.includes(symbol)
+      ? `${symbol} (自定义)` : symbol;
+    orderBookInput.appendChild(option);
+  });
+  if (options.includes(normalizedSelected)) {
+    orderBookInput.value = normalizedSelected;
+  } else if (options.length) {
+    orderBookInput.value = options[0];
+  }
+}
+
+async function loadWhitelist() {
+  const payload = await request("/config/whitelist");
+  whitelistSymbols = (payload.symbols || []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean);
+  const currentSymbol = normalizeSymbol(executionSymbol.value || activeSymbol);
+  temporaryCustomSymbol = whitelistSymbols.includes(currentSymbol) ? null : currentSymbol;
+  rebuildSymbolOptions(currentSymbol);
+  return whitelistSymbols;
+}
+
+function setExecutionMode(mode) {
+  executionMode = mode;
+  Object.entries(modeButtons).forEach(([key, button]) => {
+    if (button) button.classList.toggle("active", key === mode);
+  });
+  Object.entries(modePanels).forEach(([key, panel]) => {
+    if (panel) panel.classList.toggle("hidden", key !== mode);
+  });
+  document.getElementById("statMode").textContent = formatModeLabel(mode);
+  if (mode === "paired_open") {
+    recalculateOpenAmount();
+  } else if (mode === "paired_close") {
+    recalculateCloseAmount();
+  } else if (mode === "single_open") {
+    recalculateSingleOpenAmount();
+  } else if (mode === "single_close") {
+    recalculateSingleCloseAmount();
+  }
+}
+
+function setActiveSymbol(symbol, syncInput = true) {
+  activeSymbol = normalizeSymbol(symbol);
+  latestReferencePrice = 0;
+  document.getElementById("statsSymbol").textContent = activeSymbol;
+  executionSymbol.value = activeSymbol;
+  closeExecutionSymbol.value = activeSymbol;
+  if (singleOpenExecutionSymbol) singleOpenExecutionSymbol.value = activeSymbol;
+  const singleCloseSymbolInput = document.getElementById("singleCloseExecutionSymbol");
+  if (singleCloseSymbolInput) singleCloseSymbolInput.value = activeSymbol;
+  updateSymbolUnits(activeSymbol);
+  if (syncInput) rebuildSymbolOptions(activeSymbol);
+  refreshSingleOpenOrderOptions();
+  refreshSingleClosePositionOptions();
+  recalculateOpenAmount();
+  recalculateCloseAmount();
+  recalculateSingleOpenAmount();
+  recalculateSingleCloseAmount();
+  const footerStatus = document.getElementById("footerStatus");
+  footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
+}
+
+function setSymbolInfo(info) {
+  currentSymbolInfo = info || { symbol: activeSymbol, min_notional: 0, allowed: true };
+  symbolInfoReady = Boolean(info);
+  document.getElementById("statMinNotional").textContent = formatNumber(currentSymbolInfo.min_notional || 0, 4);
+  recalculateOpenAmount();
+  recalculateCloseAmount();
+  recalculateSingleOpenAmount();
+  recalculateSingleCloseAmount();
+}
+function renderLevels(container, levels, side) {
+  container.innerHTML = "";
+  levels.forEach((level, index) => {
+    const row = document.createElement("div");
+    row.className = `level-row ${side}`;
+    row.style.setProperty("--depth", Math.max(0, Math.min(1, Number(level.depth_ratio || 0))));
+    row.innerHTML = `
+      <div class="level-price ${side}">${side === "sell" ? `卖${index + 1}` : `买${index + 1}`} ${formatNumber(level.price, 2)}</div>
+      <div class="level-qty mono">${formatNumber(level.qty, 6)}</div>
+      <div class="level-bar-value mono">${Math.round((Number(level.depth_ratio || 0)) * 100)}%</div>
+    `;
+    container.appendChild(row);
+  });
+}
+
+function appendLog(level, message, createdAt) {
+  const line = document.createElement("div");
+  line.className = "log-line";
+  const time = createdAt ? new Date(createdAt).toLocaleTimeString("zh-CN", { hour12: false }) : nowTime();
+  line.innerHTML = `
+    <div class="log-time mono">${time}</div>
+    <div class="log-badge ${level}">${level}</div>
+    <div class="log-message">${message}</div>
+  `;
+  logsBody.prepend(line);
+}
+
+function setConnectionState(state) {
+  const connected = Boolean(state.connected);
+  const status = String(state.status || "disconnected");
+  const badge = document.getElementById("connectionBadge");
+  const switchLabel = document.getElementById("switchLabel");
+  const footerDot = document.getElementById("footerDot");
+  const footerStatus = document.getElementById("footerStatus");
+  const statConnection = document.getElementById("statConnection");
+  setCurrentAccount(state.account_id, state.account_name);
+  setActiveSymbol(state.symbol || activeSymbol);
+  if (connected) {
+    badge.className = "badge success";
+    switchLabel.className = "badge success";
+    badge.textContent = "已连接";
+    switchLabel.textContent = "已开启";
+    footerDot.classList.add("live");
+  } else if (status === "connecting") {
+    badge.className = "badge warn";
+    switchLabel.className = "badge warn";
+    badge.textContent = "连接中";
+    switchLabel.textContent = "连接中";
+    footerDot.classList.remove("live");
+  } else if (status === "error") {
+    badge.className = "badge error";
+    switchLabel.className = "badge error";
+    badge.textContent = "异常";
+    switchLabel.textContent = "异常";
+    footerDot.classList.remove("live");
+  } else {
+    badge.className = "badge warn";
+    switchLabel.className = "badge warn";
+    badge.textContent = "未连接";
+    switchLabel.textContent = "已断开";
+    footerDot.classList.remove("live");
+  }
+  footerStatus.textContent = `${connected ? "已连接" : status === "connecting" ? "连接中" : status === "error" ? "异常" : "已断开"} ${state.symbol || activeSymbol}`;
+  statConnection.textContent = status;
+  connectionToggle.checked = connected;
+}
+function refreshDerivedStats({ totalNotional = 0, perRoundNotional = 0, estimatedQty = 0, minNotional = Number(currentSymbolInfo.min_notional || 0) } = {}) {
+  document.getElementById("statTotalNotional").textContent = formatNumber(totalNotional || 0, 4);
+  document.getElementById("statPerRound").textContent = formatNumber(perRoundNotional || 0, 4);
+  document.getElementById("statLastQty").textContent = formatNumber(estimatedQty || 0, 8);
+  document.getElementById("statMinNotional").textContent = formatNumber(minNotional || 0, 4);
+}
+
+function updateExecutionStats(stats) {
+  document.getElementById("statSimStatus").textContent = stats.status || "idle";
+  document.getElementById("statRounds").textContent = `${stats.rounds_completed || 0} / ${stats.rounds_total || 0}`;
+  document.getElementById("statTotalNotional").textContent = formatNumber(stats.total_notional || 0, 4);
+  document.getElementById("statPerRound").textContent = formatNumber(stats.notional_per_round || 0, 4);
+  document.getElementById("statLastQty").textContent = formatNumber(stats.last_qty || 0, 8);
+  document.getElementById("statMode").textContent = formatModeLabel(stats.mode || executionMode);
+  if (stats.min_notional !== undefined) {
+    document.getElementById("statMinNotional").textContent = formatNumber(stats.min_notional || 0, 4);
+  }
+  if (stats.carryover_qty !== undefined) {
+    document.getElementById("statCarryoverQty").textContent = formatNumber(stats.carryover_qty || 0, 6);
+  }
+  if (stats.final_alignment_status !== undefined) {
+    document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(stats.final_alignment_status);
+  }
+}
+
+function positionQty(symbol, positionSide) {
+  return currentPositions
+    .filter((position) => position.symbol === symbol && String(position.position_side) === positionSide)
+    .reduce((total, position) => total + Number(position.qty || 0), 0);
+}
+
+function maxCloseableQtyForSymbol(symbol) {
+  return Math.min(positionQty(symbol, "LONG"), positionQty(symbol, "SHORT"));
+}
+
+function renderAccountOverview(payload) {
+  const totals = payload.totals || {};
+  setCurrentAccount(payload.account_id, payload.account_name);
+  const equity = document.getElementById("overviewEquity");
+  const margin = document.getElementById("overviewMarginUsed");
+  const availableBalance = document.getElementById("overviewAvailableBalance");
+  const unrealizedPnl = document.getElementById("overviewUnrealizedPnl");
+  latestAvailableBalance = payload.status === "ok" ? Number(totals.available_balance || 0) : null;
+  currentPositions = Array.isArray(payload.positions) ? payload.positions : [];
+
+  equity.textContent = payload.status === "idle" ? "--" : formatNumber(totals.equity || 0, 2);
+  margin.textContent = payload.status === "idle" ? "--" : formatNumber(totals.margin || 0, 2);
+  availableBalance.textContent = payload.status === "idle" ? "--" : formatNumber(totals.available_balance || 0, 2);
+  unrealizedPnl.textContent = payload.status === "idle" ? "--" : formatNumber(totals.unrealized_pnl || 0, 2);
+
+  const applyMetricTone = (element, rawValue) => {
+    element.classList.remove("positive", "negative", "zero");
+    const value = Number(rawValue || 0);
+    if (value > 0) {
+      element.classList.add("positive");
+    } else if (value < 0) {
+      element.classList.add("negative");
+    } else {
+      element.classList.add("zero");
+    }
+  };
+
+  if (payload.status === "idle") {
+    [equity, margin, availableBalance, unrealizedPnl].forEach((element) => {
+      element.classList.remove("positive", "negative", "zero");
+    });
+  } else {
+    applyMetricTone(equity, totals.equity);
+    applyMetricTone(margin, totals.margin);
+    applyMetricTone(availableBalance, totals.available_balance);
+    applyMetricTone(unrealizedPnl, totals.unrealized_pnl);
+  }
+
+  document.getElementById("positionsCount").textContent = String(currentPositions.length);
+  positionsList.innerHTML = "";
+  if (!currentPositions.length) {
+    positionsList.innerHTML = `<div class="empty-state" style="min-height: 220px; margin-top: 0;"><div><div style="font-size: 36px; margin-bottom: 10px;">📭</div><div>${payload.status === "loading" ? "正在加载持仓" : "暂无持仓"}</div><div style="margin-top: 6px; font-size: 13px;">${payload.message || "连接后会显示当前 U 本位合约持仓"}</div></div></div>`;
+    refreshSingleOpenOrderOptions();
+    refreshSingleClosePositionOptions();
+    recalculateOpenAmount();
+    recalculateCloseAmount();
+    recalculateSingleOpenAmount();
+    recalculateSingleCloseAmount();
+    return;
+  }
+
+  currentPositions.forEach((position) => {
+    const row = document.createElement("div");
+    row.className = "position-row";
+    const sideClass = String(position.position_side || "").toLowerCase() === "short" ? "short" : "long";
+    const pnlValue = Number(position.unrealized_pnl || 0);
+    const pnlClass = pnlValue > 0 ? "positive" : pnlValue < 0 ? "negative" : "zero";
+    const leverageText = Number(position.leverage || 0) > 0 ? `${position.leverage}x` : "--";
+    const notional = Number(position.notional || 0) || ((Number(position.qty || 0) || 0) * (Number(position.entry_price || 0) || 0));
+    row.innerHTML = `
+      <div class="position-row-head">
+        <div class="position-symbol">${position.symbol}<span class="position-leverage-inline">${leverageText}</span></div>
+        <span class="position-side ${sideClass}">${position.position_side}</span>
+      </div>
+      <div class="position-meta">
+        <div>持仓数量<strong class="mono">${formatNumber(position.qty || 0, 6)}</strong></div>
+        <div>名义价值<strong class="mono">${formatNumber(notional, 2)}</strong></div>
+        <div>开仓均价<strong class="mono">${formatNumber(position.entry_price || 0, 2)}</strong></div>
+        <div>未实现盈亏<strong class="mono ${pnlClass}">${formatNumber(position.unrealized_pnl || 0, 4)}</strong></div>
+      </div>
+    `;
+    positionsList.appendChild(row);
+  });
+
+  refreshSingleOpenOrderOptions();
+  refreshSingleClosePositionOptions();
+  recalculateOpenAmount();
+  recalculateCloseAmount();
+  recalculateSingleOpenAmount();
+  recalculateSingleCloseAmount();
+}
+function updateOpenValidationHint({ canCreate, canSimulate = true, message, tone }) {
+  minNotionalHint.className = `validation-hint ${tone || ""}`;
+  minNotionalHint.textContent = message;
+  createBtn.disabled = !canCreate;
+  simulateBtn.disabled = !canSimulate;
+}
+
+function updateCloseValidationHint({ canCreate, message, tone }) {
+  closeValidationHint.className = `validation-hint ${tone || ""}`;
+  closeValidationHint.textContent = message;
+  createCloseBtn.disabled = !canCreate;
+}
+
+function updateSingleOpenValidationHint({ canCreate, message, tone }) {
+  singleOpenValidationHint.className = `validation-hint ${tone || ""}`;
+  singleOpenValidationHint.textContent = message;
+  createSingleOpenBtn.disabled = !canCreate;
+}
+
+function updateSingleCloseValidationHint({ canCreate, message, tone }) {
+  singleCloseValidationHint.className = `validation-hint ${tone || ""}`;
+  singleCloseValidationHint.textContent = message;
+  createSingleCloseBtn.disabled = !canCreate;
+}
+
+function currentSymbolPositions() {
+  return currentPositions.filter((position) => position.symbol === activeSymbol && Number(position.qty || 0) > 0);
+}
+
+function resolveSymbolLeverage(symbol) {
+  const matching = currentPositions.filter((position) => position.symbol === symbol && Number(position.leverage || 0) > 0);
+  if (matching.length) {
+    return Math.max(...matching.map((position) => Number(position.leverage || 1)));
+  }
+  return Math.max(Number(currentSymbolInfo.current_leverage || 1), 1);
+}
+function refreshSingleOpenOrderOptions() {
+  const orderSelect = document.getElementById("singleOpenOrder");
+  if (!orderSelect) return;
+  const existingValue = orderSelect.value || "LONG";
+  orderSelect.innerHTML = "";
+  [
+    { value: "LONG", label: "LONG | 做多开仓" },
+    { value: "SHORT", label: "SHORT | 做空开仓" },
+  ].forEach((item) => {
+    const option = document.createElement("option");
+    option.value = item.value;
+    option.textContent = item.label;
+    orderSelect.appendChild(option);
+  });
+  orderSelect.value = existingValue === "SHORT" ? "SHORT" : "LONG";
+  syncPositionSideTone(orderSelect);
+}
+
+function recalculateSingleOpenAmount() {
+  const mode = document.getElementById("singleOpenMode")?.value || "regular";
+  const orderSelect = document.getElementById("singleOpenOrder");
+  const qtyInput = document.getElementById("singleOpenQty");
+  const leverageInput = singleOpenLeverageInput;
+  const rounds = Math.max(Number(document.getElementById("singleOpenRounds")?.value) || 1, 1);
+  const positions = currentSymbolPositions();
+  const longQty = positions.filter((position) => String(position.position_side) === "LONG").reduce((sum, position) => sum + Number(position.qty || 0), 0);
+  const shortQty = positions.filter((position) => String(position.position_side) === "SHORT").reduce((sum, position) => sum + Number(position.qty || 0), 0);
+  const hasExistingPosition = positions.length > 0;
+  let selectedSide = String(orderSelect?.value || "LONG");
+
+  if (leverageInput) {
+    const currentLeverage = Math.max(resolveSymbolLeverage(activeSymbol), 1);
+    const wasLocked = leverageInput.dataset.locked === "true";
+    if (hasExistingPosition) {
+      leverageInput.value = String(currentLeverage);
+      leverageInput.disabled = true;
+      leverageInput.dataset.locked = "true";
+    } else {
+      leverageInput.disabled = false;
+      if (wasLocked || Number(leverageInput.value || 0) <= 0) {
+        leverageInput.value = String(currentLeverage);
+      }
+      leverageInput.dataset.locked = "false";
+    }
+  }
+  const leverage = Math.max(Number(leverageInput?.value || 1), 1);
+
+  if (mode === "align") {
+    if (longQty === shortQty) {
+      selectedSide = longQty <= shortQty ? "LONG" : "SHORT";
+      if (orderSelect) {
+        orderSelect.value = selectedSide;
+        orderSelect.disabled = true;
+        syncPositionSideTone(orderSelect);
+      }
+      if (qtyInput) {
+        qtyInput.disabled = true;
+        qtyInput.value = "0";
+      }
+      document.getElementById("singleOpenRoundQty").value = "0";
+      document.getElementById("singleOpenMarginPerRound").textContent = formatNumber(0, 4);
+      document.getElementById("singleOpenTotalNotional").textContent = formatNumber(0, 4);
+      document.getElementById("singleOpenNotionalPerRound").textContent = formatNumber(0, 4);
+      if (executionMode === "single_open") {
+        refreshDerivedStats({ totalNotional: 0, perRoundNotional: 0, estimatedQty: 0 });
+      }
+      updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: "当前双边持仓数量已对齐，无需单向开仓。" });
+      return;
+    }
+    selectedSide = longQty < shortQty ? "LONG" : "SHORT";
+    if (orderSelect) {
+      orderSelect.value = selectedSide;
+      orderSelect.disabled = true;
+      syncPositionSideTone(orderSelect);
+    }
+    if (qtyInput) {
+      qtyInput.value = Math.abs(longQty - shortQty).toFixed(6);
+      qtyInput.disabled = true;
+    }
+  } else {
+    if (orderSelect) {
+      orderSelect.disabled = false;
+      syncPositionSideTone(orderSelect);
+    }
+    if (qtyInput) qtyInput.disabled = false;
+  }
+
+  const openQty = Number(qtyInput?.value || 0);
+  const perRoundQty = openQty / rounds;
+  const totalNotional = openQty * latestReferencePrice;
+  const perRoundNotional = perRoundQty * latestReferencePrice;
+  const minNotional = Number(currentSymbolInfo.min_notional || 0);
+  const impliedOpenAmount = leverage > 0 ? totalNotional / leverage : totalNotional;
+  const marginPerRound = rounds > 0 ? impliedOpenAmount / rounds : 0;
+  const maxOpenAmount = latestAvailableBalance === null ? null : latestAvailableBalance * 0.95;
+
+  document.getElementById("singleOpenRoundQty").value = perRoundQty > 0 ? perRoundQty.toFixed(6) : "0";
+  document.getElementById("singleOpenMarginPerRound").textContent = formatNumber(marginPerRound, 4);
+  document.getElementById("singleOpenTotalNotional").textContent = formatNumber(totalNotional, 4);
+  document.getElementById("singleOpenNotionalPerRound").textContent = formatNumber(perRoundNotional, 4);
+  if (executionMode === "single_open") {
+    refreshDerivedStats({ totalNotional, perRoundNotional, estimatedQty: perRoundQty });
+  }
+
+  if (!symbolInfoReady) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "等待交易对规则加载完成后再计算单向开仓参数。" });
+    return;
+  }
+  if (currentSymbolInfo.allowed === false) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `${activeSymbol} 不在白名单中，无法创建真实单向开仓会话。` });
+    return;
+  }
+  if (Number(currentSymbolInfo.max_leverage || 0) > 0 && leverage > Number(currentSymbolInfo.max_leverage)) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `杠杆 ${leverage}x 超过该交易对最大杠杆 ${currentSymbolInfo.max_leverage}x。` });
+    return;
+  }
+  if (!selectedSide) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: "请选择开仓方向。" });
+    return;
+  }
+  if (openQty <= 0) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "请输入有效的单向开仓数量。" });
+    return;
+  }
+  if (perRoundQty <= 0) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: "每轮数量归一化后为 0，无法单向开仓。" });
+    return;
+  }
+  if (perRoundNotional < minNotional) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `每轮开仓名义金额 ${formatNumber(perRoundNotional, 4)} 低于交易所最小下单金额 ${formatNumber(minNotional, 4)}。` });
+    return;
+  }
+  if (maxOpenAmount !== null && impliedOpenAmount > maxOpenAmount) {
+    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `开单金额 ${formatNumber(impliedOpenAmount, 4)} 超过当前可用余额 ${formatNumber(latestAvailableBalance, 4)} 的 95% 上限 ${formatNumber(maxOpenAmount, 4)}。` });
+    return;
+  }
+  if (mode === "align") {
+    updateSingleOpenValidationHint({ canCreate: true, tone: "success", message: hasExistingPosition ? `将按订单对齐模式补齐 ${selectedSide}，数量 ${formatNumber(openQty, 6)}，当前交易对已有持仓，杠杆已锁定为 ${leverage}x。` : `将按订单对齐模式补齐 ${selectedSide}，数量 ${formatNumber(openQty, 6)}，当前杠杆 ${leverage}x。` });
+    return;
+  }
+  updateSingleOpenValidationHint({ canCreate: true, tone: "success", message: hasExistingPosition ? `将按常规模式开 ${selectedSide}，当前交易对已有持仓，杠杆已锁定为 ${leverage}x，每轮开仓金额约 ${formatNumber(perRoundNotional, 4)}。` : `将按常规模式开 ${selectedSide}，当前杠杆 ${leverage}x，每轮开仓金额约 ${formatNumber(perRoundNotional, 4)}。` });
+}
+function refreshSingleClosePositionOptions() {  const orderSelect = document.getElementById("singleCloseOrder");
+  if (!orderSelect) return;
+  const baseAsset = inferBaseAsset(activeSymbol);
+  const positions = currentSymbolPositions();
+  const existingValue = orderSelect.value;
+  orderSelect.innerHTML = "";
+  positions.forEach((position) => {
+    const option = document.createElement("option");
+    option.value = String(position.position_side || "");
+    option.textContent = `${position.position_side} | ${formatNumber(position.qty || 0, 6)} ${baseAsset}`;
+    orderSelect.appendChild(option);
+  });
+  if (!positions.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "当前交易对没有持仓单";
+    orderSelect.appendChild(option);
+    orderSelect.value = "";
+    orderSelect.disabled = true;
+    syncPositionSideTone(orderSelect);
+    return;
+  }
+  orderSelect.disabled = false;
+  if (positions.some((position) => String(position.position_side) === existingValue)) {
+    orderSelect.value = existingValue;
+  } else {
+    orderSelect.value = String(positions[0].position_side || "");
+  }
+  syncPositionSideTone(orderSelect);
+}
+
+function recalculateSingleCloseAmount() {
+  const mode = document.getElementById("singleCloseMode")?.value || "regular";
+  const orderSelect = document.getElementById("singleCloseOrder");
+  const qtyInput = document.getElementById("singleCloseQty");
+  const rounds = Math.max(Number(document.getElementById("singleCloseRounds")?.value) || 1, 1);
+  const positions = currentSymbolPositions();
+  const longQty = positions.filter((position) => String(position.position_side) === "LONG").reduce((sum, position) => sum + Number(position.qty || 0), 0);
+  const shortQty = positions.filter((position) => String(position.position_side) === "SHORT").reduce((sum, position) => sum + Number(position.qty || 0), 0);
+  let selectedSide = String(orderSelect?.value || "");
+  let availableQty = positions.filter((position) => String(position.position_side) === selectedSide).reduce((sum, position) => sum + Number(position.qty || 0), 0);
+
+  if (mode === "align") {
+    if (longQty === shortQty) {
+      if (orderSelect) orderSelect.disabled = true;
+      if (qtyInput) qtyInput.disabled = true;
+      if (qtyInput) qtyInput.value = "0";
+      document.getElementById("singleCloseRoundQty").value = "0";
+      document.getElementById("singleCloseAvailableQty").textContent = formatNumber(0, 6);
+      document.getElementById("singleCloseTotalNotional").textContent = formatNumber(0, 4);
+      document.getElementById("singleCloseNotionalPerRound").textContent = formatNumber(0, 4);
+      if (executionMode === "single_close") {
+        refreshDerivedStats({ totalNotional: 0, perRoundNotional: 0, estimatedQty: 0 });
+      }
+      updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "当前双边持仓数量已对齐，无需单向平仓。" });
+      return;
+    }
+    selectedSide = longQty > shortQty ? "LONG" : "SHORT";
+    availableQty = Math.max(longQty, shortQty);
+    if (orderSelect) {
+      orderSelect.value = selectedSide;
+      orderSelect.disabled = true;
+      syncPositionSideTone(orderSelect);
+    }
+    if (qtyInput) {
+      qtyInput.value = Math.abs(longQty - shortQty).toFixed(6);
+      qtyInput.disabled = true;
+    }
+  } else {
+    if (orderSelect) { orderSelect.disabled = positions.length === 0; syncPositionSideTone(orderSelect); }
+    if (qtyInput) qtyInput.disabled = false;
+  }
+
+  const closeQty = Number(qtyInput?.value || 0);
+  const perRoundQty = closeQty / rounds;
+  const totalNotional = closeQty * latestReferencePrice;
+  const perRoundNotional = perRoundQty * latestReferencePrice;
+  const minNotional = Number(currentSymbolInfo.min_notional || 0);
+  document.getElementById("singleCloseRoundQty").value = perRoundQty > 0 ? perRoundQty.toFixed(6) : "0";
+  document.getElementById("singleCloseAvailableQty").textContent = formatNumber(availableQty, 6);
+  document.getElementById("singleCloseTotalNotional").textContent = formatNumber(totalNotional, 4);
+  document.getElementById("singleCloseNotionalPerRound").textContent = formatNumber(perRoundNotional, 4);
+  if (executionMode === "single_close") {
+    refreshDerivedStats({ totalNotional, perRoundNotional, estimatedQty: perRoundQty });
+  }
+
+  if (!symbolInfoReady) {
+    updateSingleCloseValidationHint({ canCreate: false, tone: "", message: "正在加载交易对规则，暂时无法确认单向平仓参数。" });
+    return;
+  }
+  if (!positions.length) {
+    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "当前交易对没有持仓单，无法创建单向平仓会话。" });
+    return;
+  }
+  if (!selectedSide) {
+    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "请选择要平仓的持仓单。" });
+    return;
+  }
+  if (closeQty <= 0) {
+    updateSingleCloseValidationHint({ canCreate: false, tone: "", message: "请输入平仓数量，或切换到订单对齐模式。" });
+    return;
+  }
+  if (closeQty > availableQty) {
+    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: `平仓数量 ${formatNumber(closeQty, 6)} 超过所选持仓数量 ${formatNumber(availableQty, 6)}。` });
+    return;
+  }
+  if (perRoundQty <= 0) {
+    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "每轮数量归一化后为 0，无法单向平仓。" });
+    return;
+  }
+  if (perRoundNotional < minNotional) {
+    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: `每轮平仓名义金额 ${formatNumber(perRoundNotional, 4)} 低于交易所最小下单金额 ${formatNumber(minNotional, 4)}。` });
+    return;
+  }
+  if (mode === "align") {
+    updateSingleCloseValidationHint({ canCreate: true, tone: "success", message: `订单对齐模式已锁定 ${selectedSide}，差值平仓数量 ${formatNumber(closeQty, 6)}。` });
+    return;
+  }
+  updateSingleCloseValidationHint({ canCreate: true, tone: "success", message: `当前可用持仓数量 ${formatNumber(availableQty, 6)}，每轮名义平仓金额 ${formatNumber(perRoundNotional, 4)}。` });
+}
+
+function recalculateOpenAmount() {
+  const margin = Number(document.getElementById("calcMargin").value) || 0;
+  const leverage = Number(document.getElementById("leverage").value) || 0;
+  const rounds = Math.max(Number(document.getElementById("calcRounds").value) || 1, 1);
+  const marginPerRound = margin / rounds;
+  const totalNotional = margin * leverage;
+  const notionalPerRound = totalNotional / rounds;
+  const roundQty = latestReferencePrice > 0 ? notionalPerRound / latestReferencePrice : 0;
+  const minNotional = Number(currentSymbolInfo.min_notional || 0);
+  const balanceLimit = latestAvailableBalance === null ? null : { available: latestAvailableBalance, maxOpenAmount: latestAvailableBalance * 0.95 };
+
+  document.getElementById("marginPerRound").textContent = formatNumber(marginPerRound, 4);
+  document.getElementById("totalNotional").textContent = formatNumber(totalNotional, 4);
+  document.getElementById("notionalPerRound").textContent = formatNumber(notionalPerRound, 4);
+  document.getElementById("roundQty").value = roundQty > 0 ? roundQty.toFixed(6) : "0";
+  if (executionMode === "paired_open") {
+    refreshDerivedStats({ totalNotional, perRoundNotional: notionalPerRound, estimatedQty: roundQty });
+  }
+  document.getElementById("statTotalNotional").textContent = formatNumber(totalNotional, 4);
+  document.getElementById("statPerRound").textContent = formatNumber(notionalPerRound, 4);
+  document.getElementById("statLastQty").textContent = formatNumber(roundQty, 8);
+
+  if (balanceLimit && margin > balanceLimit.maxOpenAmount) {
+    updateOpenValidationHint({
+      canCreate: false,
+      canSimulate: false,
+      tone: "error",
+      message: `开单金额 ${formatNumber(margin, 4)} 超过当前可用余额 ${formatNumber(balanceLimit.available, 4)} 的 95% 上限 ${formatNumber(balanceLimit.maxOpenAmount, 4)}，无法开单或模拟执行。`,
+    });
+    return;
+  }
+  if (!symbolInfoReady) {
+    updateOpenValidationHint({ canCreate: false, tone: "", message: "正在加载交易对规则，暂时无法确认最小开单金额。" });
+    return;
+  }
+  if (currentSymbolInfo.allowed === false) {
+    updateOpenValidationHint({ canCreate: false, tone: "error", message: `${activeSymbol} 不在当前白名单内，真实开单会被拒绝。` });
+    return;
+  }
+  if (roundQty <= 0) {
+    updateOpenValidationHint({ canCreate: false, tone: "", message: `等待订单簿价格更新后计算每轮数量。最小下单金额 ${formatNumber(minNotional, 4)}。` });
+    return;
+  }
+  if (notionalPerRound < minNotional) {
+    updateOpenValidationHint({ canCreate: false, tone: "error", message: `每轮开单金额 ${formatNumber(notionalPerRound, 4)} 低于交易所最小下单金额 ${formatNumber(minNotional, 4)}，无法开单。` });
+    return;
+  }
+  updateOpenValidationHint({ canCreate: true, tone: "success", message: `最小下单金额 ${formatNumber(minNotional, 4)}，当前每轮开单金额 ${formatNumber(notionalPerRound, 4)}，可以开单。` });
+}
+
+function recalculateCloseAmount() {
+  const closeQty = Number(document.getElementById("closeQty").value) || 0;
+  const rounds = Math.max(Number(document.getElementById("closeRounds").value) || 1, 1);
+  const perRoundQty = closeQty / rounds;
+  const totalNotional = closeQty * latestReferencePrice;
+  const perRoundNotional = perRoundQty * latestReferencePrice;
+  const maxCloseableQty = maxCloseableQtyForSymbol(activeSymbol);
+  const minNotional = Number(currentSymbolInfo.min_notional || 0);
+
+  document.getElementById("closeRoundQty").value = perRoundQty > 0 ? perRoundQty.toFixed(6) : "0";
+  document.getElementById("closeTotalNotional").textContent = formatNumber(totalNotional, 4);
+  document.getElementById("closeNotionalPerRound").textContent = formatNumber(perRoundNotional, 4);
+  document.getElementById("maxCloseableQty").textContent = formatNumber(maxCloseableQty, 6);
+  if (executionMode === "paired_close") {
+    refreshDerivedStats({ totalNotional, perRoundNotional, estimatedQty: perRoundQty });
+  }
+
+  if (!symbolInfoReady) {
+    updateCloseValidationHint({ canCreate: false, tone: "", message: "正在加载交易对规则，暂时无法确认双向平仓参数。" });
+    return;
+  }
+  if (closeQty <= 0) {
+    updateCloseValidationHint({ canCreate: false, tone: "", message: "请输入平仓数量。" });
+    return;
+  }
+  if (maxCloseableQty <= 0) {
+    updateCloseValidationHint({ canCreate: false, tone: "error", message: "当前账户不存在可双向平仓的双边持仓。" });
+    return;
+  }
+  if (closeQty > maxCloseableQty) {
+    updateCloseValidationHint({ canCreate: false, tone: "error", message: `平仓数量 ${formatNumber(closeQty, 6)} 超过当前可双向平仓数量 ${formatNumber(maxCloseableQty, 6)}。` });
+    return;
+  }
+  if (perRoundQty <= 0) {
+    updateCloseValidationHint({ canCreate: false, tone: "error", message: "每轮数量归一化后为 0，无法平仓。" });
+    return;
+  }
+  if (perRoundNotional < minNotional) {
+    updateCloseValidationHint({ canCreate: false, tone: "error", message: `每轮平仓名义金额 ${formatNumber(perRoundNotional, 4)} 低于交易所最小下单金额 ${formatNumber(minNotional, 4)}。` });
+    return;
+  }
+  updateCloseValidationHint({ canCreate: true, tone: "success", message: `当前可双向平仓数量 ${formatNumber(maxCloseableQty, 6)}，每轮名义平仓金额 ${formatNumber(perRoundNotional, 4)}，可以平仓。` });
+}
+
+function summarizeSessionEvent(event) {
+  const payload = event.payload || {};
+  switch (event.event_type) {
+    case "session_created":
+      return { level: "info", message: `真实开仓会话已创建: ${payload.symbol} | ${payload.trend_bias} | ${payload.round_count} 轮` };
+    case "session_preflight_failed":
+      return { level: "error", message: `真实开仓预检失败: ${payload.error || "未知错误"}` };
+    case "round_started":
+      return { level: "info", message: `第 ${payload.round_index} 轮开始执行开仓` };
+    case "stage1_fill":
+    case "stage1_late_fill":
+      return { level: "success", message: `第 ${payload.round_index} 轮 Stage1 成交 ${payload.filled_qty}` };
+    case "stage2_fill":
+    case "stage2_late_fill":
+      return { level: "success", message: `第 ${payload.round_index} 轮 Stage2 成交 ${payload.filled_qty}，剩余 ${payload.remaining_qty}` };
+    case "stage2_zero_fill_retry":
+      return { level: "warn", message: `第 ${payload.round_index} 轮 Stage2 零成交重试，第 ${payload.retry} 次` };
+    case "stage2_below_min_carryover":
+      return { level: "warn", message: `第 ${payload.round_index} 轮 Stage2 剩余 ${payload.remaining_qty} 金额低于最小下单金额，残量结转到下一轮` };
+    case "stage2_carryover_persisted":
+      return { level: "warn", message: `第 ${payload.round_index} 轮保留待补残量 ${payload.carryover_qty}` };
+    case "round_completed":
+      return { level: "success", message: `第 ${payload.round_index} 轮开仓完成，残量 ${payload.stage2_remaining_qty || "0"}` };
+    case "round_skipped":
+      return { level: "warn", message: `第 ${payload.round_index} 轮因 Stage1 连续零成交被跳过` };
+    case "final_alignment_started":
+      return { level: "warn", message: `开始最终市价对齐，当前残量 ${payload.carryover_qty}` };
+    case "final_alignment_market_reduce":
+      return { level: "warn", message: `最终对齐减仓 ${payload.position_side} ${payload.qty}` };
+    case "final_alignment_flatten_both_sides":
+      return { level: "warn", message: "少侧不足最小减仓量，双边市价清仓对齐" };
+    case "final_alignment_completed":
+      return { level: "success", message: `最终对齐完成: ${payload.mode || "完成"}` };
+    case "final_alignment_failed":
+      return { level: "error", message: `最终对齐失败: ${payload.error || "未知错误"}` };
+    case "session_completed":
+      return { level: "success", message: `真实开仓会话完成，最终对齐结果 ${formatAlignmentStatus(payload.final_alignment_status)}` };
+    case "session_failed":
+      return { level: "error", message: `真实开仓会话失败: ${payload.error || "未知错误"}` };
+    case "close_session_created":
+      return { level: "info", message: `真实双向平仓会话已创建: ${payload.symbol} | ${payload.trend_bias} | ${payload.round_count} 轮 | 数量 ${payload.close_qty}` };
+    case "close_session_preflight_failed":
+      return { level: "error", message: `真实双向平仓预检失败: ${payload.error || "未知错误"}` };
+    case "close_round_started":
+      return { level: "info", message: `第 ${payload.round_index} 轮开始执行双向平仓` };
+    case "close_round_skipped":
+      return { level: "warn", message: `第 ${payload.round_index} 轮无可双向平仓持仓，已跳过` };
+    case "close_stage1_fill":
+    case "close_stage1_late_fill":
+      return { level: "success", message: `第 ${payload.round_index} 轮 Stage1 平仓成交 ${payload.filled_qty}` };
+    case "close_stage2_fill":
+    case "close_stage2_late_fill":
+      return { level: "success", message: `第 ${payload.round_index} 轮 Stage2 平仓成交 ${payload.filled_qty}` };
+    case "close_stage2_zero_fill_retry":
+      return { level: "warn", message: `第 ${payload.round_index} 轮 Stage2 平仓零成交重试，第 ${payload.retry} 次` };
+    case "close_round_completed":
+      return { level: "success", message: `第 ${payload.round_index} 轮双向平仓完成` };
+    case "close_round_interval_wait":
+      return { level: "info", message: `等待 ${payload.wait_seconds} 秒后进入下一轮双向平仓` };
+    case "close_session_completed":
+      return { level: "success", message: "真实双向平仓会话完成" };
+    case "close_session_failed":
+      return { level: "error", message: `真实双向平仓会话失败: ${payload.error || "未知错误"}` };
+    case "single_open_session_created":
+      return { level: "info", message: `真实单向开仓会话已创建: ${payload.symbol} | ${payload.selected_position_side} | ${payload.round_count} 轮 | 数量 ${payload.open_qty}` };
+    case "single_open_session_preflight_failed":
+      return { level: "error", message: `真实单向开仓预检失败: ${payload.error || "未知错误"}` };
+    case "single_open_round_started":
+      return { level: "info", message: `第 ${payload.round_index} 轮开始执行单向开仓` };
+    case "single_open_fill":
+    case "single_open_late_fill":
+      return { level: "success", message: `第 ${payload.round_index} 轮单向开仓成交 ${payload.filled_qty}` };
+    case "single_open_zero_fill_retry":
+      return { level: "warn", message: `第 ${payload.round_index} 轮单向开仓零成交重试，第 ${payload.retry} 次` };
+    case "single_open_round_completed":
+      return { level: "success", message: `第 ${payload.round_index} 轮单向开仓完成` };
+    case "single_open_round_skipped":
+      return { level: "warn", message: `第 ${payload.round_index} 轮单向开仓已跳过` };
+    case "single_open_round_interval_wait":
+      return { level: "info", message: `等待 ${payload.wait_seconds} 秒后进入下一轮单向开仓` };
+    case "single_open_market_fallback":
+      return { level: "warn", message: `第 ${payload.round_index} 轮单向开仓已转市价补单 ${payload.filled_qty}` };
+    case "single_open_session_completed":
+      return { level: "success", message: "真实单向开仓会话完成" };
+    case "single_open_session_failed":
+      return { level: "error", message: `真实单向开仓会话失败: ${payload.error || "未知错误"}` };
+    case "single_close_session_created":      return { level: "info", message: `真实单向平仓会话已创建: ${payload.symbol} | ${payload.selected_position_side} | ${payload.round_count} 轮 | 数量 ${payload.close_qty}` };
+    case "single_close_session_preflight_failed":
+      return { level: "error", message: `真实单向平仓预检失败: ${payload.error || "未知错误"}` };
+    case "single_close_round_started":
+      return { level: "info", message: `第 ${payload.round_index} 轮开始执行单向平仓` };
+    case "single_close_fill":
+    case "single_close_late_fill":
+      return { level: "success", message: `第 ${payload.round_index} 轮单向平仓成交 ${payload.filled_qty}` };
+    case "single_close_zero_fill_retry":
+      return { level: "warn", message: `第 ${payload.round_index} 轮单向平仓零成交重试，第 ${payload.retry} 次` };
+    case "single_close_round_completed":
+      return { level: "success", message: `第 ${payload.round_index} 轮单向平仓完成` };
+    case "single_close_round_skipped":
+      return { level: "warn", message: `第 ${payload.round_index} 轮无可平持仓，已跳过` };
+    case "single_close_round_interval_wait":
+      return { level: "info", message: `等待 ${payload.wait_seconds} 秒后进入下一轮单向平仓` };
+    case "single_close_market_fallback":
+      return { level: "warn", message: `第 ${payload.round_index} 轮单向平仓已转市价补单 ${payload.filled_qty}` };
+    case "single_close_session_completed":
+      return { level: "success", message: "真实单向平仓会话完成" };
+    case "single_close_session_failed":
+      return { level: "error", message: `真实单向平仓会话失败: ${payload.error || "未知错误"}` };
+    default:
+      return null;
+  }
+}
+
+function renderSessionEvents(events) {
+  (events || []).forEach((event) => {
+    if (seenSessionEventIds.has(event.event_id)) return;
+    seenSessionEventIds.add(event.event_id);
+    const summary = summarizeSessionEvent(event);
+    if (!summary) return;
+    appendLog(summary.level, summary.message, event.created_at);
+  });
+}
+
+function updateRealSessionStats(session) {
+  const terminalRounds = Array.isArray(session.rounds)
+    ? session.rounds.filter((round) => ["round_completed", "stage1_skipped"].includes(String(round.status || ""))).length
+    : 0;
+  document.getElementById("statSessionStatus").textContent = session.status || "idle";
+  document.getElementById("statMode").textContent = formatModeLabel(session.session_kind || executionMode);
+  document.getElementById("statRounds").textContent = `${terminalRounds} / ${session.round_count || 0}`;
+  document.getElementById("statCarryoverQty").textContent = formatNumber(session.stage2_carryover_qty || 0, 6);
+  document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(session.final_alignment_status);
+  document.getElementById("statLastQty").textContent = formatNumber(session.round_qty || 0, 8);
+  accountSelect.disabled = !isTerminalSession(session.status);
+}
+
+function stopSessionPolling(clearSessionId = true) {
+  if (activeSessionPoller) {
+    clearInterval(activeSessionPoller);
+    activeSessionPoller = null;
+  }
+  if (clearSessionId) {
+    activeSessionId = null;
+    accountSelect.disabled = availableAccounts.length <= 1;
+  }
+}
+
+async function pollActiveSession() {
+  if (!activeSessionId) return;
+  try {
+    const session = await request(`/sessions/${encodeURIComponent(activeSessionId)}`);
+    updateRealSessionStats(session);
+    renderSessionEvents(session.events || []);
+    if (isTerminalSession(session.status)) {
+      stopSessionPolling();
+    }
+  } catch (error) {
+    appendLog("error", `真实会话状态获取失败: ${String(error)}`);
+    stopSessionPolling();
+  }
+}
+
+function startSessionPolling(sessionId) {
+  stopSessionPolling(false);
+  activeSessionId = sessionId;
+  seenSessionEventIds.clear();
+  accountSelect.disabled = true;
+  pollActiveSession();
+  activeSessionPoller = setInterval(pollActiveSession, 1000);
+}
+
+async function refreshSymbolInfo(symbol) {
+  const symbolInfo = await request(`/symbols/${encodeURIComponent(symbol)}`);
+  setSymbolInfo(symbolInfo);
+  return symbolInfo;
+}
+
+function openSse() {
+  if (eventSource) return;
+  eventSource = new EventSource("/stream/events");
+  eventSource.addEventListener("connection_status", (event) => {
+    const payload = JSON.parse(event.data);
+    setConnectionState(payload);
+    document.getElementById("streamClock").textContent = nowTime();
+  });
+  eventSource.addEventListener("orderbook", (event) => {
+    const payload = JSON.parse(event.data);
+    renderLevels(asksContainer, payload.asks || [], "sell");
+    renderLevels(bidsContainer, payload.bids || [], "buy");
+    const bestAsk = Number(payload.asks?.[0]?.price || 0);
+    const bestBid = Number(payload.bids?.[0]?.price || 0);
+    latestReferencePrice = bestAsk > 0 && bestBid > 0 ? (bestAsk + bestBid) / 2 : (bestAsk || bestBid || 0);
+    recalculateOpenAmount();
+    recalculateCloseAmount();
+    recalculateSingleCloseAmount();
+    document.getElementById("streamClock").textContent = nowTime();
+  });
+  eventSource.addEventListener("execution_log", (event) => {
+    const payload = JSON.parse(event.data);
+    appendLog(payload.level || "info", payload.message || "", payload.created_at);
+    document.getElementById("streamClock").textContent = nowTime();
+  });
+  eventSource.addEventListener("execution_stats", (event) => {
+    const payload = JSON.parse(event.data);
+    updateExecutionStats(payload);
+  });
+  eventSource.addEventListener("account_overview", (event) => {
+    const payload = JSON.parse(event.data);
+    renderAccountOverview(payload);
+  });
+  eventSource.onerror = () => {
+    document.getElementById("streamClock").textContent = nowTime();
+  };
+}
+
+function closeSse() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+}
+
+async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.checked) {
+  const targetSymbol = normalizeSymbol(nextSymbol);
+  if (!targetSymbol) {
+    rebuildSymbolOptions(activeSymbol);
+    appendLog("warn", "请输入有效的交易对");
+    return false;
+  }
+  if (targetSymbol === activeSymbol) {
+    rebuildSymbolOptions(activeSymbol);
+    return true;
+  }
+  const previousSymbol = activeSymbol;
+  const previousTemporaryCustomSymbol = temporaryCustomSymbol;
+  const previousSymbolInfo = { ...currentSymbolInfo };
+  try {
+    const symbolInfo = await refreshSymbolInfo(targetSymbol);
+    temporaryCustomSymbol = symbolInfo.allowed ? null : targetSymbol;
+    setActiveSymbol(targetSymbol, true);
+    setSymbolInfo(symbolInfo);
+    if (shouldReconnect) {
+      openSse();
+      await request("/market/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: targetSymbol })
+      });
+    }
+    appendLog("info", `交易对已切换为 ${targetSymbol}`);
+    if (symbolInfo.allowed === false) {
+      appendLog("warn", `${targetSymbol} 在 Binance U 本位永续合约中存在，但当前不在系统白名单内，真实开单会失败`);
+    }
+    return true;
+  } catch (error) {
+    temporaryCustomSymbol = previousTemporaryCustomSymbol;
+    setActiveSymbol(previousSymbol, true);
+    setSymbolInfo(previousSymbolInfo);
+    appendLog("error", `交易对切换失败，${targetSymbol} 不存在或当前不可用: ${String(error)}`);
+    return false;
+  }
+}
+
+connectionToggle.addEventListener("change", async (event) => {
+  const symbol = executionSymbol.value || activeSymbol || "BTCUSDT";
+  try {
+    if (event.target.checked) {
+      await refreshSymbolInfo(symbol);
+      openSse();
+      await request("/market/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol })
+      });
+    } else {
+      await request("/market/disconnect", { method: "POST" });
+      closeSse();
+      setConnectionState({
+        connected: false,
+        status: "disconnected",
+        symbol,
+        account_id: currentAccount.id,
+        account_name: currentAccount.name,
+        message: "连接已关闭",
+      });
+    }
+  } catch (error) {
+    appendLog("error", String(error));
+    event.target.checked = false;
+  }
+});
+
+accountSelect.addEventListener("change", async (event) => {
+  const nextAccountId = String(event.target.value || "").trim().toLowerCase();
+  const previousAccount = { ...currentAccount };
+  const shouldReconnect = connectionToggle.checked;
+  if (!nextAccountId || nextAccountId === previousAccount.id) {
+    return;
+  }
+  try {
+    closeSse();
+    const payload = await request("/config/accounts/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: nextAccountId })
+    });
+    setCurrentAccount(payload.account.id, payload.account.name, true);
+    openSse();
+    try {
+      await refreshSymbolInfo(activeSymbol);
+      if (shouldReconnect) {
+        await request("/market/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: activeSymbol })
+        });
+      } else {
+        setConnectionState({
+          connected: false,
+          status: "disconnected",
+          symbol: activeSymbol,
+          account_id: payload.account.id,
+          account_name: payload.account.name,
+          message: "连接已关闭",
+        });
+      }
+      appendLog("success", `当前账户已切换为 ${payload.account.name}`);
+    } catch (error) {
+      connectionToggle.checked = false;
+      setConnectionState({
+        connected: false,
+        status: "error",
+        symbol: activeSymbol,
+        account_id: payload.account.id,
+        account_name: payload.account.name,
+        message: String(error)
+      });
+      appendLog("error", `账户已切换为 ${payload.account.name}，但当前交易对 ${activeSymbol} 加载失败: ${String(error)}`);
+    }
+  } catch (error) {
+    setCurrentAccount(previousAccount.id, previousAccount.name, true);
+    openSse();
+    appendLog("error", `账户切换失败: ${String(error)}`);
+  }
+});
+
+editWhitelistBtn.addEventListener("click", async () => {
+  try {
+    const initialValue = whitelistSymbols.join(", ");
+    const input = window.prompt("编辑白名单交易对，使用逗号分隔", initialValue);
+    if (input === null) return;
+    const symbols = input.split(",").map((item) => normalizeSymbol(item)).filter(Boolean);
+    const payload = await request("/config/whitelist", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbols })
+    });
+    whitelistSymbols = (payload.symbols || []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean);
+    const currentSymbol = normalizeSymbol(executionSymbol.value);
+    temporaryCustomSymbol = whitelistSymbols.includes(currentSymbol) ? null : currentSymbol;
+    rebuildSymbolOptions(currentSymbol);
+    appendLog("success", `白名单已更新: ${(payload.symbols || []).join(", ")}`);
+    await refreshSymbolInfo(currentSymbol);
+    if (!(payload.symbols || []).includes(currentSymbol)) {
+      appendLog("warn", `${currentSymbol} 已不在白名单内，真实开单会失败`);
+    }
+  } catch (error) {
+    appendLog("error", `白名单更新失败: ${String(error)}`);
+  }
+});
+
+confirmSymbolBtn.addEventListener("click", async () => {
+  const currentSymbol = normalizeSymbol(executionSymbol.value || activeSymbol);
+  const input = window.prompt("输入自定义交易对", currentSymbol);
+  if (input === null) {
+    rebuildSymbolOptions(activeSymbol);
+    return;
+  }
+  await switchSymbol(input, connectionToggle.checked);
+});
+
+orderBookInput.addEventListener("change", async (event) => {
+  await switchSymbol(event.target.value, connectionToggle.checked);
+});
+
+simulateBtn.addEventListener("click", async () => {
+  try {
+    openSse();
+    await refreshSymbolInfo(executionSymbol.value);
+    await request("/simulation/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: executionSymbol.value,
+        trend_bias: document.getElementById("trend").value,
+        open_amount: document.getElementById("calcMargin").value,
+        leverage: Number(document.getElementById("leverage").value),
+        round_count: Number(document.getElementById("calcRounds").value)
+      })
+    });
+  } catch (error) {
+    appendLog("error", String(error));
+  }
+});
+
+createBtn.addEventListener("click", async () => {
+  try {
+    const payload = await request("/sessions/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: executionSymbol.value,
+        trend_bias: document.getElementById("trend").value,
+        leverage: Number(document.getElementById("leverage").value),
+        round_count: Number(document.getElementById("calcRounds").value),
+        round_qty: document.getElementById("roundQty").value,
+        round_interval_seconds: Number(document.getElementById("roundIntervalSeconds").value)
+      })
+    });
+    appendLog("success", `真实开仓会话已创建: ${payload.session_id}`);
+    startSessionPolling(payload.session_id);
+  } catch (error) {
+    appendLog("error", String(error));
+  }
+});
+
+createCloseBtn.addEventListener("click", async () => {
+  try {
+    const payload = await request("/sessions/close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: closeExecutionSymbol.value,
+        trend_bias: document.getElementById("closeTrend").value,
+        close_qty: document.getElementById("closeQty").value,
+        round_count: Number(document.getElementById("closeRounds").value),
+        round_interval_seconds: Number(document.getElementById("closeRoundIntervalSeconds").value)
+      })
+    });
+    appendLog("success", `真实双向平仓会话已创建: ${payload.session_id}`);
+    startSessionPolling(payload.session_id);
+  } catch (error) {
+    appendLog("error", String(error));
+  }
+});
+createSingleOpenBtn.addEventListener("click", async () => {
+  try {
+    const payload = await request("/sessions/single-open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: document.getElementById("singleOpenExecutionSymbol").value,
+        open_mode: document.getElementById("singleOpenMode").value,
+        selected_position_side: document.getElementById("singleOpenMode").value === "align" ? null : (document.getElementById("singleOpenOrder").value || null),
+        open_qty: document.getElementById("singleOpenQty").value,
+        leverage: Number(document.getElementById("singleOpenLeverage").value),
+        round_count: Number(document.getElementById("singleOpenRounds").value),
+        round_interval_seconds: Number(document.getElementById("singleOpenRoundIntervalSeconds").value)
+      })
+    });
+    appendLog("success", `真实单向开仓会话已创建: ${payload.session_id}`);
+    startSessionPolling(payload.session_id);
+  } catch (error) {
+    appendLog("error", String(error));
+  }
+});
+
+createSingleCloseBtn.addEventListener("click", async () => {
+  try {
+    const payload = await request("/sessions/single-close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: document.getElementById("singleCloseExecutionSymbol").value,
+        close_mode: document.getElementById("singleCloseMode").value,
+        selected_position_side: document.getElementById("singleCloseMode").value === "align" ? null : (document.getElementById("singleCloseOrder").value || null),
+        close_qty: document.getElementById("singleCloseQty").value,
+        round_count: Number(document.getElementById("singleCloseRounds").value),
+        round_interval_seconds: Number(document.getElementById("singleCloseRoundIntervalSeconds").value)
+      })
+    });
+    appendLog("success", `真实单向平仓会话已创建: ${payload.session_id}`);
+    startSessionPolling(payload.session_id);
+  } catch (error) {
+    appendLog("error", String(error));
+  }
+});
+
+Object.entries(modeButtons).forEach(([mode, button]) => {
+  button.addEventListener("click", () => setExecutionMode(mode));
+});
+
+["calcMargin", "leverage", "calcRounds"].forEach((id) => {
+  document.getElementById(id).addEventListener("input", recalculateOpenAmount);
+});
+["closeQty", "closeRounds"].forEach((id) => {
+  document.getElementById(id).addEventListener("input", recalculateCloseAmount);
+});
+["singleOpenQty", "singleOpenRounds", "singleOpenLeverage"].forEach((id) => {
+  document.getElementById(id)?.addEventListener("input", recalculateSingleOpenAmount);
+});
+document.getElementById("singleOpenMode")?.addEventListener("change", recalculateSingleOpenAmount);
+document.getElementById("singleOpenOrder")?.addEventListener("change", (event) => {
+  syncPositionSideTone(event.target);
+  recalculateSingleOpenAmount();
+});
+["singleCloseQty", "singleCloseRounds"].forEach((id) => {
+  document.getElementById(id)?.addEventListener("input", recalculateSingleCloseAmount);
+});
+document.getElementById("singleCloseMode")?.addEventListener("change", recalculateSingleCloseAmount);
+document.getElementById("singleCloseOrder")?.addEventListener("change", (event) => {
+  syncPositionSideTone(event.target);
+  recalculateSingleCloseAmount();
+});
+document.getElementById("trend")?.addEventListener("change", (event) => syncTrendSelectTone(event.target));
+document.getElementById("closeTrend")?.addEventListener("change", (event) => syncTrendSelectTone(event.target));
+syncPositionSideTone(document.getElementById("singleOpenOrder"));
+syncPositionSideTone(document.getElementById("singleCloseOrder"));
+
+asksContainer.innerHTML = '<div class="empty-state orderbook-empty">开启滑块后加载卖盘</div>';
+bidsContainer.innerHTML = '<div class="empty-state orderbook-empty">开启滑块后加载买盘</div>';
+setActiveSymbol(activeSymbol, false);
+renderAccountOverview({ status: "idle", message: "未连接", totals: {}, positions: [], account_id: currentAccount.id, account_name: currentAccount.name });
+updateExecutionStats({
+  mode: "paired_open",
+  status: "idle",
+  rounds_total: 0,
+  rounds_completed: 0,
+  total_notional: "0",
+  notional_per_round: "0",
+  last_qty: "0",
+  min_notional: "0",
+  carryover_qty: "0",
+  final_alignment_status: "not_needed",
+});
+syncTrendSelectTone(document.getElementById("trend"));
+syncTrendSelectTone(document.getElementById("closeTrend"));
+syncPositionSideTone(document.getElementById("singleOpenOrder"));
+syncPositionSideTone(document.getElementById("singleCloseOrder"));
+setExecutionMode("paired_open");
+appendLog("info", "控制台已就绪，可从白名单下拉选择交易对，或点击自定义切换交易对");
+loadAccounts()
+  .catch((error) => {
+    appendLog("error", `账户列表加载失败: ${String(error)}`);
+  })
+  .finally(() => {
+    loadWhitelist()
+      .catch((error) => {
+        temporaryCustomSymbol = activeSymbol;
+        rebuildSymbolOptions(activeSymbol);
+        appendLog("error", `白名单加载失败: ${String(error)}`);
+      })
+      .finally(() => {
+        refreshSymbolInfo(activeSymbol).catch((error) => {
+          appendLog("error", `交易对规则加载失败: ${String(error)}`);
+        });
+      });
+  });
+
+
+
+
+
+
+
+
+
+

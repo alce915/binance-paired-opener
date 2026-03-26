@@ -1,0 +1,864 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Paired Opener Console</title>
+    <style>
+      :root {
+        --bg: #f4efe6;
+        --surface: #fffaf3;
+        --surface-soft: #fbf4ea;
+        --ink: #1d1a16;
+        --muted: #6e6253;
+        --accent: #b5532f;
+        --accent-soft: #f0d1c2;
+        --success: #21986f;
+        --success-soft: #dff5ec;
+        --warn: #d08a22;
+        --warn-soft: #fff0d7;
+        --danger: #c6514d;
+        --danger-soft: #f8dfde;
+        --border: #d8c5aa;
+        --buy: #2f9b78;
+        --sell: #d06d57;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", "PingFang SC", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at top, #fff8e7, var(--bg));
+      }
+      main { max-width: 1400px; margin: 0 auto; padding: 24px 18px 44px; }
+      .hero-header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        margin-bottom: 8px;
+      }
+      .hero-title-wrap {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        width: 100%;
+        min-width: 0;
+      }
+      .hero-controls {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex: 0 0 auto;
+      }
+      .hero-account-select {
+        width: 190px;
+        min-width: 190px;
+        max-width: 190px;
+        height: 40px;
+        padding: 6px 12px;
+      }
+      h1 { margin: 0; font-size: 32px; }
+      p { color: var(--muted); margin-top: 0; }
+      .dashboard {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: 340px minmax(420px, 1fr) 340px;
+        align-items: start;
+      }
+      .left-col, .center-col, .right-col { display: grid; gap: 18px; align-content: start; }
+      .right-col { width: 340px; }
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        background: var(--surface);
+        overflow: hidden;
+        box-shadow: 0 18px 40px rgba(29, 26, 22, 0.06);
+      }
+      .card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 18px 20px;
+        border-bottom: 1px solid rgba(216, 197, 170, 0.8);
+      }
+      .card-title { font-size: 22px; margin: 0; }
+      .card-body { padding: 20px; }
+      .dashboard > .left-col > .card:first-child .card-header,
+      .dashboard > .center-col > .card:first-child .card-header,
+      .dashboard > .right-col > .card:first-child .card-header {
+        min-height: 70px;
+      }
+      .orderbook-header {
+        height: 70px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+      }
+      .orderbook-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-left: auto;
+        width: auto;
+        justify-content: flex-end;
+        flex-wrap: nowrap;
+      }
+      .orderbook-input {
+        width: 180px;
+        flex: 0 0 180px;
+        height: 42px;
+        padding: 8px 12px;
+      }
+      .orderbook-toolbar .inline-btn {
+        min-width: 110px;
+        padding: 8px 14px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 8px 12px;
+        border-radius: 999px;
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .badge.warn { color: #8f5c0c; background: var(--warn-soft); }
+      .badge.success { color: #11664b; background: var(--success-soft); }
+      .badge.error { color: #8d302d; background: var(--danger-soft); }
+      .metric-grid { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+      .metric {
+        padding: 18px;
+        border: 1px solid rgba(216, 197, 170, 0.85);
+        border-radius: 16px;
+        background: var(--surface-soft);
+      }
+      .metric-label { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+      .metric-value { font-size: 22px; font-weight: 800; color: var(--accent); line-height: 1.2; word-break: break-all; }
+      .metric-value.positive { color: var(--success); }
+      .metric-value.negative { color: var(--danger); }
+      .metric-value.zero { color: var(--ink); }
+      .positions-panel { margin-top: 18px; }
+      .positions-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+      .positions-title { font-size: 20px; margin: 0; }
+      .positions-count { min-width: 44px; justify-content: center; }
+      .positions-list { display: grid; gap: 12px; }
+      .position-row { padding: 14px 16px; border: 1px solid rgba(216, 197, 170, 0.8); border-radius: 16px; background: linear-gradient(180deg, #fffaf5, #f9f0e4); }
+      .position-row-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+      .position-symbol { display: inline-flex; align-items: center; gap: 8px; font-weight: 800; }
+      .position-leverage-inline { font-size: 12px; font-weight: 700; color: var(--muted); }
+      .position-side { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+      .position-side.long { color: #11664b; background: var(--success-soft); }
+      .position-side.short { color: #8d302d; background: var(--danger-soft); }
+      .position-meta { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; font-size: 13px; color: var(--muted); }
+      .position-meta strong { display: block; color: var(--ink); font-size: 15px; margin-top: 2px; }
+      .position-meta strong.positive { color: var(--success); }
+      .position-meta strong.negative { color: var(--danger); }
+      .position-meta strong.zero { color: var(--ink); }
+      .empty-state {
+        margin-top: 18px;
+        min-height: 190px;
+        display: grid;
+        place-items: center;
+        text-align: center;
+        color: var(--muted);
+        border: 1px dashed rgba(216, 197, 170, 0.9);
+        border-radius: 18px;
+        background: linear-gradient(180deg, #fffaf4, #f9f0e4);
+      }
+      .orderbook-card-body { padding-bottom: 10px; }
+      .orderbook-grid { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+      .levels { display: grid; gap: 10px; }
+      #asksContainer, #bidsContainer { min-height: 106px; align-content: start; }
+      .orderbook-empty { min-height: 106px; height: 106px; margin-top: 0; }
+      .level-head { font-size: 13px; font-weight: 700; color: var(--muted); margin-bottom: 4px; }
+      .level-row {
+        position: relative;
+        overflow: hidden;
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 1fr 1fr 72px;
+        align-items: center;
+        padding: 10px 12px;
+        border: 1px solid rgba(216, 197, 170, 0.75);
+        border-radius: 12px;
+        background: #fffdf9;
+        font-size: 14px;
+      }
+      .level-row::before {
+        content: "";
+        position: absolute;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        width: calc(var(--depth, 0) * 100%);
+        opacity: 0.16;
+      }
+      .level-row.sell::before { background: var(--sell); }
+      .level-row.buy::before { background: var(--buy); }
+      .level-price.sell { color: var(--sell); font-weight: 700; }
+      .level-price.buy { color: var(--buy); font-weight: 700; }
+      .level-qty, .level-bar-value { position: relative; z-index: 1; text-align: right; }
+      .param-grid { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+      .inline-grid { display: grid; gap: 12px; grid-template-columns: 1fr auto; align-items: end; margin-bottom: 18px; }
+      label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
+      input, select, button {
+        width: 100%;
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: #fffdf9;
+        font: inherit;
+        color: var(--ink);
+      }
+      input[readonly] {
+        background: #f6ede2;
+        color: #7a6b58;
+        cursor: not-allowed;
+      }
+      input:focus, select:focus {
+        outline: 2px solid rgba(181, 83, 47, 0.18);
+        border-color: var(--accent);
+      }
+      .button-row { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; margin-top: 18px; }
+      .mode-tabs {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(4, minmax(0, 160px));
+        width: auto;
+        justify-content: space-between;
+      }
+      .mode-tab {
+        min-width: 0;
+        padding: 12px 10px;
+        background: #6e6253;
+        color: white;
+      }
+      .mode-tab.active {
+        background: var(--success);
+        box-shadow: inset 0 0 0 2px rgba(255,255,255,0.18);
+      }
+      .mode-tab.close-mode.active {
+        background: var(--danger);
+      }
+      .mode-panel.hidden { display: none; }
+      .placeholder-panel {
+        min-height: 280px;
+        display: grid;
+        place-items: center;
+        text-align: center;
+        color: var(--muted);
+        border: 1px dashed rgba(216, 197, 170, 0.9);
+        border-radius: 18px;
+        background: linear-gradient(180deg, #fffaf4, #f9f0e4);
+      }
+      .mode-panel label { font-weight: 800; }
+      .mode-panel input,
+      .mode-panel select { font-weight: 800; }
+      .mode-panel .validation-hint { font-weight: 700; }
+      button {
+        border: none;
+        background: var(--accent);
+        color: white;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.58;
+        cursor: not-allowed;
+        box-shadow: none;
+      }
+      button.secondary { background: #6e6253; }
+      button.success { background: var(--success); }
+      button.inline-btn { width: auto; min-width: 132px; }
+      .calc-grid { display: grid; gap: 12px; grid-template-columns: repeat(3, 1fr); margin-top: 18px; }
+      .calc-item {
+        padding: 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(216, 197, 170, 0.8);
+        background: linear-gradient(180deg, #fff9f3, #f8efe4);
+      }
+      .calc-item strong { display: block; margin-bottom: 8px; font-size: 13px; color: var(--muted); }
+      .calc-item span { display: block; font-size: 24px; font-weight: 800; color: var(--accent); }
+      .validation-hint {
+        margin-top: 14px;
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(216, 197, 170, 0.8);
+        background: var(--surface-soft);
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .validation-hint.success {
+        color: #11664b;
+        background: var(--success-soft);
+        border-color: rgba(33, 152, 111, 0.24);
+      }
+      .validation-hint.error {
+        color: #8d302d;
+        background: var(--danger-soft);
+        border-color: rgba(198, 81, 77, 0.24);
+      }
+      select.trend-long { color: var(--success) !important; font-weight: 700; border-color: rgba(33, 152, 111, 0.55) !important; background: #f8fffb !important; }
+      select.trend-short { color: var(--danger) !important; font-weight: 700; border-color: rgba(198, 81, 77, 0.55) !important; background: #fff9f9 !important; }
+      select.trend-long:focus { outline: 2px solid rgba(33, 152, 111, 0.18); border-color: var(--success); }
+      select.trend-short:focus { outline: 2px solid rgba(198, 81, 77, 0.18); border-color: var(--danger); }
+      select option[value="long"] { color: var(--success); }
+      select option[value="short"] { color: var(--danger); }
+      select.side-long, #singleOpenOrder.side-long, #singleCloseOrder.side-long { color: var(--success) !important; font-weight: 700; border-color: rgba(33, 152, 111, 0.55) !important; background: #f8fffb !important; }
+      select.side-short, #singleOpenOrder.side-short, #singleCloseOrder.side-short { color: var(--danger) !important; font-weight: 700; border-color: rgba(198, 81, 77, 0.55) !important; background: #fff9f9 !important; }
+      select.side-long:focus, #singleOpenOrder.side-long:focus, #singleCloseOrder.side-long:focus { outline: 2px solid rgba(33, 152, 111, 0.18); border-color: var(--success); }
+      select.side-short:focus, #singleOpenOrder.side-short:focus, #singleCloseOrder.side-short:focus { outline: 2px solid rgba(198, 81, 77, 0.18); border-color: var(--danger); }
+      select option[value="LONG"] { color: var(--success); }
+      select option[value="SHORT"] { color: var(--danger); }
+      .stat-list { display: grid; gap: 10px; }
+      .stat-item {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 14px;
+        border: 1px solid rgba(216, 197, 170, 0.8);
+        border-radius: 14px;
+        background: var(--surface-soft);
+      }
+      .stat-item strong { color: var(--muted); font-size: 13px; }
+      .stat-item span { font-weight: 800; font-size: 14px; text-align: right; }
+      .stat-item span.mono { font-size: 14px; font-family: inherit; font-variant-numeric: tabular-nums; }
+      .logs-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 16px 20px;
+        border-bottom: 1px solid rgba(216, 197, 170, 0.8);
+      }
+      .logs-title-group { display: flex; align-items: center; gap: 12px; }
+      .logs-header-status { display: inline-flex; align-items: center; gap: 0px; color: var(--muted); font-size: 13px; }
+      .switch { position: relative; width: 56px; height: 30px; display: inline-block; }
+      .switch input { display: none; }
+      .switch-slider {
+        position: absolute;
+        inset: 0;
+        border-radius: 999px;
+        background: #d1c0a7;
+        transition: background 0.2s ease;
+        cursor: pointer;
+      }
+      .switch-slider::before {
+        content: "";
+        position: absolute;
+        width: 24px;
+        height: 24px;
+        left: 3px;
+        top: 3px;
+        border-radius: 50%;
+        background: white;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        transition: transform 0.2s ease;
+      }
+      .switch input:checked + .switch-slider { background: var(--success); }
+      .switch input:checked + .switch-slider::before { transform: translateX(26px); }
+      .logs-body {
+        height: 360px;
+        overflow: auto;
+        background: rgba(253, 249, 242, 0.65);
+        padding: 20px;
+      }
+      .log-line {
+        display: flex;
+        gap: 12px;
+        align-items: flex-start;
+        padding: 10px 0;
+        border-bottom: 1px dashed rgba(216, 197, 170, 0.65);
+        font-size: 14px;
+      }
+      .log-time { min-width: 82px; color: var(--muted); font-variant-numeric: tabular-nums; }
+      .log-badge {
+        min-width: 58px;
+        text-transform: uppercase;
+        font-size: 11px;
+        padding: 5px 8px;
+        border-radius: 999px;
+        text-align: center;
+        font-weight: 700;
+      }
+      .log-badge.info { background: var(--accent-soft); color: #7a3d23; }
+      .log-badge.warn { background: var(--warn-soft); color: #8f5c0c; }
+      .log-badge.error { background: var(--danger-soft); color: #8d302d; }
+      .log-badge.success { background: var(--success-soft); color: #11664b; }
+      .log-message { flex: 1; }
+      .footer-status {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 13px;
+        padding: 14px 20px 18px;
+        border-top: 1px solid rgba(216, 197, 170, 0.8);
+      }
+      .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; background: #aa9a85; }
+      .dot.live { background: var(--success); }
+      .mono { font-variant-numeric: tabular-nums; font-family: Consolas, Monaco, monospace; }
+      @media (max-width: 1240px) {
+        .dashboard { grid-template-columns: 1fr; }
+        .orderbook-grid, .param-grid, .calc-grid, .metric-grid, .button-row, .inline-grid { grid-template-columns: 1fr; }
+        button.inline-btn { width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="hero-header">
+        <div class="hero-title-wrap">
+          <h1>双向配对开单控制台</h1>
+          <div class="hero-controls">
+            <select id="accountSelect" class="hero-account-select"></select>
+            <span id="switchLabel" class="badge warn">已断开</span>
+            <label class="switch">
+              <input type="checkbox" id="connectionToggle" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+          <span id="accountBadge" class="badge warn" hidden>默认账户</span>
+        </div>
+      </div>
+      <p>步步为营，稳中求胜</p>
+
+      <section class="dashboard">
+        <div class="left-col">
+          <section class="card">
+            <div class="card-header">
+              <h2 class="card-title">账户概览</h2>
+              <span class="badge warn" id="connectionBadge">未连接</span>
+            </div>
+            <div class="card-body">
+              <div class="metric-grid">
+                <div class="metric">
+                  <div class="metric-label">总权益</div>
+                  <div class="metric-value mono" id="overviewEquity">--</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">保证金</div>
+                  <div class="metric-value mono" id="overviewMarginUsed">--</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">可用余额</div>
+                  <div class="metric-value mono" id="overviewAvailableBalance">--</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">未实现盈亏</div>
+                  <div class="metric-value mono" id="overviewUnrealizedPnl">--</div>
+                </div>
+              </div>
+              <div class="positions-panel">
+                <div class="positions-header">
+                  <h3 class="positions-title">当前持仓</h3>
+                  <span class="badge warn positions-count" id="positionsCount">0</span>
+                </div>
+                <div class="positions-list" id="positionsList">
+                  <div class="empty-state" style="min-height: 220px; margin-top: 0;">
+                    <div>
+                      <div style="font-size: 36px; margin-bottom: 10px;">📭</div>
+                      <div>暂无持仓</div>
+                      <div style="margin-top: 6px; font-size: 13px;">连接后会显示当前 U 本位合约持仓</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="center-col">
+          <section class="card">
+            <div class="card-header orderbook-header">
+              <h2 class="card-title">订单簿</h2>
+              <div class="orderbook-toolbar">
+                <select id="orderBookInput" class="orderbook-input"></select>
+                <button id="confirmSymbolBtn" class="inline-btn success">自定义</button>
+                <button id="editWhitelistBtn" class="inline-btn secondary">白名单</button>
+              </div>
+            </div>
+            <div class="card-body orderbook-card-body">
+              <div class="orderbook-grid">
+                <div>
+                  <div class="levels" id="asksContainer"></div>
+                </div>
+                <div>
+                  <div class="levels" id="bidsContainer"></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+                    <section class="card">
+            <div class="card-header">
+              <div class="mode-tabs">
+                <button id="modePairedOpen" class="mode-tab active">双向开仓</button>
+                <button id="modePairedClose" class="mode-tab close-mode">双向平仓</button>
+                <button id="modeSingleOpen" class="mode-tab">单向开仓</button>
+                <button id="modeSingleClose" class="mode-tab close-mode">单向平仓</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div id="pairedOpenPanel" class="mode-panel">
+                <div class="param-grid">
+                  <div>
+                    <label for="executionSymbol">执行交易对</label>
+                    <input id="executionSymbol" value="BTCUSDT" readonly />
+                  </div>
+                  <div>
+                    <label for="trend">趋势方向</label>
+                    <select id="trend">
+                      <option value="long">long · 先多后空</option>
+                      <option value="short">short · 先空后多</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="calcMargin">开单金额</label>
+                    <input id="calcMargin" type="number" min="0" step="0.01" value="100" />
+                  </div>
+                  <div>
+                    <label for="calcRounds">开单轮次</label>
+                    <input id="calcRounds" type="number" min="1" step="1" value="10" />
+                  </div>
+                  <div>
+                    <label for="roundQty">每轮数量（自动计算，<span id="openRoundQtyUnit">BTC</span> 数量）</label>
+                    <input id="roundQty" value="0" readonly />
+                  </div>
+                  <div>
+                    <label for="roundIntervalSeconds">轮次间隔（秒）</label>
+                    <input id="roundIntervalSeconds" type="number" min="0" step="1" value="3" />
+                  </div>
+                  <div>
+                    <label for="leverage">杠杆倍数</label>
+                    <input id="leverage" type="number" value="50" min="1" />
+                  </div>
+                </div>
+                <div class="calc-grid">
+                  <div class="calc-item">
+                    <strong>每轮保证金金额</strong>
+                    <span id="marginPerRound" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>总名义开仓金额</strong>
+                    <span id="totalNotional" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>每轮开仓金额</strong>
+                    <span id="notionalPerRound" class="mono">0</span>
+                  </div>
+                </div>
+                <div id="minNotionalHint" class="validation-hint">正在加载交易对规则...</div>
+                <div class="button-row" style="grid-template-columns: 1fr;">
+                  <button id="simulateBtn">模拟执行</button>
+                </div>
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                  <button id="createBtn" class="success">创建真实开单会话</button>
+                </div>
+              </div>
+              <div id="pairedClosePanel" class="mode-panel hidden">
+                <div class="param-grid">
+                  <div>
+                    <label for="closeExecutionSymbol">执行交易对</label>
+                    <input id="closeExecutionSymbol" value="BTCUSDT" readonly />
+                  </div>
+                  <div>
+                    <label for="closeTrend">趋势方向</label>
+                    <select id="closeTrend">
+                      <option value="long">long · 先平空后平多</option>
+                      <option value="short">short · 先平多后平空</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="closeQty">平仓数量（<span id="closeQtyUnit">BTC</span> 数量）</label>
+                    <input id="closeQty" type="number" min="0" step="0.000001" value="0" />
+                  </div>
+                  <div>
+                    <label for="closeRounds">开单轮次</label>
+                    <input id="closeRounds" type="number" min="1" step="1" value="10" />
+                  </div>
+                  <div>
+                    <label for="closeRoundQty">每轮数量（自动计算，<span id="closeRoundQtyUnit">BTC</span> 数量）</label>
+                    <input id="closeRoundQty" value="0" readonly />
+                  </div>
+                  <div>
+                    <label for="closeRoundIntervalSeconds">轮次间隔（秒）</label>
+                    <input id="closeRoundIntervalSeconds" type="number" min="0" step="1" value="3" />
+                  </div>
+                </div>
+                <div class="calc-grid">
+                  <div class="calc-item">
+                    <strong>可双向平仓数量</strong>
+                    <span id="maxCloseableQty" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>总名义平仓金额</strong>
+                    <span id="closeTotalNotional" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>每轮名义平仓金额</strong>
+                    <span id="closeNotionalPerRound" class="mono">0</span>
+                  </div>
+                </div>
+                <div id="closeValidationHint" class="validation-hint">请输入平仓数量和轮次。</div>
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                  <button id="createCloseBtn" class="success">创建真实平仓会话</button>
+                </div>
+              </div>
+              <div id="singleOpenPanel" class="mode-panel hidden">
+                <div class="param-grid">
+                  <div>
+                    <label for="singleOpenExecutionSymbol">执行交易对</label>
+                    <input id="singleOpenExecutionSymbol" value="BTCUSDT" readonly />
+                  </div>
+                  <div>
+                    <label for="singleOpenMode">开仓模式</label>
+                    <select id="singleOpenMode">
+                      <option value="regular">常规开仓</option>
+                      <option value="align">订单对齐</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="singleOpenOrder">开仓订单</label>
+                    <select id="singleOpenOrder">
+                      <option value="LONG">LONG</option>
+                      <option value="SHORT">SHORT</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="singleOpenQty">开仓数量（<span id="singleOpenQtyUnit">BTC</span> 数量）</label>
+                    <input id="singleOpenQty" type="number" min="0" step="0.000001" value="0" />
+                  </div>
+                  <div>
+                    <label for="singleOpenRounds">开单轮次</label>
+                    <input id="singleOpenRounds" type="number" min="1" step="1" value="10" />
+                  </div>
+                  <div>
+                    <label for="singleOpenRoundQty">每轮数量（自动计算，<span id="singleOpenRoundQtyUnit">BTC</span> 数量）</label>
+                    <input id="singleOpenRoundQty" value="0" readonly />
+                  </div>
+                  <div>
+                    <label for="singleOpenRoundIntervalSeconds">轮次间隔（秒）</label>
+                    <input id="singleOpenRoundIntervalSeconds" type="number" min="0" step="1" value="3" />
+                  </div>
+                </div>
+                <div class="calc-grid">
+                  <div class="calc-item">
+                    <strong>每轮保证金金额</strong>
+                    <span id="singleOpenMarginPerRound" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>总名义开仓金额</strong>
+                    <span id="singleOpenTotalNotional" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>每轮开仓金额</strong>
+                    <span id="singleOpenNotionalPerRound" class="mono">0</span>
+                  </div>
+                </div>
+                <div id="singleOpenValidationHint" class="validation-hint">请选择开仓模式和开仓订单。</div>
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                  <button id="createSingleOpenBtn" class="success">创建真实单向开仓会话</button>
+                </div>
+              </div>
+              <div id="singleClosePanel" class="mode-panel hidden">
+                <div class="param-grid">
+                  <div>
+                    <label for="singleCloseExecutionSymbol">执行交易对</label>
+                    <input id="singleCloseExecutionSymbol" value="BTCUSDT" readonly />
+                  </div>
+                  <div>
+                    <label for="singleCloseMode">平仓模式</label>
+                    <select id="singleCloseMode">
+                      <option value="regular">常规平仓</option>
+                      <option value="align">订单对齐</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="singleCloseOrder">平仓订单</label>
+                    <select id="singleCloseOrder"></select>
+                  </div>
+                  <div>
+                    <label for="singleCloseQty">平仓数量（<span id="singleCloseQtyUnit">BTC</span> 数量）</label>
+                    <input id="singleCloseQty" type="number" min="0" step="0.000001" value="0" />
+                  </div>
+                  <div>
+                    <label for="singleCloseRounds">开单轮次</label>
+                    <input id="singleCloseRounds" type="number" min="1" step="1" value="10" />
+                  </div>
+                  <div>
+                    <label for="singleCloseRoundQty">每轮数量（自动计算，<span id="singleCloseRoundQtyUnit">BTC</span> 数量）</label>
+                    <input id="singleCloseRoundQty" value="0" readonly />
+                  </div>
+                  <div>
+                    <label for="singleCloseRoundIntervalSeconds">轮次间隔（秒）</label>
+                    <input id="singleCloseRoundIntervalSeconds" type="number" min="0" step="1" value="3" />
+                  </div>
+                </div>
+                <div class="calc-grid">
+                  <div class="calc-item">
+                    <strong>当前可平数量</strong>
+                    <span id="singleCloseAvailableQty" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>总名义平仓金额</strong>
+                    <span id="singleCloseTotalNotional" class="mono">0</span>
+                  </div>
+                  <div class="calc-item">
+                    <strong>每轮名义平仓金额</strong>
+                    <span id="singleCloseNotionalPerRound" class="mono">0</span>
+                  </div>
+                </div>
+                <div id="singleCloseValidationHint" class="validation-hint">请选择平仓模式和持仓订单。</div>
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                  <button id="createSingleCloseBtn" class="success">创建真实单向平仓会话</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="right-col">
+          <section class="card">
+            <div class="card-header">
+              <h2 class="card-title">执行统计</h2>
+              <span class="badge success" id="statsSymbol">BTCUSDT</span>
+            </div>
+            <div class="card-body">
+              <div class="stat-list">
+                <div class="stat-item"><strong>连接状态</strong><span id="statConnection">未连接</span></div>
+                <div class="stat-item"><strong>当前功能</strong><span id="statMode">双向开仓</span></div>
+                <div class="stat-item"><strong>模拟状态</strong><span id="statSimStatus">idle</span></div>
+                <div class="stat-item"><strong>真实会话状态</strong><span id="statSessionStatus">idle</span></div>
+                <div class="stat-item"><strong>完成轮次</strong><span id="statRounds">0 / 0</span></div>
+                <div class="stat-item"><strong>总名义金额</strong><span id="statTotalNotional" class="mono">0</span></div>
+                <div class="stat-item"><strong>每轮名义金额</strong><span id="statPerRound" class="mono">0</span></div>
+                <div class="stat-item"><strong>最小下单金额</strong><span id="statMinNotional" class="mono">0</span></div>
+                <div class="stat-item"><strong>待结转残量</strong><span id="statCarryoverQty" class="mono">0</span></div>
+                <div class="stat-item"><strong>最终对齐结果</strong><span id="statFinalAlignment">未触发</span></div>
+                <div class="stat-item"><strong>最新估算数量</strong><span id="statLastQty" class="mono">0</span></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="card logs-card" style="margin-top: 18px;">
+        <div class="logs-toolbar">
+          <div class="logs-title-group">
+            <h2 class="card-title" style="margin: 0;">执行日志</h2>
+            <span class="logs-header-status"><span class="dot" id="footerDot"></span><span id="footerStatus">已断开 BTCUSDT</span></span>
+          </div>
+          <span id="streamClock">--:--:--</span>
+        </div>
+        <div class="logs-body" id="logsBody"></div>
+      </section>
+    </main>
+
+        <script src="/static/app.js"></script>
+  </body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

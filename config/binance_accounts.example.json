@@ -1,0 +1,31 @@
+{
+  "accounts": [
+    {
+      "account_id": "main",
+      "name": "Main Account",
+      "api_key": "replace-with-main-api-key",
+      "api_secret": "replace-with-main-api-secret",
+      "use_testnet": false,
+      "rest_base_url": "",
+      "ws_base_url": ""
+    },
+    {
+      "account_id": "sub1",
+      "name": "Sub Account 1",
+      "api_key": "replace-with-sub1-api-key",
+      "api_secret": "replace-with-sub1-api-secret",
+      "use_testnet": false,
+      "rest_base_url": "",
+      "ws_base_url": ""
+    },
+    {
+      "account_id": "sub2",
+      "name": "Sub Account 2",
+      "api_key": "replace-with-sub2-api-key",
+      "api_secret": "replace-with-sub2-api-secret",
+      "use_testnet": true,
+      "rest_base_url": "",
+      "ws_base_url": ""
+    }
+  ]
+}

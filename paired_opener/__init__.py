@@ -1,0 +1,1 @@
+"""Binance paired opening service."""
