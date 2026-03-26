@@ -551,9 +551,13 @@ function recalculateSingleOpenAmount() {
     if (hasExistingPosition) {
       leverageInput.value = String(currentLeverage);
       leverageInput.disabled = true;
+      leverageInput.readOnly = false;
+      leverageInput.classList.add("locked-field");
       leverageInput.dataset.locked = "true";
     } else {
       leverageInput.disabled = false;
+      leverageInput.readOnly = false;
+      leverageInput.classList.remove("locked-field");
       if (wasLocked || Number(leverageInput.value || 0) <= 0) {
         leverageInput.value = String(currentLeverage);
       }
@@ -1430,6 +1434,9 @@ loadAccounts()
         });
       });
   });
+
+
+
 
 
 
