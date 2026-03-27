@@ -147,6 +147,12 @@ function formatNumber(value, digits = 8) {
   });
 }
 
+function formatDisplayPrice(value, digits = 2) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "--";
+  return formatNumber(numeric, digits);
+}
+
 function normalizeSymbol(value) {
   return (value || "BTCUSDT").trim().toUpperCase();
 }
@@ -826,6 +832,8 @@ function renderAccountOverview(payload) {
     const pnlClass = pnlValue > 0 ? "positive" : pnlValue < 0 ? "negative" : "zero";
     const leverageText = Number(position.leverage || 0) > 0 ? `${position.leverage}x` : "--";
     const notional = Number(position.notional || 0) || ((Number(position.qty || 0) || 0) * (Number(position.entry_price || 0) || 0));
+    const markPriceText = formatDisplayPrice(position.mark_price, 2);
+    const liquidationPriceText = formatDisplayPrice(position.liquidation_price, 2);
     const signature = JSON.stringify([
       position.symbol,
       position.position_side,
@@ -833,9 +841,13 @@ function renderAccountOverview(payload) {
       position.entry_price,
       position.unrealized_pnl,
       notional,
+      position.mark_price,
+      position.liquidation_price,
       leverageText,
       pnlClass,
       sideClass,
+      markPriceText,
+      liquidationPriceText,
     ]);
     if (row.dataset.signature !== signature) {
       row.dataset.signature = signature;
@@ -848,7 +860,9 @@ function renderAccountOverview(payload) {
           <div>数量<strong class="mono">${formatNumber(position.qty || 0, 6)}</strong></div>
           <div>名义价值<strong class="mono">${formatNumber(notional, 2)}</strong></div>
           <div>开仓均价<strong class="mono">${formatNumber(position.entry_price || 0, 2)}</strong></div>
+          <div>标记价格<strong class="mono">${markPriceText}</strong></div>
           <div>未实现盈亏<strong class="mono ${pnlClass}">${formatNumber(position.unrealized_pnl || 0, 4)}</strong></div>
+          <div>爆仓价格<strong class="mono">${liquidationPriceText}</strong></div>
         </div>
       `;
     }
