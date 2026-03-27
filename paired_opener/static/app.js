@@ -45,6 +45,9 @@ let latestAvailableBalance = null;
 let currentPositions = [];
 let currentSymbolInfo = { symbol: activeSymbol, min_notional: 0, allowed: true };
 let symbolInfoReady = false;
+let precheckTimer = null;
+let latestPrecheckToken = 0;
+const latestPrecheckByMode = new Map();
 let activeSessionId = null;
 let activeSessionPoller = null;
 const seenSessionEventIds = new Set();
@@ -58,13 +61,22 @@ function request(path, options = {}) {
     const text = await response.text();
     if (!response.ok) {
       let message = text;
+      let precheck = null;
       try {
         const payload = JSON.parse(text);
         if (payload && typeof payload === "object") {
-          message = payload.detail || payload.message || text;
+          if (payload.detail && typeof payload.detail === "object") {
+            message = payload.detail.message || payload.message || text;
+            precheck = payload.detail.precheck || null;
+          } else {
+            message = payload.detail || payload.message || text;
+            precheck = payload.precheck || null;
+          }
         }
       } catch {}
-      throw new Error(message);
+      const error = new Error(message);
+      if (precheck) error.precheck = precheck;
+      throw error;
     }
     try {
       return JSON.parse(text);
@@ -157,6 +169,148 @@ function formatModeLabel(mode) {
     default:
       return "双向开仓";
   }
+}
+
+function precheckTone(precheck) {
+  if (!precheck) return "";
+  if (precheck.ok === false) return "error";
+  const checks = Array.isArray(precheck.checks) ? precheck.checks : [];
+  if (checks.some((item) => String(item.status) === "warn")) return "";
+  return "success";
+}
+
+function summarizePrecheckMessage(precheck, fallbackMessage) {
+  if (!precheck) return fallbackMessage;
+  const summary = String(precheck.summary || fallbackMessage || "").trim();
+  const checks = Array.isArray(precheck.checks) ? precheck.checks : [];
+  const warning = checks.find((item) => String(item.status) === "warn");
+  if (warning && warning.message && warning.message !== summary) {
+    return `${summary} ${warning.message}`;
+  }
+  return summary || fallbackMessage;
+}
+
+function buildPrecheckPayload(mode = executionMode) {
+  switch (mode) {
+    case "paired_close":
+      return {
+        session_kind: "paired_close",
+        symbol: closeExecutionSymbol.value,
+        trend_bias: document.getElementById("closeTrend").value,
+        close_qty: document.getElementById("closeQty").value,
+        round_count: Number(document.getElementById("closeRounds").value),
+      };
+    case "single_open": {
+      const openMode = document.getElementById("singleOpenMode").value;
+      return {
+        session_kind: "single_open",
+        symbol: document.getElementById("singleOpenExecutionSymbol").value,
+        open_mode: openMode,
+        selected_position_side: openMode === "align" ? null : (document.getElementById("singleOpenOrder").value || null),
+        open_qty: document.getElementById("singleOpenQty").value,
+        leverage: Number(document.getElementById("singleOpenLeverage").value),
+        round_count: Number(document.getElementById("singleOpenRounds").value),
+      };
+    }
+    case "single_close": {
+      const closeMode = document.getElementById("singleCloseMode").value;
+      return {
+        session_kind: "single_close",
+        symbol: document.getElementById("singleCloseExecutionSymbol").value,
+        close_mode: closeMode,
+        selected_position_side: closeMode === "align" ? null : (document.getElementById("singleCloseOrder").value || null),
+        close_qty: document.getElementById("singleCloseQty").value,
+        round_count: Number(document.getElementById("singleCloseRounds").value),
+      };
+    }
+    default:
+      return {
+        session_kind: "paired_open",
+        symbol: executionSymbol.value,
+        trend_bias: document.getElementById("trend").value,
+        leverage: Number(document.getElementById("leverage").value),
+        round_count: Number(document.getElementById("calcRounds").value),
+        round_qty: document.getElementById("roundQty").value,
+      };
+  }
+}
+
+function applyPrecheckResult(mode, precheck) {
+  if (!precheck) return;
+  latestPrecheckByMode.set(mode, precheck);
+  const derived = precheck.derived || {};
+  if (mode === executionMode) {
+    refreshDerivedStats({
+      totalNotional: Number(derived.total_notional || 0),
+      perRoundNotional: Number(derived.per_round_notional || 0),
+      estimatedQty: Number(derived.normalized_round_qty || 0),
+      minNotional: Number((derived.min_notional ?? currentSymbolInfo.min_notional) || 0),
+    });
+    document.getElementById("statMode").textContent = formatModeLabel(mode);
+    document.getElementById("statCarryoverQty").textContent = formatNumber(derived.carryover_qty || 0, 6);
+    document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(derived.final_alignment_status);
+  }
+  const tone = precheckTone(precheck);
+  const message = summarizePrecheckMessage(precheck, "预检完成");
+  switch (mode) {
+    case "paired_close":
+      updateCloseValidationHint({ canCreate: Boolean(precheck.ok), tone, message });
+      break;
+    case "single_open":
+      updateSingleOpenValidationHint({ canCreate: Boolean(precheck.ok), tone, message });
+      break;
+    case "single_close":
+      updateSingleCloseValidationHint({ canCreate: Boolean(precheck.ok), tone, message });
+      break;
+    default:
+      updateOpenValidationHint({ canCreate: Boolean(precheck.ok), canSimulate: !simulateBtn.disabled, tone, message });
+      break;
+  }
+}
+
+async function runPrecheck(mode = executionMode) {
+  const token = ++latestPrecheckToken;
+  try {
+    const precheck = await request("/sessions/precheck", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildPrecheckPayload(mode))
+    });
+    if (token !== latestPrecheckToken) return;
+    applyPrecheckResult(mode, precheck);
+  } catch (error) {
+    if (token !== latestPrecheckToken) return;
+    const precheck = error.precheck || null;
+    if (precheck) {
+      applyPrecheckResult(mode, precheck);
+      return;
+    }
+    const message = `统一预检失败: ${String(error)}`;
+    switch (mode) {
+      case "paired_close":
+        updateCloseValidationHint({ canCreate: false, tone: "error", message });
+        break;
+      case "single_open":
+        updateSingleOpenValidationHint({ canCreate: false, tone: "error", message });
+        break;
+      case "single_close":
+        updateSingleCloseValidationHint({ canCreate: false, tone: "error", message });
+        break;
+      default:
+        updateOpenValidationHint({ canCreate: false, canSimulate: !simulateBtn.disabled, tone: "error", message });
+        break;
+    }
+  }
+}
+
+function schedulePrecheck(mode = executionMode, delay = 180) {
+  if (precheckTimer) {
+    clearTimeout(precheckTimer);
+  }
+  precheckTimer = setTimeout(() => {
+    precheckTimer = null;
+    runPrecheck(mode);
+  }, delay);
 }
 
 function isTerminalSession(status) {
@@ -265,6 +419,7 @@ function setExecutionMode(mode) {
   } else if (mode === "single_close") {
     recalculateSingleCloseAmount();
   }
+  schedulePrecheck(mode, 0);
 }
 
 function setActiveSymbol(symbol, syncInput = true) {
@@ -286,6 +441,7 @@ function setActiveSymbol(symbol, syncInput = true) {
   recalculateSingleCloseAmount();
   const footerStatus = document.getElementById("footerStatus");
   footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
+  schedulePrecheck();
 }
 
 function setSymbolInfo(info) {
@@ -296,7 +452,9 @@ function setSymbolInfo(info) {
   recalculateCloseAmount();
   recalculateSingleOpenAmount();
   recalculateSingleCloseAmount();
+  schedulePrecheck();
 }
+
 function renderLevels(container, levels, side) {
   container.innerHTML = "";
   levels.forEach((level, index) => {
@@ -1203,6 +1361,7 @@ accountSelect.addEventListener("change", async (event) => {
         });
       }
       appendLog("success", `当前账户已切换为 ${payload.account.name}`);
+      schedulePrecheck();
     } catch (error) {
       connectionToggle.checked = false;
       setConnectionState({
@@ -1298,6 +1457,7 @@ createBtn.addEventListener("click", async () => {
     appendLog("success", `真实开仓会话已创建: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
+    if (error.precheck) applyPrecheckResult("paired_open", error.precheck);
     appendLog("error", String(error));
   }
 });
@@ -1318,9 +1478,11 @@ createCloseBtn.addEventListener("click", async () => {
     appendLog("success", `真实双向平仓会话已创建: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
+    if (error.precheck) applyPrecheckResult("paired_close", error.precheck);
     appendLog("error", String(error));
   }
 });
+
 createSingleOpenBtn.addEventListener("click", async () => {
   try {
     const payload = await request("/sessions/single-open", {
@@ -1339,6 +1501,7 @@ createSingleOpenBtn.addEventListener("click", async () => {
     appendLog("success", `真实单向开仓会话已创建: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
+    if (error.precheck) applyPrecheckResult("single_open", error.precheck);
     appendLog("error", String(error));
   }
 });
@@ -1357,9 +1520,11 @@ createSingleCloseBtn.addEventListener("click", async () => {
         round_interval_seconds: Number(document.getElementById("singleCloseRoundIntervalSeconds").value)
       })
     });
+
     appendLog("success", `真实单向平仓会话已创建: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
+    if (error.precheck) applyPrecheckResult("single_close", error.precheck);
     appendLog("error", String(error));
   }
 });
@@ -1369,31 +1534,55 @@ Object.entries(modeButtons).forEach(([mode, button]) => {
 });
 
 ["calcMargin", "leverage", "calcRounds"].forEach((id) => {
-  document.getElementById(id).addEventListener("input", recalculateOpenAmount);
+  document.getElementById(id).addEventListener("input", () => {
+    recalculateOpenAmount();
+    schedulePrecheck("paired_open");
+  });
 });
 ["closeQty", "closeRounds"].forEach((id) => {
-  document.getElementById(id).addEventListener("input", recalculateCloseAmount);
+  document.getElementById(id).addEventListener("input", () => {
+    recalculateCloseAmount();
+    schedulePrecheck("paired_close");
+  });
 });
 ["singleOpenQty", "singleOpenRounds", "singleOpenLeverage"].forEach((id) => {
-  document.getElementById(id)?.addEventListener("input", recalculateSingleOpenAmount);
+  document.getElementById(id)?.addEventListener("input", () => {
+    recalculateSingleOpenAmount();
+    schedulePrecheck("single_open");
+  });
 });
-document.getElementById("singleOpenMode")?.addEventListener("change", recalculateSingleOpenAmount);
+document.getElementById("singleOpenMode")?.addEventListener("change", () => {
+  recalculateSingleOpenAmount();
+  schedulePrecheck("single_open");
+});
 document.getElementById("singleOpenOrder")?.addEventListener("change", (event) => {
   syncPositionSideTone(event.target);
   recalculateSingleOpenAmount();
+  schedulePrecheck("single_open");
 });
 ["singleCloseQty", "singleCloseRounds"].forEach((id) => {
-  document.getElementById(id)?.addEventListener("input", recalculateSingleCloseAmount);
+  document.getElementById(id)?.addEventListener("input", () => {
+    recalculateSingleCloseAmount();
+    schedulePrecheck("single_close");
+  });
 });
-document.getElementById("singleCloseMode")?.addEventListener("change", recalculateSingleCloseAmount);
+document.getElementById("singleCloseMode")?.addEventListener("change", () => {
+  recalculateSingleCloseAmount();
+  schedulePrecheck("single_close");
+});
 document.getElementById("singleCloseOrder")?.addEventListener("change", (event) => {
   syncPositionSideTone(event.target);
   recalculateSingleCloseAmount();
+  schedulePrecheck("single_close");
 });
-document.getElementById("trend")?.addEventListener("change", (event) => syncTrendSelectTone(event.target));
-document.getElementById("closeTrend")?.addEventListener("change", (event) => syncTrendSelectTone(event.target));
-syncPositionSideTone(document.getElementById("singleOpenOrder"));
-syncPositionSideTone(document.getElementById("singleCloseOrder"));
+document.getElementById("trend")?.addEventListener("change", (event) => {
+  syncTrendSelectTone(event.target);
+  schedulePrecheck("paired_open");
+});
+document.getElementById("closeTrend")?.addEventListener("change", (event) => {
+  syncTrendSelectTone(event.target);
+  schedulePrecheck("paired_close");
+});
 
 asksContainer.innerHTML = '<div class="empty-state orderbook-empty">开启滑块后加载卖盘</div>';
 bidsContainer.innerHTML = '<div class="empty-state orderbook-empty">开启滑块后加载买盘</div>';
@@ -1434,6 +1623,7 @@ loadAccounts()
         });
       });
   });
+
 
 
 

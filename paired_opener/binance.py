@@ -165,6 +165,10 @@ class BinanceFuturesGateway(ExchangeGateway):
         if payload.get("code") not in (200, None):
             raise ExchangeStateError(f"Failed to enable hedge mode: {payload}")
 
+    async def is_hedge_mode_enabled(self) -> bool:
+        payload = await self._signed_request('GET', '/fapi/v1/positionSide/dual')
+        return str(payload.get('dualSidePosition', '')).lower() == 'true'
+
     async def ensure_cross_margin(self, symbol: str) -> None:
         try:
             payload = await self._signed_request(
@@ -273,6 +277,13 @@ class BinanceFuturesGateway(ExchangeGateway):
                 self._symbol_leverage_cache[target] = leverage
                 return leverage
         return 1
+
+    async def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        payload = await self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": symbol.upper()})
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
     async def get_account_overview(self) -> dict[str, Any]:
         if not self._account.api_key or not self._account.api_secret:
             raise ExchangeStateError("Binance API credentials are not configured")
@@ -640,6 +651,8 @@ class BinanceFuturesGateway(ExchangeGateway):
         order = self._to_order(payload)
         self._order_cache[order.order_id] = order
         return order
+
+
 
 
 

@@ -64,6 +64,26 @@ class SingleOpenSessionRequest(BaseModel):
     round_interval_seconds: int | None = Field(default=None, ge=0, le=3600)
     created_by: str = "manual"
 
+
+class SessionPrecheckRequest(BaseModel):
+    session_kind: SessionKind
+    symbol: str = Field(..., examples=["BTCUSDT"])
+    trend_bias: TrendBias | None = None
+    leverage: int | None = Field(default=None, ge=1, le=125)
+    round_count: int = Field(default=1, ge=1, le=10_000)
+    round_qty: Decimal | None = Field(default=None, gt=0)
+    close_qty: Decimal | None = Field(default=None, gt=0)
+    open_qty: Decimal | None = Field(default=None, gt=0)
+    selected_position_side: PositionSide | None = None
+    open_mode: SingleOpenMode | None = None
+    close_mode: SingleCloseMode | None = None
+    poll_interval_ms: int | None = Field(default=None, ge=10)
+    order_ttl_ms: int | None = Field(default=None, ge=100)
+    max_zero_fill_retries: int | None = Field(default=None, ge=1, le=100)
+    market_fallback_attempts: int | None = Field(default=None, ge=1, le=20)
+    round_interval_seconds: int | None = Field(default=None, ge=0, le=3600)
+
+
 class MarketConnectRequest(BaseModel):
     symbol: str = Field(default="BTCUSDT")
 
@@ -74,6 +94,21 @@ class SimulationRequest(BaseModel):
     open_amount: Decimal = Field(..., gt=0)
     leverage: int = Field(..., ge=1, le=125)
     round_count: int = Field(..., ge=1, le=10_000)
+
+
+class PrecheckItem(BaseModel):
+    code: str
+    label: str
+    status: str
+    message: str
+    details: dict[str, Any] | None = None
+
+
+class SessionPrecheckResponse(BaseModel):
+    ok: bool
+    summary: str
+    checks: list[PrecheckItem]
+    derived: dict[str, Any] = Field(default_factory=dict)
 
 
 class SessionSummary(BaseModel):
@@ -172,8 +207,3 @@ class AccountSelectRequest(BaseModel):
 
 class AccountSelectResponse(BaseModel):
     account: AccountSummary
-
-
-
-
-

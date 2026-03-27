@@ -69,6 +69,9 @@ class FakeGateway(ExchangeGateway):
     async def ensure_hedge_mode(self) -> None:
         return None
 
+    async def is_hedge_mode_enabled(self) -> bool:
+        return True
+
     async def ensure_cross_margin(self, symbol: str) -> None:
         return None
 
@@ -91,6 +94,9 @@ class FakeGateway(ExchangeGateway):
 
     async def get_symbol_leverage(self, symbol: str) -> int:
         return 50
+
+    async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+        return []
 
     async def get_account_overview(self) -> dict:
         if not self.account_overviews:
@@ -542,6 +548,8 @@ async def test_final_alignment_uses_session_owned_qty_instead_of_account_totals(
 
     assert session.final_alignment_status == FinalAlignmentStatus.FLATTENED_BOTH_SIDES
     assert [request["qty"] for request in gateway.market_order_requests] == [Decimal("0.002"), Decimal("0.001")]
+
+
 
 
 

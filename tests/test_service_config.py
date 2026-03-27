@@ -46,6 +46,9 @@ class SimpleGateway(ExchangeGateway):
     async def ensure_hedge_mode(self) -> None:
         return None
 
+    async def is_hedge_mode_enabled(self) -> bool:
+        return True
+
     async def ensure_cross_margin(self, symbol: str) -> None:
         return None
 
@@ -75,6 +78,9 @@ class SimpleGateway(ExchangeGateway):
 
     async def get_symbol_leverage(self, symbol: str) -> int:
         return 50
+
+    async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+        return []
 
     async def get_account_overview(self) -> dict:
         return {
@@ -379,7 +385,7 @@ async def test_create_single_open_session_rejects_symbol_outside_whitelist(tmp_p
     engine = PairedOpeningEngine(gateway, repository)
     service = OpenSessionService(settings, repository, gateway, engine)
 
-    with pytest.raises(ValueError, match="not in whitelist"):
+    with pytest.raises(ValueError, match="白名单|无法真实开仓"):
         await service.create_single_open_session(
             SingleOpenSessionRequest(
                 symbol="ETHUSDT",
@@ -833,4 +839,7 @@ async def test_create_single_open_session_rejects_when_implied_open_amount_excee
                 round_count=1,
             )
         )
+
+
+
 

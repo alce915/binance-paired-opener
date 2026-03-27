@@ -13,6 +13,10 @@ class ExchangeGateway(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def is_hedge_mode_enabled(self) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
     async def ensure_cross_margin(self, symbol: str) -> None:
         raise NotImplementedError
 
@@ -38,6 +42,10 @@ class ExchangeGateway(ABC):
 
     @abstractmethod
     async def get_symbol_leverage(self, symbol: str) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     @abstractmethod
@@ -72,5 +80,3 @@ class ExchangeGateway(ABC):
     @abstractmethod
     async def cancel_order(self, *, symbol: str, order_id: str) -> ExchangeOrder:
         raise NotImplementedError
-
-

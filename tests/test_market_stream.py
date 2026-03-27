@@ -19,6 +19,9 @@ class SlowGateway(ExchangeGateway):
     async def ensure_hedge_mode(self) -> None:
         return None
 
+    async def is_hedge_mode_enabled(self) -> bool:
+        return True
+
     async def ensure_cross_margin(self, symbol: str) -> None:
         return None
 
@@ -50,6 +53,9 @@ class SlowGateway(ExchangeGateway):
 
     async def get_symbol_leverage(self, symbol: str) -> int:
         return 50
+
+    async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+        return []
 
     async def get_account_overview(self) -> dict:
         return {
@@ -186,3 +192,4 @@ async def test_subscribe_cancels_pending_disconnect() -> None:
     controller.unsubscribe(new_queue)
     gateway.release.set()
     await controller.disconnect()
+
