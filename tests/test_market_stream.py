@@ -168,3 +168,21 @@ async def test_unsubscribe_without_subscribers_stops_market_loop() -> None:
     assert controller._state["status"] == "disconnected"
     assert controller._market_task is None
 
+
+@pytest.mark.asyncio
+async def test_subscribe_cancels_pending_disconnect() -> None:
+    gateway = SlowGateway()
+    controller = MarketStreamController(gateway)
+    queue = await controller.subscribe()
+    await controller.connect("BTCUSDT")
+    await gateway.started.wait()
+
+    controller.unsubscribe(queue)
+    new_queue = await controller.subscribe()
+    await asyncio.sleep(0.05)
+
+    assert controller._state["status"] == "connected"
+    assert controller._market_task is not None
+    controller.unsubscribe(new_queue)
+    gateway.release.set()
+    await controller.disconnect()

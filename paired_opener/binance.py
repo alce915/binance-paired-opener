@@ -260,12 +260,10 @@ class BinanceFuturesGateway(ExchangeGateway):
         if cached is not None:
             return cached
         if not self._account.api_key or not self._account.api_secret:
-            self._symbol_leverage_cache[target] = 1
             return 1
         try:
             payload = await self._signed_request("GET", "/papi/v1/um/positionRisk", use_papi=True)
         except Exception:
-            self._symbol_leverage_cache[target] = 1
             return 1
         for item in payload:
             if str(item.get("symbol", "")).upper() != target:
@@ -274,9 +272,7 @@ class BinanceFuturesGateway(ExchangeGateway):
             if leverage > 0:
                 self._symbol_leverage_cache[target] = leverage
                 return leverage
-        self._symbol_leverage_cache[target] = 1
         return 1
-
     async def get_account_overview(self) -> dict[str, Any]:
         if not self._account.api_key or not self._account.api_secret:
             raise ExchangeStateError("Binance API credentials are not configured")
@@ -644,5 +640,8 @@ class BinanceFuturesGateway(ExchangeGateway):
         order = self._to_order(payload)
         self._order_cache[order.order_id] = order
         return order
+
+
+
 
 

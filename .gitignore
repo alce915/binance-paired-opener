@@ -28,3 +28,5 @@ build/
 
 
 
+
+config/binance_api.local.env

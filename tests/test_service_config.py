@@ -372,6 +372,25 @@ def test_service_marks_incomplete_sessions_exception_on_startup(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_create_single_open_session_rejects_symbol_outside_whitelist(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "single-open-whitelist.db")
+    gateway = SimpleGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    with pytest.raises(ValueError, match="not in whitelist"):
+        await service.create_single_open_session(
+            SingleOpenSessionRequest(
+                symbol="ETHUSDT",
+                open_mode="regular",
+                selected_position_side=PositionSide.LONG,
+                open_qty=Decimal("0.050"),
+                leverage=10,
+                round_count=1,
+            )
+        )
+@pytest.mark.asyncio
 async def test_create_session_rejects_round_notional_below_minimum(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
     repository = SqliteRepository(tmp_path / "reject.db")
@@ -814,3 +833,4 @@ async def test_create_single_open_session_rejects_when_implied_open_amount_excee
                 round_count=1,
             )
         )
+

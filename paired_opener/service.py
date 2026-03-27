@@ -169,6 +169,8 @@ class OpenSessionService:
     async def create_single_open_session(self, request: SingleOpenSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
         async with self._session_creation_lock:
+            if symbol not in self._settings.normalized_whitelist:
+                raise ValueError(f"Symbol {symbol} is not in whitelist")
             self._ensure_no_active_symbol_session(symbol)
             rules = await self._gateway.get_symbol_rules(symbol)
             account_overview = await self._gateway.get_account_overview()
@@ -642,6 +644,7 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
+
 
 
 

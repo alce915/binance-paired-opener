@@ -74,6 +74,30 @@ async def test_ensure_hedge_mode_is_idempotent_when_already_enabled() -> None:
         await gateway.close()
 
 @pytest.mark.asyncio
+async def test_get_symbol_leverage_does_not_cache_transient_failure_as_one() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
+    calls = 0
+
+    async def fake_signed_request(method: str, path: str, params: dict[str, str] | None = None, *, use_papi: bool = False):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary papi failure")
+        return [{"symbol": "BTCUSDT", "leverage": 25}]
+
+    gateway._signed_request = fake_signed_request  # type: ignore[method-assign]
+    try:
+        first = await gateway.get_symbol_leverage("BTCUSDT")
+        second = await gateway.get_symbol_leverage("BTCUSDT")
+    finally:
+        await gateway.close()
+
+    assert first == 1
+    assert second == 25
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_get_account_overview_uses_unified_account_only() -> None:
     gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
     calls: list[str] = []
@@ -95,5 +119,7 @@ async def test_get_account_overview_uses_unified_account_only() -> None:
 
     assert payload["source"] == "papi"
     assert calls == ["papi"]
+
+
 
 

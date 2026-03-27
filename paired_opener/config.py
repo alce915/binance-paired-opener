@@ -9,6 +9,16 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_DIR = PROJECT_ROOT / "config"
+DATA_DIR = PROJECT_ROOT / "data"
+ENV_FILES = (
+    CONFIG_DIR / "binance_api.env",
+    CONFIG_DIR / "binance_api.local.env",
+    PROJECT_ROOT / ".env",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class AccountConfig:
     account_id: str
@@ -38,7 +48,7 @@ class AccountConfig:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=(".env", "config/binance_api.env"),
+        env_file=ENV_FILES,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -50,22 +60,22 @@ class Settings(BaseSettings):
     monitor_app_name: str = "Binance Account Monitor"
     monitor_api_host: str = "127.0.0.1"
     monitor_api_port: int = 8010
-    data_dir: Path = Path("data")
-    database_path: Path = Path("data/paired_opener.db")
+    data_dir: Path = DATA_DIR
+    database_path: Path = DATA_DIR / "paired_opener.db"
 
     binance_api_key: str = ""
     binance_api_secret: str = ""
     binance_use_testnet: bool = False
     binance_accounts: str = ""
-    binance_accounts_file: Path = Path("config/binance_accounts.json")
+    binance_accounts_file: Path = CONFIG_DIR / "binance_accounts.json"
     binance_rest_base_url: str = ""
     binance_ws_base_url: str = ""
     binance_recv_window_ms: int = 5_000
     monitor_refresh_interval_ms: int = 5_000
     monitor_history_window_days: int = 7
-    active_account_file: Path = Path("config/active_account.json")
+    active_account_file: Path = CONFIG_DIR / "active_account.json"
     symbol_whitelist: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
-    symbol_whitelist_file: Path = Path("config/symbol_whitelist.json")
+    symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"
 
     default_poll_interval_ms: int = 50
     default_order_ttl_ms: int = 3_000
@@ -115,7 +125,7 @@ class Settings(BaseSettings):
 
     def _load_env_values(self) -> dict[str, str]:
         values: dict[str, str] = {}
-        for candidate in (Path(".env"), Path("config/binance_api.env")):
+        for candidate in ENV_FILES:
             if not candidate.exists():
                 continue
             for raw_line in candidate.read_text(encoding="utf-8-sig").splitlines():
@@ -198,7 +208,7 @@ class Settings(BaseSettings):
             accounts = [
                 AccountConfig(
                     account_id="default",
-                    name=env_values.get("BINANCE_ACCOUNT_NAME", "榛樿璐︽埛"),
+                    name=env_values.get("BINANCE_ACCOUNT_NAME", "默认账户"),
                     api_key=self.binance_api_key,
                     api_secret=self.binance_api_secret,
                     use_testnet=self.binance_use_testnet,
@@ -278,8 +288,5 @@ settings.load_persisted_whitelist()
 settings.load_accounts()
 if not settings.symbol_whitelist_file.exists():
     settings.persist_whitelist(settings.symbol_whitelist)
-
-
-
 
 

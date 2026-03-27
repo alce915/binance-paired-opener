@@ -1518,7 +1518,7 @@ class PairedClosingEngine(PairedOpeningEngine):
         try:
             if stage2_available_qty < carryover_qty:
                 raise ExchangeStateError(
-                    f"鍙屽悜骞充粨鏈€缁堝榻愭椂鍙钩浠撲綅涓嶈冻: stage2_available={stage2_available_qty}, carryover={carryover_qty}"
+                    f"双向平仓最终对齐时可平仓位不足: stage2_available={stage2_available_qty}, carryover={carryover_qty}"
                 )
             try:
                 validate_qty_and_notional(carryover_qty, stage2_price, rules)
@@ -1601,7 +1601,7 @@ class PairedClosingEngine(PairedOpeningEngine):
             residual_stage2_qty = normalize_qty(stage2_available_qty - stage2_reduce_qty, rules)
             if residual_stage1_qty != residual_stage2_qty:
                 raise ExchangeStateError(
-                    f"鍙屽悜骞充粨鏈€缁堝榻愭湭鏀舵暃: residual_stage1={residual_stage1_qty}, residual_stage2={residual_stage2_qty}"
+                    f"双向平仓最终对齐未收敛: residual_stage1={residual_stage1_qty}, residual_stage2={residual_stage2_qty}"
                 )
             session.completed_with_final_alignment = True
             session.stage2_carryover_qty = Decimal("0")
@@ -1676,4 +1676,5 @@ class PairedClosingEngine(PairedOpeningEngine):
         if trend_bias == TrendBias.LONG:
             return OrderSide.SELL, PositionSide.LONG, lambda quote: quote.bid_price
         return OrderSide.BUY, PositionSide.SHORT, lambda quote: quote.ask_price
+
 

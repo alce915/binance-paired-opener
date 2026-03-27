@@ -19,6 +19,7 @@ class MarketStreamController:
         self._lock = asyncio.Lock()
         self._simulation_lock = asyncio.Lock()
         self._market_task: asyncio.Task[None] | None = None
+        self._disconnect_task: asyncio.Task[dict[str, Any]] | None = None
         self._last_account_error: str | None = None
         self._state = {
             "connected": False,
@@ -83,6 +84,9 @@ class MarketStreamController:
             self._subscribers.discard(queue)
 
     async def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        if self._disconnect_task is not None and not self._disconnect_task.done():
+            self._disconnect_task.cancel()
+        self._disconnect_task = None
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
         self._subscribers.add(queue)
         await queue.put({"event": "connection_status", "data": self._normalize(self._state)})
@@ -92,11 +96,19 @@ class MarketStreamController:
 
     def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
         self._subscribers.discard(queue)
-        if not self._subscribers and self._market_task is not None and not self._market_task.done():
-            asyncio.create_task(self.disconnect())
+        if (
+            not self._subscribers
+            and self._market_task is not None
+            and not self._market_task.done()
+            and (self._disconnect_task is None or self._disconnect_task.done())
+        ):
+            self._disconnect_task = asyncio.create_task(self._disconnect_after_unsubscribe())
 
-    async def connect(self, symbol: str) -> dict[str, Any]:
+    async def connect(self, symbol: str) -> dict:
         symbol = symbol.upper()
+        if self._disconnect_task is not None and not self._disconnect_task.done():
+            self._disconnect_task.cancel()
+        self._disconnect_task = None
         old_task: asyncio.Task[None] | None = None
         async with self._lock:
             old_task = self._market_task
@@ -133,7 +145,20 @@ class MarketStreamController:
             self._market_task = asyncio.create_task(self._market_loop(symbol))
             return self._normalize(self._state)
 
-    async def disconnect(self) -> dict[str, Any]:
+    async def _disconnect_after_unsubscribe(self) -> dict:
+        try:
+            return await self.disconnect()
+        finally:
+            self._disconnect_task = None
+
+    async def disconnect(self) -> dict:
+        current_task = asyncio.current_task()
+        if (
+            self._disconnect_task is not None
+            and self._disconnect_task is not current_task
+            and not self._disconnect_task.done()
+        ):
+            self._disconnect_task.cancel()
         async with self._lock:
             task = self._market_task
             self._market_task = None
@@ -167,7 +192,6 @@ class MarketStreamController:
             "created_at": self._utc_now(),
         })
         return self._normalize(self._state)
-
     async def _refresh_account_overview(self) -> None:
         try:
             overview = await self._gateway.get_account_overview()
@@ -418,6 +442,9 @@ class MarketStreamController:
 
 def format_sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+
 
 
 

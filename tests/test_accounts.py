@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from paired_opener.account_runtime import AccountRuntimeManager
+from paired_opener import config as config_module
 from paired_opener.config import Settings
 from paired_opener.domain import OpenSession, SessionSpec, SessionStatus, TrendBias
 from paired_opener.storage import SqliteRepository
@@ -33,12 +34,14 @@ def _write_multi_account_env(root: Path) -> None:
     )
 
 
-def _build_settings(root: Path) -> Settings:
+def _build_settings(root: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+    monkeypatch.setattr(config_module, 'ENV_FILES', (root / 'config' / 'binance_api.env',))
     settings = Settings(
         _env_file=None,
         active_account_file=Path('config/active_account.json'),
         symbol_whitelist_file=Path('config/symbol_whitelist.json'),
         database_path=Path('data/test.db'),
+        binance_accounts_file=Path('config/binance_accounts.json'),
     )
     settings.load_accounts()
     return settings
@@ -49,7 +52,7 @@ def test_settings_load_accounts_from_env_and_restore_active_account(tmp_path: Pa
     (tmp_path / 'config' / 'active_account.json').write_text('{"account_id": "sub1"}', encoding='utf-8')
     monkeypatch.chdir(tmp_path)
 
-    settings = _build_settings(tmp_path)
+    settings = _build_settings(tmp_path, monkeypatch)
 
     assert set(settings.accounts) == {'main', 'sub1'}
     assert settings.active_account_id == 'sub1'
@@ -61,7 +64,7 @@ def test_settings_load_accounts_from_env_and_restore_active_account(tmp_path: Pa
 async def test_runtime_manager_switches_account_and_persists_selection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_multi_account_env(tmp_path)
     monkeypatch.chdir(tmp_path)
-    settings = _build_settings(tmp_path)
+    settings = _build_settings(tmp_path, monkeypatch)
     repository = SqliteRepository(tmp_path / 'data' / 'runtime.db')
     manager = AccountRuntimeManager(settings, repository)
 
@@ -82,7 +85,7 @@ async def test_runtime_manager_switches_account_and_persists_selection(tmp_path:
 async def test_runtime_manager_rejects_switch_when_current_account_has_active_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_multi_account_env(tmp_path)
     monkeypatch.chdir(tmp_path)
-    settings = _build_settings(tmp_path)
+    settings = _build_settings(tmp_path, monkeypatch)
     repository = SqliteRepository(tmp_path / 'data' / 'runtime-block.db')
     manager = AccountRuntimeManager(settings, repository)
     session = OpenSession.create(
@@ -180,9 +183,10 @@ def test_settings_falls_back_to_prefixed_accounts_when_account_list_is_not_id_ba
     )
     monkeypatch.chdir(tmp_path)
 
-    settings = _build_settings(tmp_path)
+    settings = _build_settings(tmp_path, monkeypatch)
 
     assert set(settings.accounts) == {'main', 'sub1', 'sub2'}
     assert settings.accounts['main'].name == '主账户的子账户1'
     assert settings.accounts['sub1'].name == '主账户的子账户2'
     assert settings.accounts['sub2'].name == '主账户的子账户3'
+
