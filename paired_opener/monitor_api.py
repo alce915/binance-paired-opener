@@ -1,15 +1,19 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Query
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from paired_opener.account_monitor import AccountMonitorController
 from paired_opener.config import settings
 from paired_opener.market_stream import format_sse
+
+STATIC_DIR = Path(__file__).with_name("static")
+HTML_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 
 
 @asynccontextmanager
@@ -25,11 +29,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.monitor_app_name, lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
-    return FileResponse(Path(__file__).with_name("static").joinpath("monitor.html"))
+    return FileResponse(STATIC_DIR.joinpath("monitor.html"), headers=HTML_CACHE_HEADERS)
 
 
 @app.get("/healthz")
@@ -61,7 +66,7 @@ async def stream_accounts(account_ids: str | None = Query(default=None)) -> Stre
         finally:
             monitor.unsubscribe(queue)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=HTML_CACHE_HEADERS)
 
 
 def _parse_account_ids(raw: str | None) -> list[str] | None:
@@ -69,4 +74,3 @@ def _parse_account_ids(raw: str | None) -> list[str] | None:
         return None
     account_ids = [item.strip().lower() for item in raw.split(",") if item.strip()]
     return account_ids or None
-

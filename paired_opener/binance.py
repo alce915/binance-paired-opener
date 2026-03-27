@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -56,17 +56,32 @@ class BinanceFuturesGateway(ExchangeGateway):
         )
         self._rules_cache: dict[str, SymbolRules] = {}
         self._quote_cache: dict[str, Quote] = {}
+        self._depth_cache: dict[str, dict[str, Any]] = {}
         self._order_cache: dict[str, ExchangeOrder] = {}
-        self._symbol_leverage_cache: dict[str, int] = {}
+        self._symbol_leverage_cache: dict[str, tuple[float, int]] = {}
+        self._open_orders_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._account_overview_cache: tuple[float, dict[str, Any]] | None = None
+        self._monitor_history_cache: tuple[float, dict[str, Any]] | None = None
         self._quote_tasks: dict[str, asyncio.Task[None]] = {}
+        self._depth_tasks: dict[str, asyncio.Task[None]] = {}
         self._user_stream_task: asyncio.Task[None] | None = None
         self._listen_key: str | None = None
 
+    def _monotonic(self) -> float:
+        return asyncio.get_running_loop().time()
+
+    def _is_cache_fresh(self, stamp: float, ttl_ms: int) -> bool:
+        return (self._monotonic() - stamp) * 1000 < ttl_ms
+
     async def close(self) -> None:
-        for task in self._quote_tasks.values():
+        tasks = [task for task in [*self._quote_tasks.values(), *self._depth_tasks.values(), self._user_stream_task] if task is not None]
+        for task in tasks:
             task.cancel()
-        if self._user_stream_task is not None:
-            self._user_stream_task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._quote_tasks.clear()
+        self._depth_tasks.clear()
+        self._user_stream_task = None
         await self._client.aclose()
         await self._papi_client.aclose()
 
@@ -132,7 +147,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         )
 
     async def _run_user_stream(self) -> None:
-        keepalive_at = asyncio.get_running_loop().time() + 30 * 60
+        keepalive_at = self._monotonic() + 30 * 60
         while True:
             listen_key = self._listen_key or await self._start_listen_key()
             self._listen_key = listen_key
@@ -140,7 +155,7 @@ class BinanceFuturesGateway(ExchangeGateway):
             try:
                 async with websockets.connect(stream, ping_interval=20, ping_timeout=20) as websocket:
                     async for message in websocket:
-                        now = asyncio.get_running_loop().time()
+                        now = self._monotonic()
                         if now >= keepalive_at:
                             await self._keepalive_listen_key()
                             keepalive_at = now + 30 * 60
@@ -188,7 +203,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         payload = await self._signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
         if int(payload.get("leverage", 0)) != leverage:
             raise ExchangeStateError(f"Leverage mismatch for {symbol}: {payload}")
-        self._symbol_leverage_cache[symbol.upper()] = leverage
+        self._symbol_leverage_cache[symbol.upper()] = (self._monotonic(), leverage)
 
     async def get_symbol_rules(self, symbol: str) -> SymbolRules:
         symbol = symbol.upper()
@@ -212,9 +227,44 @@ class BinanceFuturesGateway(ExchangeGateway):
         raise ExchangeStateError(f"Symbol {symbol} not found in exchange info")
 
     async def _ensure_quote_stream(self, symbol: str) -> None:
-        if symbol in self._quote_tasks:
+        if symbol in self._quote_tasks and not self._quote_tasks[symbol].done():
             return
         self._quote_tasks[symbol] = asyncio.create_task(self._run_quote_stream(symbol))
+
+    async def _ensure_depth_stream(self, symbol: str) -> None:
+        if symbol in self._depth_tasks and not self._depth_tasks[symbol].done():
+            return
+        self._depth_tasks[symbol] = asyncio.create_task(self._run_depth_stream(symbol))
+
+    def _parse_order_book_payload(self, symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
+        event_timestamp = payload.get("E")
+        event_time = datetime.fromtimestamp(event_timestamp / 1000, tz=UTC) if event_timestamp else datetime.now(UTC)
+        return {
+            "symbol": symbol,
+            "lastUpdateId": payload.get("lastUpdateId") or payload.get("u"),
+            "bids": [
+                {"price": Decimal(price), "qty": Decimal(qty)}
+                for price, qty in payload.get("bids") or payload.get("b") or []
+            ],
+            "asks": [
+                {"price": Decimal(price), "qty": Decimal(qty)}
+                for price, qty in payload.get("asks") or payload.get("a") or []
+            ],
+            "event_time": event_time,
+        }
+
+    async def _run_depth_stream(self, symbol: str) -> None:
+        stream = f"{self._account.effective_websocket_base_url}/{symbol.lower()}@depth5@100ms"
+        while True:
+            try:
+                async with websockets.connect(stream, ping_interval=20, ping_timeout=20) as websocket:
+                    async for message in websocket:
+                        payload = json.loads(message)
+                        self._depth_cache[symbol] = self._parse_order_book_payload(symbol, payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(1)
 
     async def _run_quote_stream(self, symbol: str) -> None:
         stream = f"{self._account.effective_websocket_base_url}/{symbol.lower()}@bookTicker"
@@ -243,54 +293,69 @@ class BinanceFuturesGateway(ExchangeGateway):
         return Quote(symbol=symbol, bid_price=Decimal(payload["bidPrice"]), ask_price=Decimal(payload["askPrice"]))
 
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
-        payload = await self._public_request("GET", "/fapi/v1/depth", {"symbol": symbol.upper(), "limit": limit})
+        normalized_symbol = symbol.upper()
+        await self._ensure_depth_stream(normalized_symbol)
+        cached = self._depth_cache.get(normalized_symbol)
+        if cached is None:
+            payload = await self._public_request("GET", "/fapi/v1/depth", {"symbol": normalized_symbol, "limit": max(limit, 5)})
+            cached = self._parse_order_book_payload(normalized_symbol, payload)
+            self._depth_cache[normalized_symbol] = cached
         return {
-            "symbol": symbol.upper(),
-            "lastUpdateId": payload.get("lastUpdateId"),
-            "bids": [
-                {"price": Decimal(price), "qty": Decimal(qty)}
-                for price, qty in payload.get("bids", [])
-            ],
-            "asks": [
-                {"price": Decimal(price), "qty": Decimal(qty)}
-                for price, qty in payload.get("asks", [])
-            ],
-            "event_time": datetime.now(UTC),
+            "symbol": normalized_symbol,
+            "lastUpdateId": cached.get("lastUpdateId"),
+            "bids": list(cached.get("bids", []))[:limit],
+            "asks": list(cached.get("asks", []))[:limit],
+            "event_time": cached.get("event_time", datetime.now(UTC)),
         }
 
     async def get_symbol_leverage(self, symbol: str) -> int:
         target = symbol.upper()
         cached = self._symbol_leverage_cache.get(target)
-        if cached is not None:
-            return cached
+        if cached is not None and self._is_cache_fresh(cached[0], 30_000):
+            return cached[1]
         if not self._account.api_key or not self._account.api_secret:
             return 1
         try:
             payload = await self._signed_request("GET", "/papi/v1/um/positionRisk", use_papi=True)
         except Exception:
-            return 1
+            return cached[1] if cached is not None else 1
         for item in payload:
             if str(item.get("symbol", "")).upper() != target:
                 continue
             leverage = int(item.get("leverage") or 0)
             if leverage > 0:
-                self._symbol_leverage_cache[target] = leverage
+                self._symbol_leverage_cache[target] = (self._monotonic(), leverage)
                 return leverage
-        return 1
+        return cached[1] if cached is not None else 1
 
     async def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
-        payload = await self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": symbol.upper()})
+        target = symbol.upper()
+        cached = self._open_orders_cache.get(target)
+        if cached is not None and self._is_cache_fresh(cached[0], 500):
+            return list(cached[1])
+        try:
+            payload = await self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": target})
+        except Exception:
+            return list(cached[1]) if cached is not None else []
         if not isinstance(payload, list):
             return []
-        return [item for item in payload if isinstance(item, dict)]
+        orders = [item for item in payload if isinstance(item, dict)]
+        self._open_orders_cache[target] = (self._monotonic(), orders)
+        return list(orders)
 
     async def get_account_overview(self) -> dict[str, Any]:
         if not self._account.api_key or not self._account.api_secret:
             raise ExchangeStateError("Binance API credentials are not configured")
+        if self._account_overview_cache is not None and self._is_cache_fresh(self._account_overview_cache[0], 1_000):
+            return self._account_overview_cache[1]
         try:
-            return await self._get_account_overview_from_papi()
+            payload = await self._get_account_overview_from_papi()
         except Exception as exc:
-            raise ExchangeStateError(f"统一账户数据获取失败: {exc}") from exc
+            if self._account_overview_cache is not None:
+                return self._account_overview_cache[1]
+            raise ExchangeStateError(f"Failed to fetch unified account overview: {exc}") from exc
+        self._account_overview_cache = (self._monotonic(), payload)
+        return payload
 
     async def get_unified_account_snapshot(
         self,
@@ -310,45 +375,19 @@ class BinanceFuturesGateway(ExchangeGateway):
             self._signed_request("GET", "/papi/v1/account", use_papi=True),
             self._signed_request("GET", "/papi/v1/um/account", use_papi=True),
         )
-        optional_results = await asyncio.gather(
-            self._optional_papi_request(
-                "/papi/v1/um/income",
-                {"startTime": start_time, "endTime": end_time, "limit": income_limit},
-            ),
-            self._optional_papi_request(
-                "/papi/v1/margin/marginInterestHistory",
-                {"startTime": start_time, "endTime": end_time, "size": interest_limit},
-            ),
-            self._optional_papi_request(
-                "/papi/v1/portfolio/interest-history",
-                {"startTime": start_time, "endTime": end_time, "size": interest_limit},
-            ),
+        income_summary, interest_summary, section_errors = await self._get_monitor_history_snapshot(
+            start_time=start_time,
+            end_time=end_time,
+            history_window_days=bounded_window_days,
+            income_limit=income_limit,
+            interest_limit=interest_limit,
         )
-        (income_payload, income_error), (borrow_interest_payload, borrow_interest_error), (
-            negative_interest_payload,
-            negative_interest_error,
-        ) = optional_results
 
         positions = self._parse_unified_positions(um_account_payload.get("positions", []))
         assets = self._parse_unified_assets(um_account_payload.get("assets", []))
         unrealized_pnl = sum((entry["unrealized_pnl"] for entry in positions), Decimal("0"))
         if unrealized_pnl == Decimal("0") and assets:
             unrealized_pnl = sum((entry["cross_unrealized_pnl"] for entry in assets), Decimal("0"))
-        income_summary = self._summarize_income_history(income_payload, bounded_window_days)
-        interest_summary = self._summarize_interest_history(
-            borrow_interest_payload,
-            negative_interest_payload,
-            bounded_window_days,
-        )
-        section_errors = {
-            key: value
-            for key, value in {
-                "income_history": income_error,
-                "margin_interest_history": borrow_interest_error,
-                "negative_balance_interest_history": negative_interest_error,
-            }.items()
-            if value is not None
-        }
 
         return {
             "status": "ok",
@@ -376,6 +415,82 @@ class BinanceFuturesGateway(ExchangeGateway):
             "section_errors": section_errors,
         }
 
+    async def _get_monitor_history_snapshot(
+        self,
+        *,
+        start_time: int,
+        end_time: int,
+        history_window_days: int,
+        income_limit: int,
+        interest_limit: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+        cached_payload = self._monitor_history_cache[1] if self._monitor_history_cache is not None else None
+        if self._monitor_history_cache is not None and self._is_cache_fresh(
+            self._monitor_history_cache[0],
+            self._settings.monitor_history_refresh_interval_ms,
+        ):
+            return cached_payload["income_summary"], cached_payload["interest_summary"], {}
+
+        optional_results = await asyncio.gather(
+            self._optional_papi_request(
+                "/papi/v1/um/income",
+                {"startTime": start_time, "endTime": end_time, "limit": income_limit},
+            ),
+            self._optional_papi_request(
+                "/papi/v1/margin/marginInterestHistory",
+                {"startTime": start_time, "endTime": end_time, "size": interest_limit},
+            ),
+            self._optional_papi_request(
+                "/papi/v1/portfolio/interest-history",
+                {"startTime": start_time, "endTime": end_time, "size": interest_limit},
+            ),
+        )
+        (income_payload, income_error), (borrow_interest_payload, borrow_interest_error), (
+            negative_interest_payload,
+            negative_interest_error,
+        ) = optional_results
+        section_errors = {
+            key: value
+            for key, value in {
+                "income_history": income_error,
+                "margin_interest_history": borrow_interest_error,
+                "negative_balance_interest_history": negative_interest_error,
+            }.items()
+            if value is not None
+        }
+
+        if income_payload is not None:
+            income_summary = self._summarize_income_history(income_payload, history_window_days)
+        elif cached_payload is not None:
+            income_summary = cached_payload["income_summary"]
+        else:
+            income_summary = self._empty_income_summary(history_window_days)
+
+        interest_has_error = borrow_interest_error is not None or negative_interest_error is not None
+        if not interest_has_error:
+            interest_summary = self._summarize_interest_history(
+                borrow_interest_payload,
+                negative_interest_payload,
+                history_window_days,
+            )
+        elif cached_payload is not None:
+            interest_summary = cached_payload["interest_summary"]
+        else:
+            interest_summary = self._summarize_interest_history(
+                borrow_interest_payload,
+                negative_interest_payload,
+                history_window_days,
+            )
+
+        self._monitor_history_cache = (
+            self._monotonic(),
+            {
+                "income_summary": income_summary,
+                "interest_summary": interest_summary,
+            },
+        )
+        return income_summary, interest_summary, section_errors
+
     async def _optional_papi_request(
         self,
         path: str,
@@ -386,6 +501,24 @@ class BinanceFuturesGateway(ExchangeGateway):
             return payload, None
         except Exception as exc:
             return None, str(exc)
+
+    def _empty_income_summary(self, history_window_days: int) -> dict[str, Any]:
+        return {
+            "window_days": history_window_days,
+            "records": 0,
+            "total_income": Decimal("0"),
+            "by_type": {},
+            "by_asset": {},
+        }
+
+    def _empty_interest_summary(self, history_window_days: int) -> dict[str, Any]:
+        return {
+            "window_days": history_window_days,
+            "records": 0,
+            "margin_interest_total": Decimal("0"),
+            "negative_balance_interest_total": Decimal("0"),
+            "total_interest": Decimal("0"),
+        }
 
     def _parse_unified_positions(self, payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
         positions: list[dict[str, Any]] = []
@@ -509,9 +642,11 @@ class BinanceFuturesGateway(ExchangeGateway):
                     "position_side": position_side,
                     "qty": abs(position_amt),
                     "entry_price": Decimal(item.get("entryPrice") or "0"),
+                    "mark_price": Decimal(item.get("markPrice") or "0"),
                     "unrealized_pnl": pnl,
                     "notional": abs(Decimal(item.get("notional") or "0")),
                     "leverage": int(item.get("leverage") or 0),
+                    "liquidation_price": Decimal(item.get("liquidationPrice") or "0"),
                 }
             )
             unrealized_pnl += pnl
@@ -543,9 +678,11 @@ class BinanceFuturesGateway(ExchangeGateway):
                     "position_side": position_side,
                     "qty": abs(position_amt),
                     "entry_price": Decimal(item.get("entryPrice") or "0"),
+                    "mark_price": Decimal(item.get("markPrice") or "0"),
                     "unrealized_pnl": Decimal(item.get("unrealizedProfit") or "0"),
                     "notional": abs(Decimal(item.get("notional") or "0")),
                     "leverage": int(item.get("leverage") or 0),
+                    "liquidation_price": Decimal(item.get("liquidationPrice") or "0"),
                 }
             )
         positions.sort(key=lambda entry: (entry["symbol"], entry["position_side"]))

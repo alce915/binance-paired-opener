@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import asyncio
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -189,4 +190,39 @@ def test_settings_falls_back_to_prefixed_accounts_when_account_list_is_not_id_ba
     assert settings.accounts['main'].name == '主账户的子账户1'
     assert settings.accounts['sub1'].name == '主账户的子账户2'
     assert settings.accounts['sub2'].name == '主账户的子账户3'
+
+
+
+@pytest.mark.asyncio
+async def test_runtime_manager_switch_account_does_not_wait_for_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_multi_account_env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    settings = _build_settings(tmp_path, monkeypatch)
+    repository = SqliteRepository(tmp_path / 'data' / 'runtime-fast-switch.db')
+    manager = AccountRuntimeManager(settings, repository)
+    release = asyncio.Event()
+    current_runtime = manager.current()
+
+    async def slow_disconnect() -> dict[str, object]:
+        await release.wait()
+        return {}
+
+    async def slow_close_service(*args, **kwargs) -> None:
+        await release.wait()
+
+    async def slow_close_gateway() -> None:
+        await release.wait()
+
+    current_runtime.market.disconnect = slow_disconnect  # type: ignore[method-assign]
+    current_runtime.service.close = slow_close_service  # type: ignore[method-assign]
+    current_runtime.gateway.close = slow_close_gateway  # type: ignore[method-assign]
+
+    try:
+        payload = await asyncio.wait_for(manager.switch_account('sub1'), timeout=0.05)
+        assert payload == {'id': 'sub1', 'name': '子账户1', 'is_active': True}
+        assert manager.current().account.account_id == 'sub1'
+    finally:
+        release.set()
+        await manager.close()
+
 

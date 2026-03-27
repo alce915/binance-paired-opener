@@ -23,6 +23,7 @@ from paired_opener.domain import (
     TrendBias,
 )
 from paired_opener.engine import PairedOpeningEngine, SessionControl
+from paired_opener.errors import ErrorCategory, ErrorStrategy, TradingError
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.service import ManagedSession, OpenSessionService
 from paired_opener.schemas import CloseSessionRequest, OpenSessionRequest, SingleCloseSessionRequest, SingleOpenSessionRequest
@@ -204,6 +205,19 @@ class DustCarryoverGateway(SimpleGateway):
             self._close_stage2_partial_applied = True
             self._apply_fill(PositionSide.LONG, Decimal("0.002"))
         return order
+
+
+class PreflightFailingGateway(SimpleGateway):
+    async def ensure_hedge_mode(self) -> None:
+        raise TradingError(
+            category=ErrorCategory.PERMISSION_ERROR,
+            strategy=ErrorStrategy.MANUAL_INTERVENTION,
+            message="账户无权执行该交易。",
+            source="gateway",
+            code="binance_region_restricted",
+            operator_action="检查账户权限或地区限制后重试。",
+        )
+
 
 class AbortingClock:
     def __init__(self, control: SessionControl) -> None:
@@ -544,6 +558,41 @@ async def test_service_close_cancels_managed_tasks(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_session_persists_structured_preflight_error(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "preflight-structured.db")
+    gateway = PreflightFailingGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    with pytest.raises(TradingError, match="账户无权执行该交易"):
+        await service.create_session(
+            OpenSessionRequest(
+                symbol="BTCUSDT",
+                trend_bias=TrendBias.LONG,
+                leverage=10,
+                round_count=1,
+                round_qty=Decimal("0.050"),
+            )
+        )
+
+    sessions = repository.list_sessions()
+    assert len(sessions) == 1
+    payload = service.get_session(sessions[0]["session_id"])
+    event = next(item for item in payload["events"] if item["event_type"] == "session_preflight_failed")
+
+    assert payload["status"] == SessionStatus.EXCEPTION.value
+    assert payload["last_error_category"] == "permission_error"
+    assert payload["last_error_strategy"] == "manual_intervention"
+    assert payload["last_error_code"] == "binance_region_restricted"
+    assert payload["last_error_operator_action"] == "检查账户权限或地区限制后重试。"
+    assert event["payload"]["error_category"] == "permission_error"
+    assert event["payload"]["error_strategy"] == "manual_intervention"
+    assert event["payload"]["error_code"] == "binance_region_restricted"
+    assert event["payload"]["requires_operator_action"] is True
+
+
+@pytest.mark.asyncio
 async def test_create_session_rejects_open_amount_above_available_balance_ratio(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
     repository = SqliteRepository(tmp_path / "available-balance.db")
@@ -839,7 +888,3 @@ async def test_create_single_open_session_rejects_when_implied_open_amount_excee
                 round_count=1,
             )
         )
-
-
-
-

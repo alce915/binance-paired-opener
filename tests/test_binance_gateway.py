@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -120,6 +120,39 @@ async def test_get_account_overview_uses_unified_account_only() -> None:
     assert payload["source"] == "papi"
     assert calls == ["papi"]
 
+@pytest.mark.asyncio
+async def test_get_account_overview_includes_mark_and_liquidation_prices() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
 
+    async def fake_signed_request(method: str, path: str, params: dict[str, str] | None = None, *, use_papi: bool = False):
+        if path == "/papi/v1/account":
+            return {
+                "accountEquity": "1500.5",
+                "accountInitialMargin": "210.2",
+                "totalAvailableBalance": "1001.1",
+            }
+        if path == "/papi/v1/um/positionRisk":
+            return [
+                {
+                    "symbol": "BTCUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "0.02",
+                    "entryPrice": "80000",
+                    "markPrice": "80500",
+                    "unRealizedProfit": "10.0",
+                    "notional": "1610",
+                    "leverage": "10",
+                    "liquidationPrice": "70000",
+                }
+            ]
+        raise AssertionError(path)
 
+    gateway._signed_request = fake_signed_request  # type: ignore[method-assign]
+    try:
+        payload = await gateway.get_account_overview()
+    finally:
+        await gateway.close()
 
+    assert payload["source"] == "papi"
+    assert payload["positions"][0]["mark_price"] == Decimal("80500")
+    assert payload["positions"][0]["liquidation_price"] == Decimal("70000")

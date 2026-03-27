@@ -26,6 +26,7 @@ from paired_opener.engine import (
     SingleClosingEngine,
     SingleOpeningEngine,
 )
+from paired_opener.errors import ErrorStrategy, TradingError, ensure_trading_error
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.rounding import normalize_price, normalize_qty, validate_qty_and_notional
 from paired_opener.schemas import (
@@ -106,6 +107,56 @@ class OpenSessionService:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         self._managed.clear()
+
+    def _error_context(self, *, session: OpenSession | None = None, stage: str | None = None, **context: Any) -> dict[str, Any]:
+        payload = dict(context)
+        if session is not None:
+            payload.setdefault("session_id", session.session_id)
+            payload.setdefault("symbol", session.spec.symbol)
+            payload.setdefault("account_id", session.account_id)
+            payload.setdefault("account_name", session.account_name)
+            payload.setdefault("session_kind", session.spec.session_kind.value)
+        if stage is not None:
+            payload.setdefault("stage", stage)
+        return {key: value for key, value in payload.items() if value is not None}
+
+    def _normalize_trading_error(
+        self,
+        exc: Exception,
+        *,
+        source: str,
+        code: str | None = None,
+        session: OpenSession | None = None,
+        stage: str | None = None,
+        default_message: str | None = None,
+        operator_action: str | None = None,
+        **context: Any,
+    ) -> TradingError:
+        return ensure_trading_error(
+            exc,
+            source=source,
+            code=code,
+            context=self._error_context(session=session, stage=stage, **context),
+            default_message=default_message,
+            operator_action=operator_action,
+        )
+
+    def _persist_session_error(self, session_id: str, status: SessionStatus, error: TradingError) -> None:
+        self._repository.update_session_status(
+            session_id,
+            status,
+            last_error=str(error),
+            last_error_category=error.category.value,
+            last_error_strategy=error.strategy.value,
+            last_error_code=error.code,
+            last_error_operator_action=error.operator_action,
+        )
+
+    def _error_event_payload(self, error: TradingError, **extra: Any) -> dict[str, Any]:
+        payload = error.to_event_payload()
+        payload.update({key: value for key, value in extra.items() if value is not None})
+        payload["requires_operator_action"] = error.strategy == ErrorStrategy.MANUAL_INTERVENTION
+        return payload
 
     def _precheck_item(
         self,
@@ -545,8 +596,13 @@ class OpenSessionService:
             await self._gateway.ensure_cross_margin(symbol)
             await self._gateway.ensure_leverage(symbol, spec.leverage)
         except Exception as exc:
-            self._repository.update_session_status(session.session_id, SessionStatus.EXCEPTION, last_error=str(exc))
-            self._repository.add_event(session.session_id, "session_preflight_failed", {"error": str(exc)})
+            error = self._normalize_trading_error(exc, source="service", code="session_preflight_failed", session=session, stage="preflight")
+            self._persist_session_error(session.session_id, SessionStatus.EXCEPTION, error)
+            self._repository.add_event(
+                session.session_id,
+                "session_preflight_failed",
+                self._error_event_payload(error, session_kind=session.spec.session_kind.value),
+            )
             raise
         return self._launch_session(session)
 
@@ -666,10 +722,16 @@ class OpenSessionService:
             await self._gateway.ensure_cross_margin(symbol)
             await self._gateway.ensure_leverage(symbol, spec.leverage)
         except Exception as exc:
-            self._repository.update_session_status(session.session_id, SessionStatus.EXCEPTION, last_error=str(exc))
-            self._repository.add_event(session.session_id, "single_open_session_preflight_failed", {"error": str(exc)})
+            error = self._normalize_trading_error(exc, source="service", code="single_open_session_preflight_failed", session=session, stage="preflight")
+            self._persist_session_error(session.session_id, SessionStatus.EXCEPTION, error)
+            self._repository.add_event(
+                session.session_id,
+                "single_open_session_preflight_failed",
+                self._error_event_payload(error, session_kind=session.spec.session_kind.value),
+            )
             raise
         return self._launch_session(session)
+
     async def create_close_session(self, request: CloseSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
         async with self._session_creation_lock:
@@ -755,8 +817,13 @@ class OpenSessionService:
         try:
             await self._gateway.ensure_hedge_mode()
         except Exception as exc:
-            self._repository.update_session_status(session.session_id, SessionStatus.EXCEPTION, last_error=str(exc))
-            self._repository.add_event(session.session_id, "close_session_preflight_failed", {"error": str(exc)})
+            error = self._normalize_trading_error(exc, source="service", code="close_session_preflight_failed", session=session, stage="preflight")
+            self._persist_session_error(session.session_id, SessionStatus.EXCEPTION, error)
+            self._repository.add_event(
+                session.session_id,
+                "close_session_preflight_failed",
+                self._error_event_payload(error, session_kind=session.spec.session_kind.value),
+            )
             raise
         return self._launch_session(session)
 
@@ -863,8 +930,13 @@ class OpenSessionService:
         try:
             await self._gateway.ensure_hedge_mode()
         except Exception as exc:
-            self._repository.update_session_status(session.session_id, SessionStatus.EXCEPTION, last_error=str(exc))
-            self._repository.add_event(session.session_id, "single_close_session_preflight_failed", {"error": str(exc)})
+            error = self._normalize_trading_error(exc, source="service", code="single_close_session_preflight_failed", session=session, stage="preflight")
+            self._persist_session_error(session.session_id, SessionStatus.EXCEPTION, error)
+            self._repository.add_event(
+                session.session_id,
+                "single_close_session_preflight_failed",
+                self._error_event_payload(error, session_kind=session.spec.session_kind.value),
+            )
             raise
         return self._launch_session(session)
 
@@ -898,20 +970,45 @@ class OpenSessionService:
         except Exception as exc:
             status = SessionStatus.ABORTED if control.aborted else SessionStatus.EXCEPTION
             self._repository.update_session_runtime(session)
-            self._repository.update_session_status(session.session_id, status, last_error=str(exc))
-            self._repository.add_event(
-                session.session_id,
-                failed_event,
-                {"session_kind": session.spec.session_kind.value, "error": str(exc), "status": status.value},
-            )
+            if status == SessionStatus.ABORTED and not isinstance(exc, TradingError):
+                self._repository.update_session_status(session.session_id, status, last_error=str(exc))
+                self._repository.add_event(
+                    session.session_id,
+                    failed_event,
+                    {"session_kind": session.spec.session_kind.value, "error": str(exc), "status": status.value},
+                )
+            else:
+                error = self._normalize_trading_error(exc, source="service", code="session_failed", session=session, stage="session_run")
+                self._persist_session_error(session.session_id, status, error)
+                self._repository.add_event(
+                    session.session_id,
+                    failed_event,
+                    self._error_event_payload(error, session_kind=session.spec.session_kind.value, status=status.value),
+                )
         finally:
             self._managed.pop(session.session_id, None)
-
     def get_session(self, session_id: str) -> dict:
         session = self._repository.get_session(session_id, self._account_id)
         if session is None:
             raise KeyError(session_id)
         return session
+
+    def get_session_updates(self, session_id: str, after_event_id: int = 0) -> dict[str, Any]:
+        session = self._repository.get_session_record(session_id, self._account_id)
+        if session is None:
+            raise KeyError(session_id)
+        events = self._repository.list_events(session_id, after_event_id=max(int(after_event_id), 0))
+        changed_round_indexes = {
+            int(event['round_index'])
+            for event in events
+            if event.get('round_index') is not None
+        }
+        return {
+            'session': session,
+            'changed_rounds': self._repository.list_rounds_by_indexes(session_id, changed_round_indexes),
+            'events': events,
+            'latest_event_id': self._repository.latest_event_id(session_id),
+        }
 
     def list_sessions(self) -> list[dict]:
         return self._repository.list_sessions(self._account_id)
@@ -1054,17 +1151,3 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -554,7 +554,11 @@ class PairedOpeningEngine:
                 round_index=round_index,
             )
         if rest_qty > Decimal("0"):
-            raise ExchangeStateError(f"Market fallback failed for session {session.session_id}, remaining {rest_qty}")
+            raise MatchingFailureError(
+                f"Market fallback failed for session {session.session_id}, remaining {rest_qty}",
+                code="market_fallback_failed",
+                context={"session_id": session.session_id, "symbol": spec.symbol, "remaining_qty": str(rest_qty), "label": label},
+            )
         return filled_total
 
     async def _observe_order(
@@ -567,14 +571,24 @@ class PairedOpeningEngine:
     ) -> PollObservation:
         deadline = self._monotonic() + ((ttl_override_ms or spec.order_ttl_ms) / 1000)
         current = order
+        poll_schedule = self._poll_delay_schedule(spec.poll_interval_ms)
+        poll_index = 0
         while self._monotonic() < deadline:
             await self._respect_control(control, allow_abort=False, allow_pause=False)
             current = await self._gateway.get_order(symbol=spec.symbol, order_id=order.order_id)
+            if current.status == ExchangeOrderStatus.REJECTED:
+                raise MatchingFailureError(
+                    f"Order {order.order_id} was rejected by exchange",
+                    code="order_rejected",
+                    context={"symbol": spec.symbol, "order_id": order.order_id},
+                )
             if current.status == ExchangeOrderStatus.FILLED:
                 return PollObservation(order=current, filled_qty=current.executed_qty, had_fill=True, terminal=True)
             if current.executed_qty > Decimal("0"):
                 return PollObservation(order=current, filled_qty=current.executed_qty, had_fill=True, terminal=False)
-            await self._sleep_with_control(spec.poll_interval_ms / 1000, control, allow_abort=False, allow_pause=False)
+            delay_seconds = poll_schedule[min(poll_index, len(poll_schedule) - 1)]
+            poll_index += 1
+            await self._sleep_with_control(delay_seconds, control, allow_abort=False, allow_pause=False)
         await self._respect_control(control, allow_abort=False, allow_pause=False)
         current = await self._gateway.get_order(symbol=spec.symbol, order_id=order.order_id)
         return PollObservation(
@@ -583,6 +597,11 @@ class PairedOpeningEngine:
             had_fill=current.executed_qty > Decimal("0"),
             terminal=current.status == ExchangeOrderStatus.FILLED,
         )
+
+    def _poll_delay_schedule(self, base_poll_interval_ms: int) -> list[float]:
+        normalized_base_seconds = max(base_poll_interval_ms, 10) / 1000
+        schedule_ms = [50, 100, 150, 250, 400]
+        return [max(normalized_base_seconds, delay_ms / 1000) for delay_ms in schedule_ms]
 
     async def _cancel_if_open(self, order: ExchangeOrder) -> ExchangeOrder:
         if order.status in (
@@ -1676,5 +1695,10 @@ class PairedClosingEngine(PairedOpeningEngine):
         if trend_bias == TrendBias.LONG:
             return OrderSide.SELL, PositionSide.LONG, lambda quote: quote.bid_price
         return OrderSide.BUY, PositionSide.SHORT, lambda quote: quote.ask_price
+
+
+
+
+
 
 

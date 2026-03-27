@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -6,21 +6,33 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from paired_opener.config import Settings
 from paired_opener.domain import TrendBias
 from paired_opener.exchange import ExchangeGateway
 
 
 class MarketStreamController:
-    def __init__(self, gateway: ExchangeGateway, account_id: str = "default", account_name: str = "默认账户") -> None:
+    def __init__(
+        self,
+        gateway: ExchangeGateway,
+        settings: Settings | None = None,
+        account_id: str = "default",
+        account_name: str = "default",
+    ) -> None:
         self._gateway = gateway
+        self._settings = settings or Settings()
         self._account_id = account_id
         self._account_name = account_name
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._lock = asyncio.Lock()
         self._simulation_lock = asyncio.Lock()
         self._market_task: asyncio.Task[None] | None = None
+        self._account_task: asyncio.Task[None] | None = None
         self._disconnect_task: asyncio.Task[dict[str, Any]] | None = None
         self._last_account_error: str | None = None
+        self._last_orderbook_signature: tuple[Any, ...] | None = None
+        self._orderbook_interval_seconds = 0.25
+        self._account_refresh_interval_seconds = max(self._settings.market_account_refresh_interval_ms / 1000, 1.0)
         self._state = {
             "connected": False,
             "status": "disconnected",
@@ -28,14 +40,14 @@ class MarketStreamController:
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": "未连接",
+            "message": "idle",
         }
         self._account_overview = {
             "status": "idle",
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": "未连接",
+            "message": "idle",
             "totals": {
                 "equity": "0",
                 "margin": "0",
@@ -98,8 +110,7 @@ class MarketStreamController:
         self._subscribers.discard(queue)
         if (
             not self._subscribers
-            and self._market_task is not None
-            and not self._market_task.done()
+            and (self._market_task is not None or self._account_task is not None)
             and (self._disconnect_task is None or self._disconnect_task.done())
         ):
             self._disconnect_task = asyncio.create_task(self._disconnect_after_unsubscribe())
@@ -109,10 +120,12 @@ class MarketStreamController:
         if self._disconnect_task is not None and not self._disconnect_task.done():
             self._disconnect_task.cancel()
         self._disconnect_task = None
-        old_task: asyncio.Task[None] | None = None
         async with self._lock:
-            old_task = self._market_task
+            old_market_task = self._market_task
+            old_account_task = self._account_task
             self._market_task = None
+            self._account_task = None
+            self._last_orderbook_signature = None
             self._state = {
                 "connected": False,
                 "status": "connecting",
@@ -120,29 +133,28 @@ class MarketStreamController:
                 "account_id": self._account_id,
                 "account_name": self._account_name,
                 "updated_at": self._utc_now(),
-                "message": f"正在连接 {symbol}",
+                "message": f"???? {symbol}",
             }
             self._account_overview = {
                 **self._account_overview,
                 "status": "loading",
                 "updated_at": self._utc_now(),
-                "message": f"正在获取 {symbol} 账户概览",
+                "message": f"???? {symbol} ????",
             }
-        if old_task is not None:
-            old_task.cancel()
-            try:
-                await old_task
-            except asyncio.CancelledError:
-                pass
+        await self._cancel_tasks(old_market_task, old_account_task)
         await self.publish("connection_status", self._state)
         await self.publish("account_overview", self._account_overview)
-        await self.publish("execution_log", {
-            "level": "info",
-            "message": f"开始连接行情流: {symbol}",
-            "created_at": self._utc_now(),
-        })
+        await self.publish(
+            "execution_log",
+            {
+                "level": "info",
+                "message": f"???????: {symbol}",
+                "created_at": self._utc_now(),
+            },
+        )
         async with self._lock:
             self._market_task = asyncio.create_task(self._market_loop(symbol))
+            self._account_task = asyncio.create_task(self._account_loop(symbol))
             return self._normalize(self._state)
 
     async def _disconnect_after_unsubscribe(self) -> dict:
@@ -160,15 +172,13 @@ class MarketStreamController:
         ):
             self._disconnect_task.cancel()
         async with self._lock:
-            task = self._market_task
+            market_task = self._market_task
+            account_task = self._account_task
             self._market_task = None
+            self._account_task = None
             symbol = self._state.get("symbol", "BTCUSDT")
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        await self._cancel_tasks(market_task, account_task)
+        self._last_orderbook_signature = None
         self._state = {
             "connected": False,
             "status": "disconnected",
@@ -176,22 +186,34 @@ class MarketStreamController:
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": "连接已关闭",
+            "message": "?????",
         }
         self._account_overview = {
             **self._account_overview,
             "status": "idle",
             "updated_at": self._utc_now(),
-            "message": "连接已关闭",
+            "message": "?????",
         }
         await self.publish("connection_status", self._state)
         await self.publish("account_overview", self._account_overview)
-        await self.publish("execution_log", {
-            "level": "warn",
-            "message": "已停止获取订单簿数据",
-            "created_at": self._utc_now(),
-        })
+        await self.publish(
+            "execution_log",
+            {
+                "level": "warn",
+                "message": "??????????",
+                "created_at": self._utc_now(),
+            },
+        )
         return self._normalize(self._state)
+
+    async def _cancel_tasks(self, *tasks: asyncio.Task[Any] | None) -> None:
+        active_tasks = [task for task in tasks if task is not None and not task.done()]
+        if not active_tasks:
+            return
+        for task in active_tasks:
+            task.cancel()
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+
     async def _refresh_account_overview(self) -> None:
         try:
             overview = await self._gateway.get_account_overview()
@@ -201,16 +223,19 @@ class MarketStreamController:
                 "account_id": self._account_id,
                 "account_name": self._account_name,
                 "updated_at": self._utc_now(),
-                "message": "账户概览已更新",
+                "message": "???????",
             }
             self._account_overview = overview
             await self.publish("account_overview", self._account_overview)
             if self._last_account_error is not None:
-                await self.publish("execution_log", {
-                    "level": "success",
-                    "message": "账户概览连接已恢复",
-                    "created_at": self._utc_now(),
-                })
+                await self.publish(
+                    "execution_log",
+                    {
+                        "level": "success",
+                        "message": "?????????",
+                        "created_at": self._utc_now(),
+                    },
+                )
             self._last_account_error = None
         except Exception as exc:
             error_message = str(exc)
@@ -222,12 +247,50 @@ class MarketStreamController:
             }
             await self.publish("account_overview", self._account_overview)
             if error_message != self._last_account_error:
-                await self.publish("execution_log", {
-                    "level": "warn",
-                    "message": f"账户概览获取失败: {error_message}",
-                    "created_at": self._utc_now(),
-                })
+                await self.publish(
+                    "execution_log",
+                    {
+                        "level": "warn",
+                        "message": f"????????: {error_message}",
+                        "created_at": self._utc_now(),
+                    },
+                )
             self._last_account_error = error_message
+
+    def _orderbook_signature(self, snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        asks = tuple((str(level.get("price")), str(level.get("qty"))) for level in snapshot.get("asks", [])[:2])
+        bids = tuple((str(level.get("price")), str(level.get("qty"))) for level in snapshot.get("bids", [])[:2])
+        return snapshot.get("lastUpdateId"), asks, bids
+
+    async def _publish_orderbook(self, symbol: str, snapshot: dict[str, Any]) -> None:
+        raw_asks = snapshot.get("asks") or []
+        raw_bids = snapshot.get("bids") or []
+        asks = [raw_asks[index] for index in (0, 1) if index < len(raw_asks)]
+        bids = [raw_bids[index] for index in (0, 1) if index < len(raw_bids)]
+        max_qty = max([level["qty"] for level in asks + bids], default=Decimal("1"))
+        await self.publish(
+            "orderbook",
+            {
+                "symbol": symbol,
+                "updated_at": self._utc_now(),
+                "asks": [
+                    {
+                        "price": level["price"],
+                        "qty": level["qty"],
+                        "depth_ratio": (level["qty"] / max_qty) if max_qty > 0 else Decimal("0"),
+                    }
+                    for level in asks
+                ],
+                "bids": [
+                    {
+                        "price": level["price"],
+                        "qty": level["qty"],
+                        "depth_ratio": (level["qty"] / max_qty) if max_qty > 0 else Decimal("0"),
+                    }
+                    for level in bids
+                ],
+            },
+        )
 
     async def _market_loop(self, symbol: str) -> None:
         self._state = {
@@ -237,46 +300,17 @@ class MarketStreamController:
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": f"已连接 {symbol}",
+            "message": f"??? {symbol}",
         }
         await self.publish("connection_status", self._state)
-        next_account_refresh_at = 0.0
         try:
             while True:
-                snapshot = await self._gateway.get_order_book(symbol, limit=10)
-                raw_asks = snapshot["asks"]
-                raw_bids = snapshot["bids"]
-                asks = [raw_asks[index] for index in (0, 1) if index < len(raw_asks)]
-                bids = [raw_bids[index] for index in (0, 1) if index < len(raw_bids)]
-                max_qty = max([level["qty"] for level in asks + bids], default=Decimal("1"))
-                await self.publish(
-                    "orderbook",
-                    {
-                        "symbol": symbol,
-                        "updated_at": self._utc_now(),
-                        "asks": [
-                            {
-                                "price": level["price"],
-                                "qty": level["qty"],
-                                "depth_ratio": (level["qty"] / max_qty) if max_qty > 0 else Decimal("0"),
-                            }
-                            for level in asks
-                        ],
-                        "bids": [
-                            {
-                                "price": level["price"],
-                                "qty": level["qty"],
-                                "depth_ratio": (level["qty"] / max_qty) if max_qty > 0 else Decimal("0"),
-                            }
-                            for level in bids
-                        ],
-                    },
-                )
-                loop_now = asyncio.get_running_loop().time()
-                if loop_now >= next_account_refresh_at:
-                    await self._refresh_account_overview()
-                    next_account_refresh_at = loop_now + 2.0
-                await asyncio.sleep(0.5)
+                snapshot = await self._gateway.get_order_book(symbol, limit=5)
+                signature = self._orderbook_signature(snapshot)
+                if signature != self._last_orderbook_signature:
+                    self._last_orderbook_signature = signature
+                    await self._publish_orderbook(symbol, snapshot)
+                await asyncio.sleep(self._orderbook_interval_seconds)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -290,13 +324,35 @@ class MarketStreamController:
                 "message": str(exc),
             }
             await self.publish("connection_status", self._state)
-            await self.publish("execution_log", {
-                "level": "error",
-                "message": f"订单簿获取失败: {exc}",
-                "created_at": self._utc_now(),
-            })
+            await self.publish(
+                "execution_log",
+                {
+                    "level": "error",
+                    "message": f"???????: {exc}",
+                    "created_at": self._utc_now(),
+                },
+            )
             async with self._lock:
                 self._market_task = None
+
+    async def _account_loop(self, symbol: str) -> None:
+        try:
+            while True:
+                await self._refresh_account_overview()
+                await asyncio.sleep(self._account_refresh_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.publish(
+                "execution_log",
+                {
+                    "level": "warn",
+                    "message": f"????????: {exc}",
+                    "created_at": self._utc_now(),
+                },
+            )
+            async with self._lock:
+                self._account_task = None
 
     async def run_simulation(
         self,
@@ -337,11 +393,14 @@ class MarketStreamController:
                         "updated_at": self._utc_now(),
                     }
                     await self.publish("execution_stats", self._execution_stats)
-                    await self.publish("execution_log", {
-                        "level": "warn",
-                        "message": f"模拟执行已阻止: 开单金额 {open_amount} 超过当前可用余额 {available_balance} 的 95% 上限 {max_open_amount}",
-                        "created_at": self._utc_now(),
-                    })
+                    await self.publish(
+                        "execution_log",
+                        {
+                            "level": "warn",
+                            "message": f"???????: ???? {open_amount} ???????? {available_balance} ? 95% ?? {max_open_amount}",
+                            "created_at": self._utc_now(),
+                        },
+                    )
                     return self._normalize(self._execution_stats)
             total_notional = open_amount * Decimal(leverage)
             notional_per_round = total_notional / Decimal(round_count)
@@ -360,11 +419,14 @@ class MarketStreamController:
                     "updated_at": self._utc_now(),
                 }
                 await self.publish("execution_stats", self._execution_stats)
-                await self.publish("execution_log", {
-                    "level": "warn",
-                    "message": f"模拟执行已阻止: 每轮开单金额 {notional_per_round} 低于最小开单金额 {rules.min_notional}",
-                    "created_at": self._utc_now(),
-                })
+                await self.publish(
+                    "execution_log",
+                    {
+                        "level": "warn",
+                        "message": f"???????: ?????? {notional_per_round} ???????? {rules.min_notional}",
+                        "created_at": self._utc_now(),
+                    },
+                )
                 return self._normalize(self._execution_stats)
             self._execution_stats = {
                 "status": "running",
@@ -380,11 +442,14 @@ class MarketStreamController:
                 "updated_at": self._utc_now(),
             }
             await self.publish("execution_stats", self._execution_stats)
-            await self.publish("execution_log", {
-                "level": "info",
-                "message": f"开始模拟执行: {symbol} | 趋势={trend_bias.value} | 总保证金={open_amount} | 杠杆={leverage}x | 轮次={round_count}",
-                "created_at": self._utc_now(),
-            })
+            await self.publish(
+                "execution_log",
+                {
+                    "level": "info",
+                    "message": f"??????: {symbol} | ??={trend_bias.value} | ????={open_amount} | ??={leverage}x | ??={round_count}",
+                    "created_at": self._utc_now(),
+                },
+            )
 
             for round_index in range(1, round_count + 1):
                 snapshot = await self._gateway.get_order_book(symbol, limit=10)
@@ -402,11 +467,14 @@ class MarketStreamController:
                     stage2_price = bid1["price"]
 
                 est_qty = (notional_per_round / stage1_price) if stage1_price > 0 else Decimal("0")
-                await self.publish("execution_log", {
-                    "level": "info",
-                    "message": f"第 {round_index} 轮: Stage1 {stage1_side} @ {stage1_price} | Stage2 {stage2_side} @ {stage2_price} | 预计数量 {est_qty:.8f}",
-                    "created_at": self._utc_now(),
-                })
+                await self.publish(
+                    "execution_log",
+                    {
+                        "level": "info",
+                        "message": f"? {round_index} ?: Stage1 {stage1_side} @ {stage1_price} | Stage2 {stage2_side} @ {stage2_price} | ???? {est_qty:.8f}",
+                        "created_at": self._utc_now(),
+                    },
+                )
                 self._execution_stats = {
                     "status": "running",
                     "symbol": symbol,
@@ -422,35 +490,29 @@ class MarketStreamController:
                 }
                 await self.publish("execution_stats", self._execution_stats)
                 if round_index < round_count:
-                    await self.publish("execution_log", {
-                        "level": "info",
-                        "message": f"第 {round_index} 轮完成，等待 3 秒后进入下一轮",
-                        "created_at": self._utc_now(),
-                    })
+                    await self.publish(
+                        "execution_log",
+                        {
+                            "level": "info",
+                            "message": f"? {round_index} ?????? 3 ???????",
+                            "created_at": self._utc_now(),
+                        },
+                    )
                     await asyncio.sleep(3)
 
             self._execution_stats["status"] = "completed"
             self._execution_stats["updated_at"] = self._utc_now()
             await self.publish("execution_stats", self._execution_stats)
-            await self.publish("execution_log", {
-                "level": "success",
-                "message": f"模拟执行完成: {symbol} 共 {round_count} 轮",
-                "created_at": self._utc_now(),
-            })
+            await self.publish(
+                "execution_log",
+                {
+                    "level": "success",
+                    "message": f"??????: {symbol} ? {round_count} ?",
+                    "created_at": self._utc_now(),
+                },
+            )
             return self._normalize(self._execution_stats)
 
 
 def format_sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-
-
-
-
-
-
-
-
-
-

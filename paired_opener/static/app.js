@@ -1,4 +1,4 @@
-﻿const logsBody = document.getElementById("logsBody");
+const logsBody = document.getElementById("logsBody");
 const asksContainer = document.getElementById("asksContainer");
 const bidsContainer = document.getElementById("bidsContainer");
 const connectionToggle = document.getElementById("connectionToggle");
@@ -46,15 +46,62 @@ let currentPositions = [];
 let currentSymbolInfo = { symbol: activeSymbol, min_notional: 0, allowed: true };
 let symbolInfoReady = false;
 let precheckTimer = null;
+let precheckAbortController = null;
 let latestPrecheckToken = 0;
 const latestPrecheckByMode = new Map();
+const inFlightPrecheckPayloadByMode = new Map();
+let precheckPaused = false;
 let activeSessionId = null;
 let activeSessionPoller = null;
+let activeSessionState = null;
+let latestSessionEventId = 0;
 const seenSessionEventIds = new Set();
+const MAX_LOG_LINES = 200;
+const orderBookRowCache = { sell: [], buy: [] };
+const positionRowCache = new Map();
+let pendingOrderbookPayload = null;
+let pendingAccountOverviewPayload = null;
+const pendingLogEntries = [];
+let renderFramePending = false;
 
 function nowTime() {
   return new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
+
+function queueUiRender() {
+  if (renderFramePending) return;
+  renderFramePending = true;
+  requestAnimationFrame(() => {
+    renderFramePending = false;
+    if (pendingOrderbookPayload) {
+      const payload = pendingOrderbookPayload;
+      pendingOrderbookPayload = null;
+      renderLevels(asksContainer, payload.asks || [], "sell");
+      renderLevels(bidsContainer, payload.bids || [], "buy");
+      const bestAsk = Number(payload.asks?.[0]?.price || 0);
+      const bestBid = Number(payload.bids?.[0]?.price || 0);
+      latestReferencePrice = bestAsk > 0 && bestBid > 0 ? (bestAsk + bestBid) / 2 : (bestAsk || bestBid || 0);
+      recalculateOpenAmount();
+      recalculateCloseAmount();
+      recalculateSingleCloseAmount();
+      document.getElementById("streamClock").textContent = nowTime();
+    }
+    if (pendingAccountOverviewPayload) {
+      const payload = pendingAccountOverviewPayload;
+      pendingAccountOverviewPayload = null;
+      renderAccountOverview(payload);
+      document.getElementById("streamClock").textContent = nowTime();
+    }
+    if (pendingLogEntries.length) {
+      const entries = pendingLogEntries.splice(0, pendingLogEntries.length);
+      entries.forEach((entry) => {
+        appendLog(entry.level || "info", entry.message || "", entry.created_at);
+      });
+      document.getElementById("streamClock").textContent = nowTime();
+    }
+  });
+}
+
 
 function request(path, options = {}) {
   return fetch(path, options).then(async (response) => {
@@ -323,21 +370,38 @@ function applyPrecheckResult(mode, precheck) {
 }
 
 async function runPrecheck(mode = executionMode) {
-  const token = ++latestPrecheckToken;
+  if (precheckPaused) return;
   const payload = buildPrecheckPayload(mode);
   if (!canRunPrecheck(mode, payload)) {
     return;
   }
+  const payloadKey = JSON.stringify(payload);
+  if (latestPrecheckByMode.get(mode) === payloadKey || inFlightPrecheckPayloadByMode.get(mode) === payloadKey) {
+    return;
+  }
+  if (precheckAbortController) {
+    precheckAbortController.abort();
+  }
+  const controller = new AbortController();
+  precheckAbortController = controller;
+  inFlightPrecheckPayloadByMode.set(mode, payloadKey);
+  const token = ++latestPrecheckToken;
   try {
     const precheck = await request("/sessions/precheck", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
-    if (token !== latestPrecheckToken) return;
+    if (controller.signal.aborted || token !== latestPrecheckToken) return;
+    latestPrecheckByMode.set(mode, payloadKey);
     applyPrecheckResult(mode, precheck);
   } catch (error) {
+    if (controller.signal.aborted || error?.name === "AbortError") {
+      return;
+    }
     if (token !== latestPrecheckToken) return;
+    latestPrecheckByMode.delete(mode);
     const precheck = error.precheck || null;
     if (error.validationDetail) {
       return;
@@ -346,7 +410,7 @@ async function runPrecheck(mode = executionMode) {
       applyPrecheckResult(mode, precheck);
       return;
     }
-    const message = `统一预检失败: ${String(error)}`;
+    const message = `Precheck failed: ${String(error)}`;
     switch (mode) {
       case "paired_close":
         updateCloseValidationHint({ canCreate: false, tone: "error", message });
@@ -361,10 +425,18 @@ async function runPrecheck(mode = executionMode) {
         updateOpenValidationHint({ canCreate: false, canSimulate: !simulateBtn.disabled, tone: "error", message });
         break;
     }
+  } finally {
+    if (inFlightPrecheckPayloadByMode.get(mode) === payloadKey) {
+      inFlightPrecheckPayloadByMode.delete(mode);
+    }
+    if (precheckAbortController === controller) {
+      precheckAbortController = null;
+    }
   }
 }
 
-function schedulePrecheck(mode = executionMode, delay = 180) {
+function schedulePrecheck(mode = executionMode, delay = 400) {
+  if (precheckPaused) return;
   if (precheckTimer) {
     clearTimeout(precheckTimer);
   }
@@ -372,6 +444,22 @@ function schedulePrecheck(mode = executionMode, delay = 180) {
     precheckTimer = null;
     runPrecheck(mode);
   }, delay);
+}
+
+function setPrecheckPaused(paused) {
+  precheckPaused = Boolean(paused);
+  if (!precheckPaused) {
+    return;
+  }
+  if (precheckTimer) {
+    clearTimeout(precheckTimer);
+    precheckTimer = null;
+  }
+  if (precheckAbortController) {
+    precheckAbortController.abort();
+    precheckAbortController = null;
+  }
+  inFlightPrecheckPayloadByMode.clear();
 }
 
 function isTerminalSession(status) {
@@ -517,18 +605,57 @@ function setSymbolInfo(info) {
 }
 
 function renderLevels(container, levels, side) {
-  container.innerHTML = "";
+  const cache = orderBookRowCache[side] || [];
+  orderBookRowCache[side] = cache;
+  const emptyState = container.querySelector(".orderbook-empty");
+  if (!Array.isArray(levels) || !levels.length) {
+    if (!emptyState) {
+      const placeholder = document.createElement("div");
+      placeholder.className = "empty-state orderbook-empty";
+      placeholder.textContent = side === "sell" ? "Sell levels will appear after connect" : "Buy levels will appear after connect";
+      container.appendChild(placeholder);
+    }
+    cache.forEach((row) => {
+      row.style.display = "none";
+    });
+    return;
+  }
+  if (emptyState) {
+    emptyState.remove();
+  }
   levels.forEach((level, index) => {
-    const row = document.createElement("div");
-    row.className = `level-row ${side}`;
-    row.style.setProperty("--depth", Math.max(0, Math.min(1, Number(level.depth_ratio || 0))));
-    row.innerHTML = `
-      <div class="level-price ${side}">${side === "sell" ? `卖${index + 1}` : `买${index + 1}`} ${formatNumber(level.price, 2)}</div>
-      <div class="level-qty mono">${formatNumber(level.qty, 6)}</div>
-      <div class="level-bar-value mono">${Math.round((Number(level.depth_ratio || 0)) * 100)}%</div>
-    `;
-    container.appendChild(row);
+    let row = cache[index];
+    if (!row) {
+      row = document.createElement("div");
+      row.className = `level-row ${side}`;
+      const price = document.createElement("div");
+      price.className = `level-price ${side}`;
+      const qty = document.createElement("div");
+      qty.className = "level-qty mono";
+      const ratio = document.createElement("div");
+      ratio.className = "level-bar-value mono";
+      row.appendChild(price);
+      row.appendChild(qty);
+      row.appendChild(ratio);
+      row._priceEl = price;
+      row._qtyEl = qty;
+      row._ratioEl = ratio;
+      cache[index] = row;
+      container.appendChild(row);
+    }
+    row.style.display = "";
+    const depthRatio = Math.max(0, Math.min(1, Number(level.depth_ratio || 0)));
+    const priceText = `${side === "sell" ? "卖" : "买"}${index + 1} ${formatNumber(level.price, 2)}`;
+    const qtyText = formatNumber(level.qty, 6);
+    const ratioText = `${Math.round(depthRatio * 100)}%`;
+    row.style.setProperty("--depth", depthRatio);
+    if (row._priceEl.textContent !== priceText) row._priceEl.textContent = priceText;
+    if (row._qtyEl.textContent !== qtyText) row._qtyEl.textContent = qtyText;
+    if (row._ratioEl.textContent !== ratioText) row._ratioEl.textContent = ratioText;
   });
+  for (let index = levels.length; index < cache.length; index += 1) {
+    cache[index].style.display = "none";
+  }
 }
 
 function appendLog(level, message, createdAt) {
@@ -541,6 +668,9 @@ function appendLog(level, message, createdAt) {
     <div class="log-message">${message}</div>
   `;
   logsBody.prepend(line);
+  while (logsBody.children.length > MAX_LOG_LINES) {
+    logsBody.removeChild(logsBody.lastElementChild);
+  }
 }
 
 function setConnectionState(state) {
@@ -656,9 +786,18 @@ function renderAccountOverview(payload) {
   }
 
   document.getElementById("positionsCount").textContent = String(currentPositions.length);
-  positionsList.innerHTML = "";
+  const emptyNode = positionsList.querySelector(".empty-state");
   if (!currentPositions.length) {
-    positionsList.innerHTML = `<div class="empty-state" style="min-height: 220px; margin-top: 0;"><div><div style="font-size: 36px; margin-bottom: 10px;">📭</div><div>${payload.status === "loading" ? "正在加载持仓" : "暂无持仓"}</div><div style="margin-top: 6px; font-size: 13px;">${payload.message || "连接后会显示当前 U 本位合约持仓"}</div></div></div>`;
+    positionRowCache.forEach((row) => row.remove());
+    positionRowCache.clear();
+    const message = payload.status === "loading" ? "Loading positions" : "No open positions";
+    const detail = payload.message || "Positions will appear here after the stream connects.";
+    const placeholder = document.createElement("div");
+    placeholder.className = "empty-state";
+    placeholder.style.minHeight = "220px";
+    placeholder.style.marginTop = "0";
+    placeholder.innerHTML = `<div><div style="font-size: 36px; margin-bottom: 10px;">??</div><div>${message}</div><div style="margin-top: 6px; font-size: 13px;">${detail}</div></div>`;
+    positionsList.replaceChildren(placeholder);
     refreshSingleOpenOrderOptions();
     refreshSingleClosePositionOptions();
     recalculateOpenAmount();
@@ -668,28 +807,60 @@ function renderAccountOverview(payload) {
     return;
   }
 
+  if (emptyNode) {
+    emptyNode.remove();
+  }
+  const nextKeys = new Set();
+  const fragment = document.createDocumentFragment();
   currentPositions.forEach((position) => {
-    const row = document.createElement("div");
-    row.className = "position-row";
+    const key = `${position.symbol}:${position.position_side}`;
+    nextKeys.add(key);
+    let row = positionRowCache.get(key);
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "position-row";
+      positionRowCache.set(key, row);
+    }
     const sideClass = String(position.position_side || "").toLowerCase() === "short" ? "short" : "long";
     const pnlValue = Number(position.unrealized_pnl || 0);
     const pnlClass = pnlValue > 0 ? "positive" : pnlValue < 0 ? "negative" : "zero";
     const leverageText = Number(position.leverage || 0) > 0 ? `${position.leverage}x` : "--";
     const notional = Number(position.notional || 0) || ((Number(position.qty || 0) || 0) * (Number(position.entry_price || 0) || 0));
-    row.innerHTML = `
-      <div class="position-row-head">
-        <div class="position-symbol">${position.symbol}<span class="position-leverage-inline">${leverageText}</span></div>
-        <span class="position-side ${sideClass}">${position.position_side}</span>
-      </div>
-      <div class="position-meta">
-        <div>持仓数量<strong class="mono">${formatNumber(position.qty || 0, 6)}</strong></div>
-        <div>名义价值<strong class="mono">${formatNumber(notional, 2)}</strong></div>
-        <div>开仓均价<strong class="mono">${formatNumber(position.entry_price || 0, 2)}</strong></div>
-        <div>未实现盈亏<strong class="mono ${pnlClass}">${formatNumber(position.unrealized_pnl || 0, 4)}</strong></div>
-      </div>
-    `;
-    positionsList.appendChild(row);
+    const signature = JSON.stringify([
+      position.symbol,
+      position.position_side,
+      position.qty,
+      position.entry_price,
+      position.unrealized_pnl,
+      notional,
+      leverageText,
+      pnlClass,
+      sideClass,
+    ]);
+    if (row.dataset.signature !== signature) {
+      row.dataset.signature = signature;
+      row.innerHTML = `
+        <div class="position-row-head">
+          <div class="position-symbol">${position.symbol}<span class="position-leverage-inline">${leverageText}</span></div>
+          <span class="position-side ${sideClass}">${position.position_side === "SHORT" ? "空" : "多"}</span>
+        </div>
+        <div class="position-meta">
+          <div>数量<strong class="mono">${formatNumber(position.qty || 0, 6)}</strong></div>
+          <div>名义价值<strong class="mono">${formatNumber(notional, 2)}</strong></div>
+          <div>开仓均价<strong class="mono">${formatNumber(position.entry_price || 0, 2)}</strong></div>
+          <div>未实现盈亏<strong class="mono ${pnlClass}">${formatNumber(position.unrealized_pnl || 0, 4)}</strong></div>
+        </div>
+      `;
+    }
+    fragment.appendChild(row);
   });
+  positionRowCache.forEach((row, key) => {
+    if (!nextKeys.has(key)) {
+      row.remove();
+      positionRowCache.delete(key);
+    }
+  });
+  positionsList.replaceChildren(fragment);
 
   refreshSingleOpenOrderOptions();
   refreshSingleClosePositionOptions();
@@ -1238,32 +1409,78 @@ function stopSessionPolling(clearSessionId = true) {
   }
   if (clearSessionId) {
     activeSessionId = null;
+    activeSessionState = null;
+    latestSessionEventId = 0;
     accountSelect.disabled = availableAccounts.length <= 1;
+  }
+}
+
+function mergeChangedRounds(existingRounds, changedRounds) {
+  const rounds = Array.isArray(existingRounds) ? [...existingRounds] : [];
+  const byIndex = new Map(rounds.map((round) => [Number(round.round_index || 0), round]));
+  (changedRounds || []).forEach((round) => {
+    byIndex.set(Number(round.round_index || 0), round);
+  });
+  return [...byIndex.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .map((entry) => entry[1]);
+}
+
+async function loadActiveSessionSnapshot() {
+  if (!activeSessionId) return;
+  const session = await request(`/sessions/${encodeURIComponent(activeSessionId)}`);
+  activeSessionState = session;
+  latestSessionEventId = Array.isArray(session.events)
+    ? session.events.reduce((maxId, event) => Math.max(maxId, Number(event.event_id || 0)), 0)
+    : 0;
+  updateRealSessionStats(session);
+  renderSessionEvents(session.events || []);
+  if (isTerminalSession(session.status)) {
+    stopSessionPolling();
   }
 }
 
 async function pollActiveSession() {
   if (!activeSessionId) return;
   try {
-    const session = await request(`/sessions/${encodeURIComponent(activeSessionId)}`);
-    updateRealSessionStats(session);
-    renderSessionEvents(session.events || []);
-    if (isTerminalSession(session.status)) {
+    if (!activeSessionState) {
+      await loadActiveSessionSnapshot();
+      return;
+    }
+    const payload = await request(`/sessions/${encodeURIComponent(activeSessionId)}/updates?after_event_id=${latestSessionEventId}`);
+    activeSessionState = {
+      ...activeSessionState,
+      ...(payload.session || {}),
+      rounds: mergeChangedRounds(activeSessionState.rounds || [], payload.changed_rounds || []),
+    };
+    latestSessionEventId = Math.max(latestSessionEventId, Number(payload.latest_event_id || 0));
+    updateRealSessionStats(activeSessionState);
+    renderSessionEvents(payload.events || []);
+    if (isTerminalSession(activeSessionState.status)) {
       stopSessionPolling();
     }
   } catch (error) {
-    appendLog("error", `真实会话状态获取失败: ${String(error)}`);
-    stopSessionPolling();
+    try {
+      await loadActiveSessionSnapshot();
+    } catch (fallbackError) {
+      appendLog("error", `Session refresh failed: ${String(fallbackError || error)}`);
+      stopSessionPolling();
+    }
   }
 }
 
 function startSessionPolling(sessionId) {
   stopSessionPolling(false);
   activeSessionId = sessionId;
+  activeSessionState = null;
+  latestSessionEventId = 0;
   seenSessionEventIds.clear();
   accountSelect.disabled = true;
-  pollActiveSession();
-  activeSessionPoller = setInterval(pollActiveSession, 1000);
+  loadActiveSessionSnapshot().catch((error) => {
+    appendLog("error", `Session refresh failed: ${String(error)}`);
+    stopSessionPolling();
+  });
+  activeSessionPoller = setInterval(pollActiveSession, 2000);
 }
 
 async function refreshSymbolInfo(symbol) {
@@ -1281,29 +1498,20 @@ function openSse() {
     document.getElementById("streamClock").textContent = nowTime();
   });
   eventSource.addEventListener("orderbook", (event) => {
-    const payload = JSON.parse(event.data);
-    renderLevels(asksContainer, payload.asks || [], "sell");
-    renderLevels(bidsContainer, payload.bids || [], "buy");
-    const bestAsk = Number(payload.asks?.[0]?.price || 0);
-    const bestBid = Number(payload.bids?.[0]?.price || 0);
-    latestReferencePrice = bestAsk > 0 && bestBid > 0 ? (bestAsk + bestBid) / 2 : (bestAsk || bestBid || 0);
-    recalculateOpenAmount();
-    recalculateCloseAmount();
-    recalculateSingleCloseAmount();
-    document.getElementById("streamClock").textContent = nowTime();
+    pendingOrderbookPayload = JSON.parse(event.data);
+    queueUiRender();
   });
   eventSource.addEventListener("execution_log", (event) => {
-    const payload = JSON.parse(event.data);
-    appendLog(payload.level || "info", payload.message || "", payload.created_at);
-    document.getElementById("streamClock").textContent = nowTime();
+    pendingLogEntries.push(JSON.parse(event.data));
+    queueUiRender();
   });
   eventSource.addEventListener("execution_stats", (event) => {
     const payload = JSON.parse(event.data);
     updateExecutionStats(payload);
   });
   eventSource.addEventListener("account_overview", (event) => {
-    const payload = JSON.parse(event.data);
-    renderAccountOverview(payload);
+    pendingAccountOverviewPayload = JSON.parse(event.data);
+    queueUiRender();
   });
   eventSource.onerror = () => {
     document.getElementById("streamClock").textContent = nowTime();
@@ -1321,7 +1529,7 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
   const targetSymbol = normalizeSymbol(nextSymbol);
   if (!targetSymbol) {
     rebuildSymbolOptions(activeSymbol);
-    appendLog("warn", "请输入有效的交易对");
+    appendLog("warn", "Please enter a valid symbol");
     return false;
   }
   if (targetSymbol === activeSymbol) {
@@ -1344,16 +1552,16 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
         body: JSON.stringify({ symbol: targetSymbol })
       });
     }
-    appendLog("info", `交易对已切换为 ${targetSymbol}`);
+    appendLog("info", `Symbol switched to ${targetSymbol}`);
     if (symbolInfo.allowed === false) {
-      appendLog("warn", `${targetSymbol} 在 Binance U 本位永续合约中存在，但当前不在系统白名单内，真实开单会失败`);
+      appendLog("warn", `${targetSymbol} exists on Binance USD-M futures, but it is not in the current whitelist, so real trading will fail.`);
     }
     return true;
   } catch (error) {
     temporaryCustomSymbol = previousTemporaryCustomSymbol;
     setActiveSymbol(previousSymbol, true);
     setSymbolInfo(previousSymbolInfo);
-    appendLog("error", `交易对切换失败，${targetSymbol} 不存在或当前不可用: ${String(error)}`);
+    appendLog("error", `Failed to switch symbol ${targetSymbol}: ${String(error)}`);
     return false;
   }
 }
@@ -1378,7 +1586,7 @@ connectionToggle.addEventListener("change", async (event) => {
         symbol,
         account_id: currentAccount.id,
         account_name: currentAccount.name,
-        message: "连接已关闭",
+        message: "Disconnected",
       });
     }
   } catch (error) {
@@ -1418,10 +1626,10 @@ accountSelect.addEventListener("change", async (event) => {
           symbol: activeSymbol,
           account_id: payload.account.id,
           account_name: payload.account.name,
-          message: "连接已关闭",
+          message: "Disconnected",
         });
       }
-      appendLog("success", `当前账户已切换为 ${payload.account.name}`);
+      appendLog("success", `Current account switched to ${payload.account.name}`);
       schedulePrecheck();
     } catch (error) {
       connectionToggle.checked = false;
@@ -1433,19 +1641,19 @@ accountSelect.addEventListener("change", async (event) => {
         account_name: payload.account.name,
         message: String(error)
       });
-      appendLog("error", `账户已切换为 ${payload.account.name}，但当前交易对 ${activeSymbol} 加载失败: ${String(error)}`);
+      appendLog("error", `Account switched to ${payload.account.name}, but loading ${activeSymbol} failed: ${String(error)}`);
     }
   } catch (error) {
     setCurrentAccount(previousAccount.id, previousAccount.name, true);
     openSse();
-    appendLog("error", `账户切换失败: ${String(error)}`);
+    appendLog("error", `Failed to switch account: ${String(error)}`);
   }
 });
 
 editWhitelistBtn.addEventListener("click", async () => {
   try {
     const initialValue = whitelistSymbols.join(", ");
-    const input = window.prompt("编辑白名单交易对，使用逗号分隔", initialValue);
+    const input = window.prompt("Edit whitelist symbols, separated by commas", initialValue);
     if (input === null) return;
     const symbols = input.split(",").map((item) => normalizeSymbol(item)).filter(Boolean);
     const payload = await request("/config/whitelist", {
@@ -1457,19 +1665,19 @@ editWhitelistBtn.addEventListener("click", async () => {
     const currentSymbol = normalizeSymbol(executionSymbol.value);
     temporaryCustomSymbol = whitelistSymbols.includes(currentSymbol) ? null : currentSymbol;
     rebuildSymbolOptions(currentSymbol);
-    appendLog("success", `白名单已更新: ${(payload.symbols || []).join(", ")}`);
+    appendLog("success", `Whitelist updated: ${(payload.symbols || []).join(", ")}`);
     await refreshSymbolInfo(currentSymbol);
     if (!(payload.symbols || []).includes(currentSymbol)) {
-      appendLog("warn", `${currentSymbol} 已不在白名单内，真实开单会失败`);
+      appendLog("warn", `${currentSymbol} is no longer in the whitelist, so real trading will fail.`);
     }
   } catch (error) {
-    appendLog("error", `白名单更新失败: ${String(error)}`);
+    appendLog("error", `Failed to update whitelist: ${String(error)}`);
   }
 });
 
 confirmSymbolBtn.addEventListener("click", async () => {
   const currentSymbol = normalizeSymbol(executionSymbol.value || activeSymbol);
-  const input = window.prompt("输入自定义交易对", currentSymbol);
+  const input = window.prompt("Enter a custom symbol", currentSymbol);
   if (input === null) {
     rebuildSymbolOptions(activeSymbol);
     return;
@@ -1502,6 +1710,7 @@ simulateBtn.addEventListener("click", async () => {
 });
 
 createBtn.addEventListener("click", async () => {
+  setPrecheckPaused(true);
   try {
     const payload = await request("/sessions/open", {
       method: "POST",
@@ -1515,15 +1724,18 @@ createBtn.addEventListener("click", async () => {
         round_interval_seconds: Number(document.getElementById("roundIntervalSeconds").value)
       })
     });
-    appendLog("success", `真实开仓会话已创建: ${payload.session_id}`);
+    appendLog("success", `Open session created: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
     if (error.precheck) applyPrecheckResult("paired_open", error.precheck);
     appendLog("error", String(error));
+  } finally {
+    setPrecheckPaused(false);
   }
 });
 
 createCloseBtn.addEventListener("click", async () => {
+  setPrecheckPaused(true);
   try {
     const payload = await request("/sessions/close", {
       method: "POST",
@@ -1536,15 +1748,18 @@ createCloseBtn.addEventListener("click", async () => {
         round_interval_seconds: Number(document.getElementById("closeRoundIntervalSeconds").value)
       })
     });
-    appendLog("success", `真实双向平仓会话已创建: ${payload.session_id}`);
+    appendLog("success", `Close session created: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
     if (error.precheck) applyPrecheckResult("paired_close", error.precheck);
     appendLog("error", String(error));
+  } finally {
+    setPrecheckPaused(false);
   }
 });
 
 createSingleOpenBtn.addEventListener("click", async () => {
+  setPrecheckPaused(true);
   try {
     const payload = await request("/sessions/single-open", {
       method: "POST",
@@ -1559,15 +1774,18 @@ createSingleOpenBtn.addEventListener("click", async () => {
         round_interval_seconds: Number(document.getElementById("singleOpenRoundIntervalSeconds").value)
       })
     });
-    appendLog("success", `真实单向开仓会话已创建: ${payload.session_id}`);
+    appendLog("success", `Single-side open session created: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
     if (error.precheck) applyPrecheckResult("single_open", error.precheck);
     appendLog("error", String(error));
+  } finally {
+    setPrecheckPaused(false);
   }
 });
 
 createSingleCloseBtn.addEventListener("click", async () => {
+  setPrecheckPaused(true);
   try {
     const payload = await request("/sessions/single-close", {
       method: "POST",
@@ -1581,12 +1799,13 @@ createSingleCloseBtn.addEventListener("click", async () => {
         round_interval_seconds: Number(document.getElementById("singleCloseRoundIntervalSeconds").value)
       })
     });
-
-    appendLog("success", `真实单向平仓会话已创建: ${payload.session_id}`);
+    appendLog("success", `Single-side close session created: ${payload.session_id}`);
     startSessionPolling(payload.session_id);
   } catch (error) {
     if (error.precheck) applyPrecheckResult("single_close", error.precheck);
     appendLog("error", String(error));
+  } finally {
+    setPrecheckPaused(false);
   }
 });
 
@@ -1645,10 +1864,10 @@ document.getElementById("closeTrend")?.addEventListener("change", (event) => {
   schedulePrecheck("paired_close");
 });
 
-asksContainer.innerHTML = '<div class="empty-state orderbook-empty">开启滑块后加载卖盘</div>';
-bidsContainer.innerHTML = '<div class="empty-state orderbook-empty">开启滑块后加载买盘</div>';
+asksContainer.innerHTML = '<div class="empty-state orderbook-empty">Enable the stream to load asks</div>';
+bidsContainer.innerHTML = '<div class="empty-state orderbook-empty">Enable the stream to load bids</div>';
 setActiveSymbol(activeSymbol, false);
-renderAccountOverview({ status: "idle", message: "未连接", totals: {}, positions: [], account_id: currentAccount.id, account_name: currentAccount.name });
+renderAccountOverview({ status: "idle", message: "Disconnected", totals: {}, positions: [], account_id: currentAccount.id, account_name: currentAccount.name });
 updateExecutionStats({
   mode: "paired_open",
   status: "idle",
@@ -1666,35 +1885,22 @@ syncTrendSelectTone(document.getElementById("closeTrend"));
 syncPositionSideTone(document.getElementById("singleOpenOrder"));
 syncPositionSideTone(document.getElementById("singleCloseOrder"));
 setExecutionMode("paired_open");
-appendLog("info", "控制台已就绪，可从白名单下拉选择交易对，或点击自定义切换交易对");
-loadAccounts()
-  .catch((error) => {
-    appendLog("error", `账户列表加载失败: ${String(error)}`);
-  })
-  .finally(() => {
-    loadWhitelist()
-      .catch((error) => {
-        temporaryCustomSymbol = activeSymbol;
-        rebuildSymbolOptions(activeSymbol);
-        appendLog("error", `白名单加载失败: ${String(error)}`);
-      })
-      .finally(() => {
-        refreshSymbolInfo(activeSymbol).catch((error) => {
-          appendLog("error", `交易对规则加载失败: ${String(error)}`);
-        });
-      });
-  });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+appendLog("info", "Console ready. Pick a symbol from the whitelist or switch to a custom symbol.");
+Promise.allSettled([
+  loadAccounts(),
+  loadWhitelist(),
+  refreshSymbolInfo(activeSymbol),
+]).then((results) => {
+  const [accountsResult, whitelistResult, symbolInfoResult] = results;
+  if (accountsResult.status === "rejected") {
+    appendLog("error", `Failed to load account list: ${String(accountsResult.reason)}`);
+  }
+  if (whitelistResult.status === "rejected") {
+    temporaryCustomSymbol = activeSymbol;
+    rebuildSymbolOptions(activeSymbol);
+    appendLog("error", `Failed to load whitelist: ${String(whitelistResult.reason)}`);
+  }
+  if (symbolInfoResult.status === "rejected") {
+    appendLog("error", `Failed to load symbol rules: ${String(symbolInfoResult.reason)}`);
+  }
+});

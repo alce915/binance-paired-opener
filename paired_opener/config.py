@@ -72,7 +72,9 @@ class Settings(BaseSettings):
     binance_ws_base_url: str = ""
     binance_recv_window_ms: int = 5_000
     monitor_refresh_interval_ms: int = 5_000
+    market_account_refresh_interval_ms: int = 5_000
     monitor_history_window_days: int = 7
+    monitor_history_refresh_interval_ms: int = 60_000
     active_account_file: Path = CONFIG_DIR / "active_account.json"
     symbol_whitelist: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
     symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"

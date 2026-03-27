@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from paired_opener.binance import BinanceFuturesGateway
+from paired_opener.classified_gateway import ClassifiedExchangeGateway
 from paired_opener.config import AccountConfig, Settings
 from paired_opener.engine import PairedClosingEngine, PairedOpeningEngine
 from paired_opener.market_stream import MarketStreamController
@@ -14,7 +15,7 @@ from paired_opener.storage import SqliteRepository
 @dataclass(slots=True)
 class RuntimeBundle:
     account: AccountConfig
-    gateway: BinanceFuturesGateway
+    gateway: ClassifiedExchangeGateway
     engine: PairedOpeningEngine
     close_engine: PairedClosingEngine
     service: OpenSessionService
@@ -27,9 +28,10 @@ class AccountRuntimeManager:
         self._repository = repository
         self._lock = asyncio.Lock()
         self._runtime = self._build_runtime(settings.active_account)
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def _build_runtime(self, account: AccountConfig) -> RuntimeBundle:
-        gateway = BinanceFuturesGateway(self._settings, account)
+        gateway = ClassifiedExchangeGateway(BinanceFuturesGateway(self._settings, account))
         engine = PairedOpeningEngine(gateway, self._repository)
         close_engine = PairedClosingEngine(gateway, self._repository)
         service = OpenSessionService(
@@ -41,11 +43,24 @@ class AccountRuntimeManager:
             account_id=account.account_id,
             account_name=account.name,
         )
-        market = MarketStreamController(gateway, account.account_id, account.name)
+        market = MarketStreamController(gateway, self._settings, account.account_id, account.name)
         return RuntimeBundle(account=account, gateway=gateway, engine=engine, close_engine=close_engine, service=service, market=market)
 
     def current(self) -> RuntimeBundle:
         return self._runtime
+
+    async def _shutdown_runtime(self, runtime: RuntimeBundle) -> None:
+        try:
+            await runtime.market.disconnect()
+            await runtime.service.close()
+            await runtime.gateway.close()
+        except Exception:
+            return
+
+    def _schedule_runtime_cleanup(self, runtime: RuntimeBundle) -> None:
+        task = asyncio.create_task(self._shutdown_runtime(runtime))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
 
     def list_accounts(self) -> list[dict[str, object]]:
         active_id = self._settings.active_account_id
@@ -72,12 +87,10 @@ class AccountRuntimeManager:
                 raise ValueError("当前账户存在活动真实开单会话，禁止切换账户")
             if normalized not in self._settings.accounts:
                 raise ValueError(f"Unknown account {account_id}")
-            await current_runtime.market.disconnect()
-            await current_runtime.service.close()
-            await current_runtime.gateway.close()
             self._settings.persist_active_account(normalized)
             next_runtime = self._build_runtime(self._settings.active_account)
             self._runtime = next_runtime
+            self._schedule_runtime_cleanup(current_runtime)
             return {
                 "id": next_runtime.account.account_id,
                 "name": next_runtime.account.name,
@@ -88,4 +101,8 @@ class AccountRuntimeManager:
         await self._runtime.market.disconnect()
         await self._runtime.service.close()
         await self._runtime.gateway.close()
+        if self._cleanup_tasks:
+            await asyncio.gather(*tuple(self._cleanup_tasks), return_exceptions=True)
+
+
 

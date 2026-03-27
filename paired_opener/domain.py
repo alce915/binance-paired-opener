@@ -7,6 +7,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from paired_opener.errors import ExchangeStateError
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -148,6 +150,10 @@ class OpenSession:
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     last_error: str | None = None
+    last_error_category: str | None = None
+    last_error_strategy: str | None = None
+    last_error_code: str | None = None
+    last_error_operator_action: str | None = None
     stage2_carryover_qty: Decimal = Decimal("0")
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
@@ -189,7 +195,7 @@ class SessionAbortedError(RuntimeError):
     pass
 
 
-class ExchangeStateError(RuntimeError):
-    pass
+
+
 
 

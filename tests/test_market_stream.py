@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
@@ -193,3 +193,55 @@ async def test_subscribe_cancels_pending_disconnect() -> None:
     gateway.release.set()
     await controller.disconnect()
 
+@pytest.mark.asyncio
+async def test_refresh_account_overview_normalizes_mark_and_liquidation_prices() -> None:
+    gateway = SlowGateway()
+    controller = MarketStreamController(gateway)
+
+    async def fake_get_account_overview() -> dict:
+        return {
+            "status": "ok",
+            "totals": {"available_balance": Decimal("100")},
+            "positions": [
+                {
+                    "symbol": "BTCUSDT",
+                    "position_side": "LONG",
+                    "qty": Decimal("0.01"),
+                    "entry_price": Decimal("80000"),
+                    "mark_price": Decimal("80500"),
+                    "unrealized_pnl": Decimal("5"),
+                    "notional": Decimal("805"),
+                    "leverage": 10,
+                    "liquidation_price": Decimal("70000"),
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "position_side": "SHORT",
+                    "qty": Decimal("0.5"),
+                    "entry_price": Decimal("2000"),
+                    "mark_price": Decimal("0"),
+                    "unrealized_pnl": Decimal("2.5"),
+                    "notional": Decimal("997.5"),
+                    "leverage": 5,
+                    "liquidation_price": Decimal("0"),
+                },
+            ],
+            "updated_at": datetime.now(UTC),
+        }
+
+    gateway.get_account_overview = fake_get_account_overview  # type: ignore[method-assign]
+    queue = await controller.subscribe()
+    await queue.get()
+    await queue.get()
+    await queue.get()
+
+    await controller._refresh_account_overview()
+    message = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert message["event"] == "account_overview"
+    assert message["data"]["positions"][0]["mark_price"] == "80500"
+    assert message["data"]["positions"][0]["liquidation_price"] == "70000"
+    assert message["data"]["positions"][1]["mark_price"] == "0"
+    assert message["data"]["positions"][1]["liquidation_price"] == "0"
+
+    controller.unsubscribe(queue)

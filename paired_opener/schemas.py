@@ -130,6 +130,10 @@ class SessionSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_error: str | None = None
+    last_error_category: str | None = None
+    last_error_strategy: str | None = None
+    last_error_code: str | None = None
+    last_error_operator_action: str | None = None
 
 
 class SessionDetail(BaseModel):
@@ -156,12 +160,23 @@ class SessionDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_error: str | None = None
+    last_error_category: str | None = None
+    last_error_strategy: str | None = None
+    last_error_code: str | None = None
+    last_error_operator_action: str | None = None
     stage2_carryover_qty: Decimal = Decimal("0")
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
     completed_with_final_alignment: bool = False
     rounds: list[dict[str, Any]]
     events: list[dict[str, Any]]
+
+
+class SessionUpdatesResponse(BaseModel):
+    session: SessionSummary
+    changed_rounds: list[dict[str, Any]] = Field(default_factory=list)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    latest_event_id: int = 0
 
 
 class SessionActionResponse(BaseModel):
@@ -207,3 +222,4 @@ class AccountSelectRequest(BaseModel):
 
 class AccountSelectResponse(BaseModel):
     account: AccountSummary
+

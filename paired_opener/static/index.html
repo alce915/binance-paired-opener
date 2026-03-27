@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -150,7 +150,7 @@
       .position-side { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
       .position-side.long { color: #11664b; background: var(--success-soft); }
       .position-side.short { color: #8d302d; background: var(--danger-soft); }
-      .position-meta { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; font-size: 13px; color: var(--muted); }
+      .position-meta { display: grid; gap: 8px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); font-size: 13px; color: var(--muted); }
       .position-meta strong { display: block; color: var(--ink); font-size: 15px; margin-top: 2px; }
       .position-meta strong.positive { color: var(--success); }
       .position-meta strong.negative { color: var(--danger); }
@@ -406,6 +406,10 @@
         .dashboard { grid-template-columns: 1fr; }
         .orderbook-grid, .param-grid, .calc-grid, .metric-grid, .button-row, .inline-grid { grid-template-columns: 1fr; }
         button.inline-btn { width: 100%; }
+      }
+      @media (max-width: 640px) {
+        .position-row-head { flex-direction: column; align-items: flex-start; }
+        .position-meta { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -763,7 +767,7 @@
       </section>
     </main>
 
-        <script src="/static/app.js"></script>
+        <script src="/static/app.js?v=20260327-position-prices"></script>
   </body>
 </html>
 
