@@ -19,6 +19,10 @@ dist/
 build/
 .idea/
 .vscode/
+git-sync.local.env
+projects.json
+git-remote.json
+repo-name-overrides.json
 # <<< codex git-sync <<<
 
 
@@ -30,3 +34,4 @@ build/
 
 
 config/binance_api.local.env
+
