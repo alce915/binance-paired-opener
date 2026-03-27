@@ -222,7 +222,18 @@ class OpenSessionService:
                 )
             )
         except Exception as exc:
-            checks.append(self._precheck_item("hedge_mode", "双向持仓", "fail", f"双向持仓状态读取失败: {exc}"))
+            message = str(exc)
+            if overview is not None and ("401 Unauthorized" in message or "fapi/v1/positionSide/dual" in message):
+                checks.append(
+                    self._precheck_item(
+                        "hedge_mode",
+                        "双向持仓",
+                        "warn",
+                        "当前账户无法读取 FAPI 双向持仓状态，预检阶段已忽略；创建真实会话时将继续按执行链路确认。",
+                    )
+                )
+            else:
+                checks.append(self._precheck_item("hedge_mode", "双向持仓", "fail", f"双向持仓状态读取失败: {exc}"))
         try:
             rules = await self._gateway.get_symbol_rules(symbol)
             current_leverage = max(int(await self._gateway.get_symbol_leverage(symbol) or 1), 1)
@@ -1043,6 +1054,7 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
+
 
 
 

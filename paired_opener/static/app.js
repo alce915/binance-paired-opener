@@ -62,10 +62,14 @@ function request(path, options = {}) {
     if (!response.ok) {
       let message = text;
       let precheck = null;
+      let validationDetail = null;
       try {
         const payload = JSON.parse(text);
         if (payload && typeof payload === "object") {
-          if (payload.detail && typeof payload.detail === "object") {
+          if (Array.isArray(payload.detail)) {
+            validationDetail = payload.detail;
+            message = payload.message || text;
+          } else if (payload.detail && typeof payload.detail === "object") {
             message = payload.detail.message || payload.message || text;
             precheck = payload.detail.precheck || null;
           } else {
@@ -76,6 +80,7 @@ function request(path, options = {}) {
       } catch {}
       const error = new Error(message);
       if (precheck) error.precheck = precheck;
+      if (validationDetail) error.validationDetail = validationDetail;
       throw error;
     }
     try {
@@ -179,6 +184,14 @@ function precheckTone(precheck) {
   return "success";
 }
 
+function optionalPositiveValue(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const numeric = Number(raw);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return raw;
+}
+
 function summarizePrecheckMessage(precheck, fallbackMessage) {
   if (!precheck) return fallbackMessage;
   const summary = String(precheck.summary || fallbackMessage || "").trim();
@@ -197,7 +210,7 @@ function buildPrecheckPayload(mode = executionMode) {
         session_kind: "paired_close",
         symbol: closeExecutionSymbol.value,
         trend_bias: document.getElementById("closeTrend").value,
-        close_qty: document.getElementById("closeQty").value,
+        close_qty: optionalPositiveValue(document.getElementById("closeQty").value),
         round_count: Number(document.getElementById("closeRounds").value),
       };
     case "single_open": {
@@ -207,7 +220,7 @@ function buildPrecheckPayload(mode = executionMode) {
         symbol: document.getElementById("singleOpenExecutionSymbol").value,
         open_mode: openMode,
         selected_position_side: openMode === "align" ? null : (document.getElementById("singleOpenOrder").value || null),
-        open_qty: document.getElementById("singleOpenQty").value,
+        open_qty: optionalPositiveValue(document.getElementById("singleOpenQty").value),
         leverage: Number(document.getElementById("singleOpenLeverage").value),
         round_count: Number(document.getElementById("singleOpenRounds").value),
       };
@@ -219,7 +232,7 @@ function buildPrecheckPayload(mode = executionMode) {
         symbol: document.getElementById("singleCloseExecutionSymbol").value,
         close_mode: closeMode,
         selected_position_side: closeMode === "align" ? null : (document.getElementById("singleCloseOrder").value || null),
-        close_qty: document.getElementById("singleCloseQty").value,
+        close_qty: optionalPositiveValue(document.getElementById("singleCloseQty").value),
         round_count: Number(document.getElementById("singleCloseRounds").value),
       };
     }
@@ -230,8 +243,28 @@ function buildPrecheckPayload(mode = executionMode) {
         trend_bias: document.getElementById("trend").value,
         leverage: Number(document.getElementById("leverage").value),
         round_count: Number(document.getElementById("calcRounds").value),
-        round_qty: document.getElementById("roundQty").value,
+        round_qty: optionalPositiveValue(document.getElementById("roundQty").value),
       };
+  }
+}
+
+function canRunPrecheck(mode, payload) {
+  if (!payload || !payload.symbol) return false;
+  switch (mode) {
+    case "paired_close":
+      return Boolean(payload.trend_bias && payload.close_qty && Number(payload.round_count) > 0);
+    case "single_open":
+      if (!payload.open_mode || !payload.open_qty || Number(payload.round_count) <= 0 || Number(payload.leverage) <= 0) {
+        return false;
+      }
+      return payload.open_mode === "align" ? true : Boolean(payload.selected_position_side);
+    case "single_close":
+      if (!payload.close_mode || !payload.close_qty || Number(payload.round_count) <= 0) {
+        return false;
+      }
+      return payload.close_mode === "align" ? true : Boolean(payload.selected_position_side);
+    default:
+      return Boolean(payload.trend_bias && payload.round_qty && Number(payload.round_count) > 0 && Number(payload.leverage) > 0);
   }
 }
 
@@ -250,8 +283,29 @@ function applyPrecheckResult(mode, precheck) {
     document.getElementById("statCarryoverQty").textContent = formatNumber(derived.carryover_qty || 0, 6);
     document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(derived.final_alignment_status);
   }
+  const checks = Array.isArray(precheck.checks) ? precheck.checks : [];
+  const hasFailures = checks.some((item) => String(item.status) === "fail");
+  const hasWarnings = checks.some((item) => String(item.status) === "warn");
+  if (!hasFailures && hasWarnings) {
+    switch (mode) {
+      case "paired_close":
+        createCloseBtn.disabled = !Boolean(precheck.ok);
+        break;
+      case "single_open":
+        createSingleOpenBtn.disabled = !Boolean(precheck.ok);
+        break;
+      case "single_close":
+        createSingleCloseBtn.disabled = !Boolean(precheck.ok);
+        break;
+      default:
+        createBtn.disabled = !Boolean(precheck.ok);
+        simulateBtn.disabled = false;
+        break;
+    }
+    return;
+  }
   const tone = precheckTone(precheck);
-  const message = summarizePrecheckMessage(precheck, "预检完成");
+  const message = summarizePrecheckMessage(precheck, "????");
   switch (mode) {
     case "paired_close":
       updateCloseValidationHint({ canCreate: Boolean(precheck.ok), tone, message });
@@ -270,17 +324,24 @@ function applyPrecheckResult(mode, precheck) {
 
 async function runPrecheck(mode = executionMode) {
   const token = ++latestPrecheckToken;
+  const payload = buildPrecheckPayload(mode);
+  if (!canRunPrecheck(mode, payload)) {
+    return;
+  }
   try {
     const precheck = await request("/sessions/precheck", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildPrecheckPayload(mode))
+      body: JSON.stringify(payload)
     });
     if (token !== latestPrecheckToken) return;
     applyPrecheckResult(mode, precheck);
   } catch (error) {
     if (token !== latestPrecheckToken) return;
     const precheck = error.precheck || null;
+    if (error.validationDetail) {
+      return;
+    }
     if (precheck) {
       applyPrecheckResult(mode, precheck);
       return;
