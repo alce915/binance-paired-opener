@@ -358,14 +358,15 @@ class OpenSessionService:
             checks.append(self._precheck_item("request", "参数完整性", "fail", "缺少双向开仓必要参数"))
             return self._finalize_precheck(checks, derived, default_summary="双向开仓预检完成")
         if rules and quote:
-            normalized_round_qty = normalize_qty(request.round_qty, rules)
+            requested_round_qty = Decimal(request.round_qty)
+            normalized_round_qty = normalize_qty(requested_round_qty, rules)
             stage1_price = normalize_price(self._open_stage1_price(request.trend_bias, quote), rules)
-            per_round_notional = normalized_round_qty * stage1_price
-            total_notional = per_round_notional * Decimal(request.round_count)
+            requested_per_round_notional = requested_round_qty * stage1_price
+            total_notional = requested_per_round_notional * Decimal(request.round_count)
             implied_margin_amount = total_notional / Decimal(requested_leverage)
             derived.update({
                 "normalized_round_qty": self._stringify_decimal(normalized_round_qty),
-                "per_round_notional": self._stringify_decimal(per_round_notional),
+                "per_round_notional": self._stringify_decimal(requested_per_round_notional),
                 "total_notional": self._stringify_decimal(total_notional),
                 "implied_margin_amount": self._stringify_decimal(implied_margin_amount),
                 "requested_leverage": requested_leverage,
@@ -378,10 +379,10 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, stage1_price, rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮下单金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", f"每轮开单金额 {self._format_money(per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, "min_notional", Decimal("0")))}，无法开单。"))
+                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", f"每轮开单金额 {self._format_money(requested_per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, "min_notional", Decimal("0")))}，无法开单。"))
             max_open_amount = Decimal(str(derived["max_open_amount_95"]))
             if implied_margin_amount > max_open_amount:
-                checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "fail", f"开单金额 {self._stringify_decimal(implied_margin_amount)} 超过可用余额 95% 上限 {self._stringify_decimal(max_open_amount)}"))
+                checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "fail", "开仓总金额超过可用余额的95%，无法开单。"))
             else:
                 checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "pass", "开单金额未超过可用余额 95% 限制"))
         if overview:
@@ -458,14 +459,15 @@ class OpenSessionService:
             else:
                 checks.append(self._precheck_item("leverage", "杠杆限制", "pass", f"杠杆 {effective_leverage}x 合法"))
             side_price = normalize_price(self._single_open_params(selected_position_side or PositionSide.LONG, quote)[1], rules)
-            normalized_round_qty = normalize_qty(open_qty / Decimal(request.round_count), rules)
-            per_round_notional = normalized_round_qty * side_price
+            requested_round_qty = open_qty / Decimal(request.round_count)
+            normalized_round_qty = normalize_qty(requested_round_qty, rules)
+            requested_per_round_notional = requested_round_qty * side_price
             total_notional = open_qty * side_price
             implied_margin_amount = total_notional / Decimal(max(effective_leverage, 1))
             derived.update({
                 "selected_position_side": selected_position_side.value if selected_position_side else None,
                 "normalized_round_qty": self._stringify_decimal(normalized_round_qty),
-                "per_round_notional": self._stringify_decimal(per_round_notional),
+                "per_round_notional": self._stringify_decimal(requested_per_round_notional),
                 "total_notional": self._stringify_decimal(total_notional),
                 "implied_margin_amount": self._stringify_decimal(implied_margin_amount),
                 "current_leverage": effective_leverage,
@@ -474,10 +476,10 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, side_price, rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮开仓金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", f"每轮开单金额 {self._format_money(per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, "min_notional", Decimal("0")))}，无法开单。"))
+                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", f"每轮开单金额 {self._format_money(requested_per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, "min_notional", Decimal("0")))}，无法开单。"))
             max_open_amount = Decimal(str(derived["max_open_amount_95"]))
             if implied_margin_amount > max_open_amount:
-                checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "fail", f"开单金额 {self._stringify_decimal(implied_margin_amount)} 超过可用余额 95% 上限 {self._stringify_decimal(max_open_amount)}"))
+                checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "fail", "开仓总金额超过可用余额的95%，无法开单。"))
             else:
                 checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "pass", "开单金额未超过可用余额 95% 限制"))
         return self._finalize_precheck(checks, derived, default_summary="单向开仓预检通过")
@@ -1155,6 +1157,7 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
+
 
 
 

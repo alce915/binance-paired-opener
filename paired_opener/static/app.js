@@ -48,15 +48,19 @@ let symbolInfoReady = false;
 let precheckTimer = null;
 let precheckAbortController = null;
 let latestPrecheckToken = 0;
-const latestPrecheckByMode = new Map();
+const latestPrecheckResultByMode = new Map();
+const latestResolvedPrecheckPayloadByMode = new Map();
 const inFlightPrecheckPayloadByMode = new Map();
 let precheckPaused = false;
+let lastAutoPrecheckAt = 0;
 let activeSessionId = null;
 let activeSessionPoller = null;
 let activeSessionState = null;
 let latestSessionEventId = 0;
 const seenSessionEventIds = new Set();
 const MAX_LOG_LINES = 200;
+const LOG_LEVEL_LABELS = { info: '提示', success: '成功', warn: '警告', error: '错误' };
+const CONNECTION_STATUS_LABELS = { connected: '已连接', connecting: '连接中', disconnected: '已断开', error: '异常', idle: '空闲' };
 const orderBookRowCache = { sell: [], buy: [] };
 const positionRowCache = new Map();
 let pendingOrderbookPayload = null;
@@ -83,7 +87,11 @@ function queueUiRender() {
       latestReferencePrice = bestAsk > 0 && bestBid > 0 ? (bestAsk + bestBid) / 2 : (bestAsk || bestBid || 0);
       recalculateOpenAmount();
       recalculateCloseAmount();
+      recalculateSingleOpenAmount();
       recalculateSingleCloseAmount();
+      if (symbolInfoReady && !precheckPaused && !precheckTimer && !precheckAbortController) {
+        schedulePrecheck(executionMode, 0);
+      }
       document.getElementById("streamClock").textContent = nowTime();
     }
     if (pendingAccountOverviewPayload) {
@@ -331,7 +339,7 @@ function canRunPrecheck(mode, payload) {
 
 function applyPrecheckResult(mode, precheck) {
   if (!precheck) return;
-  latestPrecheckByMode.set(mode, precheck);
+  latestPrecheckResultByMode.set(mode, precheck);
   const derived = precheck.derived || {};
   if (mode === "paired_open") {
     syncPairedOpenDerivedPanel(derived);
@@ -349,53 +357,38 @@ function applyPrecheckResult(mode, precheck) {
     document.getElementById("statCarryoverQty").textContent = formatNumber(derived.carryover_qty || 0, 6);
     document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(derived.final_alignment_status);
   }
-  const checks = Array.isArray(precheck.checks) ? precheck.checks : [];
-  const hasFailures = checks.some((item) => String(item.status) === "fail");
-  const hasWarnings = checks.some((item) => String(item.status) === "warn");
-  if (!hasFailures && hasWarnings) {
-    switch (mode) {
-      case "paired_close":
-        createCloseBtn.disabled = !Boolean(precheck.ok);
-        break;
-      case "single_open":
-        createSingleOpenBtn.disabled = !Boolean(precheck.ok);
-        break;
-      case "single_close":
-        createSingleCloseBtn.disabled = !Boolean(precheck.ok);
-        break;
-      default:
-        createBtn.disabled = !Boolean(precheck.ok);
-        simulateBtn.disabled = false;
-        break;
-    }
+  const failure = firstFailingPrecheckItem(precheck);
+  if (failure) {
+    setHintStateForMode(mode, {
+      canCreate: false,
+      canSimulate: false,
+      tone: "error",
+      message: failure.message || summarizePrecheckMessage(precheck, "参数校验未通过。"),
+    });
     return;
   }
-  const tone = precheckTone(precheck);
-  const message = summarizePrecheckMessage(precheck, "参数校验未通过。");
-  switch (mode) {
-    case "paired_close":
-      updateCloseValidationHint({ canCreate: Boolean(precheck.ok), tone, message });
-      break;
-    case "single_open":
-      updateSingleOpenValidationHint({ canCreate: Boolean(precheck.ok), tone, message });
-      break;
-    case "single_close":
-      updateSingleCloseValidationHint({ canCreate: Boolean(precheck.ok), tone, message });
-      break;
-    default:
-      updateOpenValidationHint({ canCreate: Boolean(precheck.ok), canSimulate: !simulateBtn.disabled, tone, message });
-      break;
-  }
+  setHintStateForMode(mode, {
+    canCreate: Boolean(precheck.ok),
+    canSimulate: Boolean(precheck.ok),
+    tone: Boolean(precheck.ok) ? "success" : "",
+    message: buildModeSuccessHint(mode, precheck),
+  });
 }
-
 async function runPrecheck(mode = executionMode) {
   if (precheckPaused) return;
   const payload = buildPrecheckPayload(mode);
   if (!canRunPrecheck(mode, payload)) {
     return;
   }
-  const payloadKey = JSON.stringify(payload);
-  if (latestPrecheckByMode.get(mode) === payloadKey || inFlightPrecheckPayloadByMode.get(mode) === payloadKey) {
+  const payloadKey = JSON.stringify({ mode, accountId: currentAccount.id, payload });
+  if (latestResolvedPrecheckPayloadByMode.get(mode) === payloadKey) {
+    const cachedPrecheck = latestPrecheckResultByMode.get(mode);
+    if (cachedPrecheck) {
+      applyPrecheckResult(mode, cachedPrecheck);
+      return;
+    }
+  }
+  if (inFlightPrecheckPayloadByMode.get(mode) === payloadKey) {
     return;
   }
   if (precheckAbortController) {
@@ -405,6 +398,12 @@ async function runPrecheck(mode = executionMode) {
   precheckAbortController = controller;
   inFlightPrecheckPayloadByMode.set(mode, payloadKey);
   const token = ++latestPrecheckToken;
+  setHintStateForMode(mode, {
+    canCreate: false,
+    canSimulate: false,
+    tone: "",
+    message: mode === "paired_close" || mode === "single_close" ? "正在校验平仓参数..." : "正在校验开仓参数...",
+  });
   try {
     const precheck = await request("/sessions/precheck", {
       method: "POST",
@@ -413,37 +412,30 @@ async function runPrecheck(mode = executionMode) {
       signal: controller.signal,
     });
     if (controller.signal.aborted || token !== latestPrecheckToken) return;
-    latestPrecheckByMode.set(mode, payloadKey);
+    latestResolvedPrecheckPayloadByMode.set(mode, payloadKey);
     applyPrecheckResult(mode, precheck);
   } catch (error) {
     if (controller.signal.aborted || error?.name === "AbortError") {
       return;
     }
     if (token !== latestPrecheckToken) return;
-    latestPrecheckByMode.delete(mode);
+    latestPrecheckResultByMode.delete(mode);
     const precheck = error.precheck || null;
     if (error.validationDetail) {
       return;
     }
     if (precheck) {
+      latestResolvedPrecheckPayloadByMode.set(mode, payloadKey);
       applyPrecheckResult(mode, precheck);
       return;
     }
     const message = `Precheck 失败： ${String(error)}`;
-    switch (mode) {
-      case "paired_close":
-        updateCloseValidationHint({ canCreate: false, tone: "error", message });
-        break;
-      case "single_open":
-        updateSingleOpenValidationHint({ canCreate: false, tone: "error", message });
-        break;
-      case "single_close":
-        updateSingleCloseValidationHint({ canCreate: false, tone: "error", message });
-        break;
-      default:
-        updateOpenValidationHint({ canCreate: false, canSimulate: !simulateBtn.disabled, tone: "error", message });
-        break;
-    }
+    setHintStateForMode(mode, {
+      canCreate: false,
+      canSimulate: false,
+      tone: "error",
+      message,
+    });
   } finally {
     if (inFlightPrecheckPayloadByMode.get(mode) === payloadKey) {
       inFlightPrecheckPayloadByMode.delete(mode);
@@ -453,7 +445,6 @@ async function runPrecheck(mode = executionMode) {
     }
   }
 }
-
 function schedulePrecheck(mode = executionMode, delay = 400) {
   if (precheckPaused) return;
   if (precheckTimer) {
@@ -728,7 +719,7 @@ function setConnectionState(state) {
     footerDot.classList.remove("live");
   }
   footerStatus.textContent = `${connected ? "已连接" : status === "connecting" ? "连接中" : status === "error" ? "异常" : "已断开"} ${state.symbol || activeSymbol}`;
-  statConnection.textContent = status;
+  statConnection.textContent = CONNECTION_STATUS_LABELS[status] || status;
   connectionToggle.checked = connected;
 }
 function refreshDerivedStats({ totalNotional = 0, perRoundNotional = 0, estimatedQty = 0, minNotional = Number(currentSymbolInfo.min_notional || 0) } = {}) {
@@ -959,6 +950,83 @@ function updateSingleCloseValidationHint({ canCreate, message, tone }) {
   createSingleCloseBtn.disabled = !canCreate;
 }
 
+function setHintStateForMode(mode, { canCreate = false, canSimulate = false, message = "", tone = "" } = {}) {
+  switch (mode) {
+    case "paired_close":
+      updateCloseValidationHint({ canCreate, tone, message });
+      break;
+    case "single_open":
+      updateSingleOpenValidationHint({ canCreate, tone, message });
+      break;
+    case "single_close":
+      updateSingleCloseValidationHint({ canCreate, tone, message });
+      break;
+    default:
+      updateOpenValidationHint({ canCreate, canSimulate, tone, message });
+      break;
+  }
+}
+
+function clearHintStateForMode(mode) {
+  setHintStateForMode(mode, {
+    canCreate: false,
+    canSimulate: false,
+    tone: "",
+    message: "",
+  });
+}
+
+function firstFailingPrecheckItem(precheck) {
+  const checks = Array.isArray(precheck?.checks) ? precheck.checks : [];
+  return checks.find((item) => String(item.status) === "fail") || null;
+}
+
+function buildModeSuccessHint(mode, precheck) {
+  const derived = precheck?.derived || {};
+  switch (mode) {
+    case "paired_close": {
+      const maxCloseableQty = Math.min(Number(derived.long_qty || 0), Number(derived.short_qty || 0));
+      const perRoundNotional = Number(derived.per_round_notional || 0);
+      return `当前可双向平仓数量 ${formatNumber(maxCloseableQty, 6)}，每轮名义平仓金额 ${formatMoney(perRoundNotional)}，可以平仓。`;
+    }
+    case "single_open": {
+      const openMode = document.getElementById("singleOpenMode")?.value || "regular";
+      const selectedSide = String(derived.selected_position_side || document.getElementById("singleOpenOrder")?.value || "LONG");
+      const openQty = Number(document.getElementById("singleOpenQty")?.value || 0);
+      const leverage = Math.max(Number(derived.current_leverage || document.getElementById("singleOpenLeverage")?.value || 1), 1);
+      const hasExistingPosition = Number(derived.long_qty || 0) > 0 || Number(derived.short_qty || 0) > 0;
+      const perRoundNotional = Number(derived.per_round_notional || 0);
+      if (openMode === "align") {
+        return hasExistingPosition
+          ? `将按订单对齐模式补齐 ${selectedSide}，数量 ${formatNumber(openQty, 6)}，当前交易对已有持仓，杠杆已锁定为 ${leverage}x。`
+          : `将按订单对齐模式补齐 ${selectedSide}，数量 ${formatNumber(openQty, 6)}，当前杠杆 ${leverage}x。`;
+      }
+      return hasExistingPosition
+        ? `将按常规模式开 ${selectedSide}，当前交易对已有持仓，杠杆已锁定为 ${leverage}x，每轮开仓金额约 ${formatMoney(perRoundNotional)}。`
+        : `将按常规模式开 ${selectedSide}，当前杠杆 ${leverage}x，每轮开仓金额约 ${formatMoney(perRoundNotional)}。`;
+    }
+    case "single_close": {
+      const closeMode = document.getElementById("singleCloseMode")?.value || "regular";
+      const selectedSide = String(derived.selected_position_side || document.getElementById("singleCloseOrder")?.value || "");
+      const closeQty = Number(document.getElementById("singleCloseQty")?.value || 0);
+      const availableQty = selectedSide === "LONG"
+        ? Number(derived.long_qty || 0)
+        : selectedSide === "SHORT"
+          ? Number(derived.short_qty || 0)
+          : 0;
+      const perRoundNotional = Number(derived.per_round_notional || 0);
+      if (closeMode === "align") {
+        return `订单对齐模式已锁定 ${selectedSide}，差值平仓数量 ${formatNumber(closeQty, 6)}。`;
+      }
+      return `当前可用持仓数量 ${formatNumber(availableQty, 6)}，每轮名义平仓金额 ${formatMoney(perRoundNotional)}。`;
+    }
+    default: {
+      const minNotional = Number(derived.min_notional ?? currentSymbolInfo.min_notional ?? 0);
+      const perRoundNotional = Number(derived.per_round_notional || 0);
+      return `最小下单金额 ${formatMoney(minNotional)}，当前每轮开单金额 ${formatMoney(perRoundNotional)}，可以开单。`;
+    }
+  }
+}
 function currentSymbolPositions() {
   return currentPositions.filter((position) => position.symbol === activeSymbol && Number(position.qty || 0) > 0);
 }
@@ -1065,11 +1133,9 @@ function recalculateSingleOpenAmount() {
   const perRoundQty = openQty / rounds;
   const totalNotional = openQty * latestReferencePrice;
   const perRoundNotional = perRoundQty * latestReferencePrice;
-  const minNotional = Number(currentSymbolInfo.min_notional || 0);
   const impliedOpenAmount = leverage > 0 ? totalNotional / leverage : totalNotional;
   const marginPerRound = rounds > 0 ? impliedOpenAmount / rounds : 0;
-  const maxOpenAmount = latestAvailableBalance === null ? null : latestAvailableBalance * 0.95;
-  const deferHintToPrecheck = canRunPrecheck("single_open", buildPrecheckPayload("single_open"));
+  const deferHintToPrecheck = symbolInfoReady && canRunPrecheck("single_open", buildPrecheckPayload("single_open"));
 
   document.getElementById("singleOpenRoundQty").value = perRoundQty > 0 ? perRoundQty.toFixed(6) : "0";
   document.getElementById("singleOpenMarginPerRound").textContent = formatMoney(marginPerRound);
@@ -1079,58 +1145,11 @@ function recalculateSingleOpenAmount() {
     refreshDerivedStats({ totalNotional, perRoundNotional, estimatedQty: perRoundQty });
   }
 
-  if (!symbolInfoReady) {
-    updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "等待交易对规则加载完成后再计算单向开仓参数。" });
+  if (!deferHintToPrecheck) {
+    latestPrecheckResultByMode.delete("single_open");
+    latestResolvedPrecheckPayloadByMode.delete("single_open");
+    clearHintStateForMode("single_open");
     return;
-  }
-  if (currentSymbolInfo.allowed === false) {
-    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `${activeSymbol} 不在白名单中，无法创建真实单向开仓会话。` });
-    return;
-  }
-  if (Number(currentSymbolInfo.max_leverage || 0) > 0 && leverage > Number(currentSymbolInfo.max_leverage)) {
-    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `杠杆 ${leverage}x 超过该交易对最大杠杆 ${currentSymbolInfo.max_leverage}x。` });
-    return;
-  }
-  if (!selectedSide) {
-    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: "请选择开仓方向。" });
-    return;
-  }
-  if (openQty <= 0) {
-    updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "请输入有效的单向开仓数量。" });
-    return;
-  }
-  if (perRoundQty <= 0) {
-    updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: "每轮数量归一化后为 0，无法单向开仓。" });
-    return;
-  }
-  if (perRoundNotional < minNotional) {
-    if (deferHintToPrecheck) {
-      updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "正在校验单向开仓参数..." });
-    } else {
-      updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `每轮开单金额 ${formatMoney(perRoundNotional)} 低于交易所最小下单金额 ${formatMoney(minNotional)}，无法开单。` });
-    }
-    return;
-  }
-  if (maxOpenAmount !== null && impliedOpenAmount > maxOpenAmount) {
-    if (deferHintToPrecheck) {
-      updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "正在校验单向开仓参数..." });
-    } else {
-      updateSingleOpenValidationHint({ canCreate: false, tone: "error", message: `开单金额 ${formatMoney(impliedOpenAmount)} 超过当前可用余额 ${formatMoney(latestAvailableBalance)} 的 95% 上限 ${formatMoney(maxOpenAmount)}。` });
-    }
-    return;
-  }
-  if (mode === "align") {
-    if (deferHintToPrecheck) {
-      updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "正在校验单向开仓参数..." });
-    } else {
-      updateSingleOpenValidationHint({ canCreate: true, tone: "success", message: hasExistingPosition ? `将按订单对齐模式补齐 ${selectedSide}，数量 ${formatNumber(openQty, 6)}，当前交易对已有持仓，杠杆已锁定为 ${leverage}x。` : `将按订单对齐模式补齐 ${selectedSide}，数量 ${formatNumber(openQty, 6)}，当前杠杆 ${leverage}x。` });
-    }
-    return;
-  }
-  if (deferHintToPrecheck) {
-    updateSingleOpenValidationHint({ canCreate: false, tone: "", message: "正在校验单向开仓参数..." });
-  } else {
-    updateSingleOpenValidationHint({ canCreate: true, tone: "success", message: hasExistingPosition ? `将按常规模式开 ${selectedSide}，当前交易对已有持仓，杠杆已锁定为 ${leverage}x，每轮开仓金额约 ${formatMoney(perRoundNotional)}。` : `将按常规模式开 ${selectedSide}，当前杠杆 ${leverage}x，每轮开仓金额约 ${formatMoney(perRoundNotional)}。` });
   }
 }
 function refreshSingleClosePositionOptions() {  const orderSelect = document.getElementById("singleCloseOrder");
@@ -1182,8 +1201,8 @@ function recalculateSingleCloseAmount() {
       if (qtyInput) qtyInput.value = "0";
       document.getElementById("singleCloseRoundQty").value = "0";
       document.getElementById("singleCloseAvailableQty").textContent = formatNumber(0, 6);
-      document.getElementById("singleCloseTotalNotional").textContent = formatNumber(0, 4);
-      document.getElementById("singleCloseNotionalPerRound").textContent = formatNumber(0, 4);
+      document.getElementById("singleCloseTotalNotional").textContent = formatMoney(0);
+      document.getElementById("singleCloseNotionalPerRound").textContent = formatMoney(0);
       if (executionMode === "single_close") {
         refreshDerivedStats({ totalNotional: 0, perRoundNotional: 0, estimatedQty: 0 });
       }
@@ -1213,50 +1232,22 @@ function recalculateSingleCloseAmount() {
   const perRoundQty = closeQty / rounds;
   const totalNotional = closeQty * latestReferencePrice;
   const perRoundNotional = perRoundQty * latestReferencePrice;
-  const minNotional = Number(currentSymbolInfo.min_notional || 0);
   document.getElementById("singleCloseRoundQty").value = perRoundQty > 0 ? perRoundQty.toFixed(6) : "0";
   document.getElementById("singleCloseAvailableQty").textContent = formatNumber(availableQty, 6);
-  document.getElementById("singleCloseTotalNotional").textContent = formatNumber(totalNotional, 4);
-  document.getElementById("singleCloseNotionalPerRound").textContent = formatNumber(perRoundNotional, 4);
+  document.getElementById("singleCloseTotalNotional").textContent = formatMoney(totalNotional);
+  document.getElementById("singleCloseNotionalPerRound").textContent = formatMoney(perRoundNotional);
   if (executionMode === "single_close") {
     refreshDerivedStats({ totalNotional, perRoundNotional, estimatedQty: perRoundQty });
   }
 
-  if (!symbolInfoReady) {
-    updateSingleCloseValidationHint({ canCreate: false, tone: "", message: "正在加载交易对规则，暂时无法确认单向平仓参数。" });
+  const deferHintToPrecheck = symbolInfoReady && canRunPrecheck("single_close", buildPrecheckPayload("single_close"));
+  if (!deferHintToPrecheck) {
+    latestPrecheckResultByMode.delete("single_close");
+    latestResolvedPrecheckPayloadByMode.delete("single_close");
+    clearHintStateForMode("single_close");
     return;
   }
-  if (!positions.length) {
-    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "当前交易对没有持仓单，无法创建单向平仓会话。" });
-    return;
-  }
-  if (!selectedSide) {
-    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "请选择要平仓的持仓单。" });
-    return;
-  }
-  if (closeQty <= 0) {
-    updateSingleCloseValidationHint({ canCreate: false, tone: "", message: "请输入平仓数量，或切换到订单对齐模式。" });
-    return;
-  }
-  if (closeQty > availableQty) {
-    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: `平仓数量 ${formatNumber(closeQty, 6)} 超过所选持仓数量 ${formatNumber(availableQty, 6)}。` });
-    return;
-  }
-  if (perRoundQty <= 0) {
-    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "每轮数量归一化后为 0，无法单向平仓。" });
-    return;
-  }
-  if (perRoundNotional < minNotional) {
-    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: `每轮平仓名义金额 ${formatNumber(perRoundNotional, 4)} 低于交易所最小下单金额 ${formatNumber(minNotional, 4)}。` });
-    return;
-  }
-  if (mode === "align") {
-    updateSingleCloseValidationHint({ canCreate: true, tone: "success", message: `订单对齐模式已锁定 ${selectedSide}，差值平仓数量 ${formatNumber(closeQty, 6)}。` });
-    return;
-  }
-  updateSingleCloseValidationHint({ canCreate: true, tone: "success", message: `当前可用持仓数量 ${formatNumber(availableQty, 6)}，每轮名义平仓金额 ${formatNumber(perRoundNotional, 4)}。` });
 }
-
 function recalculateOpenAmount() {
   const margin = Number(document.getElementById("calcMargin").value) || 0;
   const leverage = Number(document.getElementById("leverage").value) || 0;
@@ -1265,9 +1256,7 @@ function recalculateOpenAmount() {
   const totalNotional = margin * leverage;
   const notionalPerRound = totalNotional / rounds;
   const roundQty = latestReferencePrice > 0 ? notionalPerRound / latestReferencePrice : 0;
-  const minNotional = Number(currentSymbolInfo.min_notional || 0);
-  const balanceLimit = latestAvailableBalance === null ? null : { available: latestAvailableBalance, maxOpenAmount: latestAvailableBalance * 0.95 };
-  const deferHintToPrecheck = canRunPrecheck("paired_open", buildPrecheckPayload("paired_open"));
+  const deferHintToPrecheck = symbolInfoReady && canRunPrecheck("paired_open", buildPrecheckPayload("paired_open"));
 
   document.getElementById("marginPerRound").textContent = formatMoney(marginPerRound);
   document.getElementById("totalNotional").textContent = formatMoney(totalNotional);
@@ -1280,43 +1269,11 @@ function recalculateOpenAmount() {
   document.getElementById("statPerRound").textContent = formatMoney(notionalPerRound);
   document.getElementById("statLastQty").textContent = formatNumber(roundQty, 8);
 
-  if (balanceLimit && margin > balanceLimit.maxOpenAmount) {
-    if (deferHintToPrecheck) {
-      updateOpenValidationHint({ canCreate: false, canSimulate: false, tone: "", message: "正在校验开仓参数..." });
-    } else {
-      updateOpenValidationHint({
-        canCreate: false,
-        canSimulate: false,
-        tone: "error",
-        message: `开单金额 ${formatMoney(margin)} 超过当前可用余额 ${formatNumber(balanceLimit.available, 4)} 的 95% 上限 ${formatNumber(balanceLimit.maxOpenAmount, 4)}，无法开单或模拟执行。`,
-      });
-    }
+  if (!deferHintToPrecheck) {
+    latestPrecheckResultByMode.delete("paired_open");
+    latestResolvedPrecheckPayloadByMode.delete("paired_open");
+    clearHintStateForMode("paired_open");
     return;
-  }
-  if (!symbolInfoReady) {
-    updateOpenValidationHint({ canCreate: false, tone: "", message: "正在加载交易对规则，暂时无法确认最小下单金额。" });
-    return;
-  }
-  if (currentSymbolInfo.allowed === false) {
-    updateOpenValidationHint({ canCreate: false, tone: "error", message: `${activeSymbol} 不在当前白名单内，真实开单会被拒绝。` });
-    return;
-  }
-  if (roundQty <= 0) {
-    updateOpenValidationHint({ canCreate: false, tone: "", message: `等待订单簿价格更新后计算每轮数量。最小下单金额 ${formatMoney(minNotional)}。` });
-    return;
-  }
-  if (notionalPerRound < minNotional) {
-    if (deferHintToPrecheck) {
-      updateOpenValidationHint({ canCreate: false, canSimulate: false, tone: "", message: "正在校验开仓参数..." });
-    } else {
-      updateOpenValidationHint({ canCreate: false, canSimulate: false, tone: "error", message: `每轮开单金额 ${formatMoney(notionalPerRound)} 低于交易所最小下单金额 ${formatMoney(minNotional)}，无法开单。` });
-    }
-    return;
-  }
-  if (deferHintToPrecheck) {
-    updateOpenValidationHint({ canCreate: false, canSimulate: false, tone: "", message: "正在校验开仓参数..." });
-  } else {
-    updateOpenValidationHint({ canCreate: true, tone: "success", message: `最小下单金额 ${formatMoney(minNotional)}，当前每轮开单金额 ${formatMoney(notionalPerRound)}，可以开单。` });
   }
 }
 function recalculateCloseAmount() {
@@ -1326,43 +1283,23 @@ function recalculateCloseAmount() {
   const totalNotional = closeQty * latestReferencePrice;
   const perRoundNotional = perRoundQty * latestReferencePrice;
   const maxCloseableQty = maxCloseableQtyForSymbol(activeSymbol);
-  const minNotional = Number(currentSymbolInfo.min_notional || 0);
 
   document.getElementById("closeRoundQty").value = perRoundQty > 0 ? perRoundQty.toFixed(6) : "0";
-  document.getElementById("closeTotalNotional").textContent = formatNumber(totalNotional, 4);
-  document.getElementById("closeNotionalPerRound").textContent = formatNumber(perRoundNotional, 4);
+  document.getElementById("closeTotalNotional").textContent = formatMoney(totalNotional);
+  document.getElementById("closeNotionalPerRound").textContent = formatMoney(perRoundNotional);
   document.getElementById("maxCloseableQty").textContent = formatNumber(maxCloseableQty, 6);
   if (executionMode === "paired_close") {
     refreshDerivedStats({ totalNotional, perRoundNotional, estimatedQty: perRoundQty });
   }
 
-  if (!symbolInfoReady) {
-    updateCloseValidationHint({ canCreate: false, tone: "", message: "正在加载交易对规则，暂时无法确认双向平仓参数。" });
+  const deferHintToPrecheck = symbolInfoReady && canRunPrecheck("paired_close", buildPrecheckPayload("paired_close"));
+  if (!deferHintToPrecheck) {
+    latestPrecheckResultByMode.delete("paired_close");
+    latestResolvedPrecheckPayloadByMode.delete("paired_close");
+    clearHintStateForMode("paired_close");
     return;
   }
-  if (closeQty <= 0) {
-    updateCloseValidationHint({ canCreate: false, tone: "", message: "请输入平仓数量。" });
-    return;
-  }
-  if (maxCloseableQty <= 0) {
-    updateCloseValidationHint({ canCreate: false, tone: "error", message: "当前账户不存在可双向平仓的双边持仓。" });
-    return;
-  }
-  if (closeQty > maxCloseableQty) {
-    updateCloseValidationHint({ canCreate: false, tone: "error", message: `平仓数量 ${formatNumber(closeQty, 6)} 超过当前可双向平仓数量 ${formatNumber(maxCloseableQty, 6)}。` });
-    return;
-  }
-  if (perRoundQty <= 0) {
-    updateCloseValidationHint({ canCreate: false, tone: "error", message: "每轮数量归一化后为 0，无法平仓。" });
-    return;
-  }
-  if (perRoundNotional < minNotional) {
-    updateCloseValidationHint({ canCreate: false, tone: "error", message: `每轮平仓名义金额 ${formatNumber(perRoundNotional, 4)} 低于交易所最小下单金额 ${formatNumber(minNotional, 4)}。` });
-    return;
-  }
-  updateCloseValidationHint({ canCreate: true, tone: "success", message: `当前可双向平仓数量 ${formatNumber(maxCloseableQty, 6)}，每轮名义平仓金额 ${formatNumber(perRoundNotional, 4)}，可以平仓。` });
 }
-
 function summarizeSessionEvent(event) {
   const payload = event.payload || {};
   switch (event.event_type) {
@@ -2001,6 +1938,17 @@ Promise.allSettled([
     appendLog("error", `加载交易对规则失败： ${String(symbolInfoResult.reason)}`);
   }
 });
+
+
+
+
+
+
+
+
+
+
+
 
 
 
