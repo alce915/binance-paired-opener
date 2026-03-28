@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -133,13 +133,13 @@ class MarketStreamController:
                 "account_id": self._account_id,
                 "account_name": self._account_name,
                 "updated_at": self._utc_now(),
-                "message": f"???? {symbol}",
+                "message": f"正在连接 {symbol}",
             }
             self._account_overview = {
                 **self._account_overview,
                 "status": "loading",
                 "updated_at": self._utc_now(),
-                "message": f"???? {symbol} ????",
+                "message": f"正在加载 {symbol} 账户概览",
             }
         await self._cancel_tasks(old_market_task, old_account_task)
         await self.publish("connection_status", self._state)
@@ -148,7 +148,7 @@ class MarketStreamController:
             "execution_log",
             {
                 "level": "info",
-                "message": f"???????: {symbol}",
+                "message": f"开始连接行情流：{symbol}",
                 "created_at": self._utc_now(),
             },
         )
@@ -186,13 +186,13 @@ class MarketStreamController:
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": "?????",
+            "message": "已断开",
         }
         self._account_overview = {
             **self._account_overview,
             "status": "idle",
             "updated_at": self._utc_now(),
-            "message": "?????",
+            "message": "已断开",
         }
         await self.publish("connection_status", self._state)
         await self.publish("account_overview", self._account_overview)
@@ -200,7 +200,7 @@ class MarketStreamController:
             "execution_log",
             {
                 "level": "warn",
-                "message": "??????????",
+                "message": "已停止行情连接",
                 "created_at": self._utc_now(),
             },
         )
@@ -223,7 +223,7 @@ class MarketStreamController:
                 "account_id": self._account_id,
                 "account_name": self._account_name,
                 "updated_at": self._utc_now(),
-                "message": "???????",
+                "message": "账户概览已同步",
             }
             self._account_overview = overview
             await self.publish("account_overview", self._account_overview)
@@ -232,7 +232,7 @@ class MarketStreamController:
                     "execution_log",
                     {
                         "level": "success",
-                        "message": "?????????",
+                        "message": "账户概览已恢复",
                         "created_at": self._utc_now(),
                     },
                 )
@@ -251,7 +251,7 @@ class MarketStreamController:
                     "execution_log",
                     {
                         "level": "warn",
-                        "message": f"????????: {error_message}",
+                        "message": f"账户概览刷新失败：{error_message}",
                         "created_at": self._utc_now(),
                     },
                 )
@@ -300,7 +300,7 @@ class MarketStreamController:
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": f"??? {symbol}",
+            "message": f"已连接 {symbol}",
         }
         await self.publish("connection_status", self._state)
         try:
@@ -328,7 +328,7 @@ class MarketStreamController:
                 "execution_log",
                 {
                     "level": "error",
-                    "message": f"???????: {exc}",
+                    "message": f"订单簿获取失败：{exc}",
                     "created_at": self._utc_now(),
                 },
             )
@@ -347,7 +347,7 @@ class MarketStreamController:
                 "execution_log",
                 {
                     "level": "warn",
-                    "message": f"????????: {exc}",
+                    "message": f"账户概览轮询失败：{exc}",
                     "created_at": self._utc_now(),
                 },
             )
@@ -397,7 +397,7 @@ class MarketStreamController:
                         "execution_log",
                         {
                             "level": "warn",
-                            "message": f"???????: ???? {open_amount} ???????? {available_balance} ? 95% ?? {max_open_amount}",
+                            "message": f"模拟执行已阻止：开单金额 {open_amount} 超过可用余额 {available_balance} 的 95% 上限 {max_open_amount}",
                             "created_at": self._utc_now(),
                         },
                     )
@@ -423,7 +423,7 @@ class MarketStreamController:
                     "execution_log",
                     {
                         "level": "warn",
-                        "message": f"???????: ?????? {notional_per_round} ???????? {rules.min_notional}",
+                        "message": f"模拟执行已阻止：每轮开单金额 {notional_per_round} 低于交易所最小下单金额 {rules.min_notional}",
                         "created_at": self._utc_now(),
                     },
                 )
@@ -446,7 +446,7 @@ class MarketStreamController:
                 "execution_log",
                 {
                     "level": "info",
-                    "message": f"??????: {symbol} | ??={trend_bias.value} | ????={open_amount} | ??={leverage}x | ??={round_count}",
+                    "message": f"开始模拟执行：{symbol} | 趋势={trend_bias.value} | 开单金额={open_amount} | 杠杆={leverage}x | 轮次={round_count}",
                     "created_at": self._utc_now(),
                 },
             )
@@ -471,7 +471,7 @@ class MarketStreamController:
                     "execution_log",
                     {
                         "level": "info",
-                        "message": f"? {round_index} ?: Stage1 {stage1_side} @ {stage1_price} | Stage2 {stage2_side} @ {stage2_price} | ???? {est_qty:.8f}",
+                        "message": f"第 {round_index} 轮：Stage1 {stage1_side} @ {stage1_price} | Stage2 {stage2_side} @ {stage2_price} | 预计数量 {est_qty:.8f}",
                         "created_at": self._utc_now(),
                     },
                 )
@@ -494,7 +494,7 @@ class MarketStreamController:
                         "execution_log",
                         {
                             "level": "info",
-                            "message": f"? {round_index} ?????? 3 ???????",
+                            "message": f"第 {round_index} 轮结束，等待 3 秒进入下一轮",
                             "created_at": self._utc_now(),
                         },
                     )
@@ -507,7 +507,7 @@ class MarketStreamController:
                 "execution_log",
                 {
                     "level": "success",
-                    "message": f"??????: {symbol} ? {round_count} ?",
+                    "message": f"模拟执行完成：{symbol} 共 {round_count} 轮",
                     "created_at": self._utc_now(),
                 },
             )
@@ -516,3 +516,4 @@ class MarketStreamController:
 
 def format_sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+

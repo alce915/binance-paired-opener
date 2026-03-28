@@ -3,7 +3,7 @@
 import asyncio
 import re
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from paired_opener.config import Settings
@@ -197,6 +197,10 @@ class OpenSessionService:
             return "0"
         return str(value)
 
+    def _format_money(self, value: Decimal | int | float | str | None) -> str:
+        if value is None:
+            return "0.00"
+        return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     async def _get_open_order_counts(self, symbol: str) -> tuple[int, int]:
         try:
             open_orders = await self._gateway.get_open_orders(symbol)
@@ -274,7 +278,7 @@ class OpenSessionService:
             )
         except Exception as exc:
             message = str(exc)
-            if overview is not None and ("401 Unauthorized" in message or "fapi/v1/positionSide/dual" in message):
+            if overview is not None and (("401 Unauthorized" in message) or ("fapi/v1/positionSide/dual" in message) or ("Binance API 鉴权失败" in message) or (("鉴权失败" in message) and ("双向持仓" in message or "position side" in message or "hedge mode" in message))):
                 checks.append(
                     self._precheck_item(
                         "hedge_mode",
@@ -374,7 +378,7 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, stage1_price, rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮下单金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮开单金额低于交易所最小开单金额，无法开单"))
+                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", f"每轮开单金额 {self._format_money(per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, "min_notional", Decimal("0")))}，无法开单。"))
             max_open_amount = Decimal(str(derived["max_open_amount_95"]))
             if implied_margin_amount > max_open_amount:
                 checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "fail", f"开单金额 {self._stringify_decimal(implied_margin_amount)} 超过可用余额 95% 上限 {self._stringify_decimal(max_open_amount)}"))
@@ -412,7 +416,7 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, normalize_price(stage2_price, rules), rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮平仓金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮开单金额低于交易所最小开单金额，无法开单"))
+                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮平仓金额低于交易所最小下单金额，无法平仓"))
             checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "skip", "平仓类不校验可用余额 95% 限制"))
         return self._finalize_precheck(checks, derived, default_summary="双向平仓预检通过")
 
@@ -470,7 +474,7 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, side_price, rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮开仓金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮开单金额低于交易所最小开单金额，无法开单"))
+                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", f"每轮开单金额 {self._format_money(per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, "min_notional", Decimal("0")))}，无法开单。"))
             max_open_amount = Decimal(str(derived["max_open_amount_95"]))
             if implied_margin_amount > max_open_amount:
                 checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "fail", f"开单金额 {self._stringify_decimal(implied_margin_amount)} 超过可用余额 95% 上限 {self._stringify_decimal(max_open_amount)}"))
@@ -521,7 +525,7 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, side_price, rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮平仓金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮开单金额低于交易所最小开单金额，无法开单"))
+                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮平仓金额低于交易所最小下单金额，无法平仓"))
             checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "skip", "平仓类不校验可用余额 95% 限制"))
         return self._finalize_precheck(checks, derived, default_summary="单向平仓预检通过")
     async def create_session(self, request: OpenSessionRequest) -> OpenSession:
@@ -1151,3 +1155,7 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
+
+
+
+

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sqlite3
@@ -47,7 +47,7 @@ class SqliteRepository:
                     session_id TEXT PRIMARY KEY,
                     session_kind TEXT NOT NULL DEFAULT 'paired_open',
                     account_id TEXT NOT NULL DEFAULT 'default',
-                    account_name TEXT NOT NULL DEFAULT '????',
+                    account_name TEXT NOT NULL DEFAULT '默认账户',
                     symbol TEXT NOT NULL,
                     trend_bias TEXT NOT NULL,
                     leverage INTEGER NOT NULL,
@@ -103,7 +103,7 @@ class SqliteRepository:
             )
             self._ensure_column("sessions", "session_kind", "TEXT NOT NULL DEFAULT 'paired_open'")
             self._ensure_column("sessions", "account_id", "TEXT NOT NULL DEFAULT 'default'")
-            self._ensure_column("sessions", "account_name", "TEXT NOT NULL DEFAULT '????'")
+            self._ensure_column("sessions", "account_name", "TEXT NOT NULL DEFAULT '默认账户'")
             self._ensure_column("sessions", "round_interval_seconds", "INTEGER NOT NULL DEFAULT 3")
             self._ensure_column("sessions", "open_mode", "TEXT")
             self._ensure_column("sessions", "close_mode", "TEXT")
@@ -439,3 +439,4 @@ class SqliteRepository:
         payload = dict(row)
         payload["completed_with_final_alignment"] = bool(payload.get("completed_with_final_alignment"))
         return payload
+

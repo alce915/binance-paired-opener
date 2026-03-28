@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -39,7 +39,7 @@ from paired_opener.service import SessionPrecheckFailed
 from paired_opener.storage import SqliteRepository
 
 STATIC_DIR = Path(__file__).with_name('static')
-HTML_CACHE_HEADERS = {'Cache-Control': 'no-cache'}
+HTML_CACHE_HEADERS = {'Cache-Control': 'no-store, max-age=0'}
 STATIC_CACHE_HEADERS = {'Cache-Control': 'public, max-age=300'}
 
 
@@ -61,7 +61,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
-app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 
 
 def current_runtime(app: FastAPI):
@@ -94,12 +93,14 @@ async def index() -> FileResponse:
 
 @app.get('/static/app.js', include_in_schema=False)
 async def static_app_js() -> FileResponse:
-    return _static_file_response('app.js', media_type='application/javascript')
+    return _static_file_response('app.js', media_type='application/javascript', cache_headers=HTML_CACHE_HEADERS)
 
 
 @app.get('/static/monitor.html', include_in_schema=False)
 async def static_monitor_html() -> FileResponse:
     return _static_file_response('monitor.html', cache_headers=HTML_CACHE_HEADERS)
+
+app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 
 
 @app.get('/stream/events')
@@ -114,9 +115,7 @@ async def stream_events() -> StreamingResponse:
                     message = await asyncio.wait_for(queue.get(), timeout=15)
                     yield format_sse(message['event'], message['data'])
                 except asyncio.TimeoutError:
-                    yield ': keep-alive
-
-'
+                    yield ': keep-alive\n\n'
         finally:
             market.unsubscribe(queue)
 
@@ -257,7 +256,7 @@ async def pause_session(session_id: str) -> SessionActionResponse:
         status=status,
         requested=True,
         requested_action='pause',
-        message='????????????????',
+        message='已请求暂停当前会话。',
     )
 
 
@@ -273,7 +272,7 @@ async def resume_session(session_id: str) -> SessionActionResponse:
         status=status,
         requested=True,
         requested_action='resume',
-        message='???????',
+        message='已请求恢复当前会话。',
     )
 
 
@@ -289,7 +288,7 @@ async def abort_session(session_id: str) -> SessionActionResponse:
         status=status,
         requested=True,
         requested_action='abort',
-        message='??????????????????',
+        message='已请求安全中止当前会话。',
     )
 
 
@@ -334,3 +333,5 @@ async def get_symbol_info(symbol: str) -> SymbolInfoResponse:
     except Exception as exc:
         _raise_api_error(exc, code='trading_request_failed', source='service')
     return SymbolInfoResponse.model_validate(payload)
+
+
