@@ -26,7 +26,7 @@ from paired_opener.engine import PairedOpeningEngine, SessionControl
 from paired_opener.errors import ErrorCategory, ErrorStrategy, TradingError
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.service import ManagedSession, OpenSessionService
-from paired_opener.schemas import CloseSessionRequest, OpenSessionRequest, SingleCloseSessionRequest, SingleOpenSessionRequest
+from paired_opener.schemas import CloseSessionRequest, OpenSessionRequest, SessionPrecheckRequest, SingleCloseSessionRequest, SingleOpenSessionRequest
 from paired_opener.storage import SqliteRepository
 
 
@@ -888,4 +888,144 @@ async def test_create_single_open_session_rejects_when_implied_open_amount_excee
                 round_count=1,
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_precheck_fails_when_system_open_orders_cannot_be_loaded(tmp_path: Path) -> None:
+    class OpenOrdersFailingGateway(SimpleGateway):
+        async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+            raise RuntimeError("open orders unavailable")
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "precheck-open-orders.db")
+    gateway = OpenOrdersFailingGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    precheck = await service.precheck_request(
+        SessionPrecheckRequest(
+            session_kind="paired_open",
+            symbol="BTCUSDT",
+            trend_bias="long",
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.1"),
+        )
+    )
+
+    assert precheck["ok"] is False
+    failure = next(item for item in precheck["checks"] if item["code"] == "system_open_orders")
+    assert failure["status"] == "fail"
+    assert "系统挂单状态读取失败" in failure["message"]
+
+
+@pytest.mark.asyncio
+async def test_display_precheck_skips_hedge_mode_confirmation_when_read_fails(tmp_path: Path) -> None:
+    class HedgeModeReadFailingGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            self.ensure_calls += 1
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "display-precheck-hedge-mode.db")
+    gateway = HedgeModeReadFailingGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    precheck = await service.precheck_request(
+        SessionPrecheckRequest(
+            session_kind="paired_open",
+            symbol="BTCUSDT",
+            trend_bias="long",
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.1"),
+        )
+    )
+
+    assert precheck["ok"] is True
+    hedge_check = next(item for item in precheck["checks"] if item["code"] == "hedge_mode")
+    assert hedge_check["status"] == "skip"
+    assert "普通预检阶段已跳过" in hedge_check["message"]
+    assert "当前账户无法读取 FAPI 双向持仓状态" not in precheck["summary"]
+    assert gateway.ensure_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_strict_precheck_confirms_hedge_mode_via_execution_path_when_read_fails(tmp_path: Path) -> None:
+    class HedgeModeReadFailingGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            self.ensure_calls += 1
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "strict-precheck-hedge-mode-confirmed.db")
+    gateway = HedgeModeReadFailingGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    precheck = await service.precheck_request(
+        SessionPrecheckRequest(
+            session_kind="paired_open",
+            symbol="BTCUSDT",
+            trend_bias="long",
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.1"),
+        ),
+        strict_hedge_mode=True,
+    )
+
+    assert precheck["ok"] is True
+    hedge_check = next(item for item in precheck["checks"] if item["code"] == "hedge_mode")
+    assert hedge_check["status"] == "pass"
+    assert "已按执行链路确认 Hedge Mode 可用" in hedge_check["message"]
+    assert gateway.ensure_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_strict_precheck_fails_when_hedge_mode_confirmation_also_fails(tmp_path: Path) -> None:
+    class HedgeModeReadAndConfirmFailingGateway(SimpleGateway):
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            raise RuntimeError("position side confirmation failed")
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "strict-precheck-hedge-mode-failed.db")
+    gateway = HedgeModeReadAndConfirmFailingGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    precheck = await service.precheck_request(
+        SessionPrecheckRequest(
+            session_kind="paired_open",
+            symbol="BTCUSDT",
+            trend_bias="long",
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.1"),
+        ),
+        strict_hedge_mode=True,
+    )
+
+    assert precheck["ok"] is False
+    failure = next(item for item in precheck["checks"] if item["code"] == "hedge_mode")
+    assert failure["status"] == "fail"
+    assert "执行链路确认失败" in failure["message"]
+
+
 

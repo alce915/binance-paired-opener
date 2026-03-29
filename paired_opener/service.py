@@ -82,6 +82,7 @@ class OpenSessionService:
         self._account_name = account_name
         self._managed: dict[str, ManagedSession] = {}
         self._session_creation_lock = asyncio.Lock()
+        self._hedge_mode_fallback_confirmed = False
         for session_id in self._repository.fail_incomplete_sessions("Service restarted before session completion"):
             self._repository.add_event(
                 session_id,
@@ -201,11 +202,11 @@ class OpenSessionService:
         if value is None:
             return "0.00"
         return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-    async def _get_open_order_counts(self, symbol: str) -> tuple[int, int]:
+    async def _get_open_order_counts(self, symbol: str) -> tuple[int | None, int | None, str | None]:
         try:
             open_orders = await self._gateway.get_open_orders(symbol)
-        except Exception:
-            return 0, 0
+        except Exception as exc:
+            return None, None, str(exc)
         system_count = 0
         manual_count = 0
         for order in open_orders:
@@ -214,24 +215,23 @@ class OpenSessionService:
                 system_count += 1
             else:
                 manual_count += 1
-        return system_count, manual_count
+        return system_count, manual_count, None
 
-    async def precheck_request(self, request: SessionPrecheckRequest) -> dict[str, Any]:
+    async def precheck_request(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> dict[str, Any]:
         if request.session_kind == SessionKind.PAIRED_OPEN:
-            return await self._precheck_paired_open(request)
+            return await self._precheck_paired_open(request, strict_hedge_mode=strict_hedge_mode)
         if request.session_kind == SessionKind.PAIRED_CLOSE:
-            return await self._precheck_paired_close(request)
+            return await self._precheck_paired_close(request, strict_hedge_mode=strict_hedge_mode)
         if request.session_kind == SessionKind.SINGLE_OPEN:
-            return await self._precheck_single_open(request)
+            return await self._precheck_single_open(request, strict_hedge_mode=strict_hedge_mode)
         if request.session_kind == SessionKind.SINGLE_CLOSE:
-            return await self._precheck_single_close(request)
+            return await self._precheck_single_close(request, strict_hedge_mode=strict_hedge_mode)
         return self._finalize_precheck(
             [self._precheck_item("unsupported_session_kind", "会话类型", "fail", f"不支持的会话类型: {request.session_kind}")],
             {"session_kind": str(request.session_kind), "account_id": self._account_id, "account_name": self._account_name},
             default_summary="不支持的会话类型",
         )
-
-    async def precheck_open_request(self, request: OpenSessionRequest | SingleOpenSessionRequest) -> dict[str, Any]:
+    async def precheck_open_request(self, request: OpenSessionRequest | SingleOpenSessionRequest, *, strict_hedge_mode: bool = False) -> dict[str, Any]:
         if isinstance(request, OpenSessionRequest):
             return await self.precheck_request(
                 SessionPrecheckRequest(
@@ -241,7 +241,8 @@ class OpenSessionService:
                     leverage=request.leverage,
                     round_count=request.round_count,
                     round_qty=request.round_qty,
-                )
+                ),
+                strict_hedge_mode=strict_hedge_mode,
             )
         return await self.precheck_request(
             SessionPrecheckRequest(
@@ -252,10 +253,10 @@ class OpenSessionService:
                 open_qty=request.open_qty,
                 selected_position_side=request.selected_position_side,
                 open_mode=request.open_mode,
-            )
+            ),
+            strict_hedge_mode=strict_hedge_mode,
         )
-
-    async def _account_status_snapshot(self, symbol: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None, Any | None, int, Any | None]:
+    async def _account_status_snapshot(self, symbol: str, *, strict_hedge_mode: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any] | None, Any | None, int, Any | None]:
         checks: list[dict[str, Any]] = []
         overview = None
         rules = None
@@ -278,15 +279,48 @@ class OpenSessionService:
             )
         except Exception as exc:
             message = str(exc)
-            if overview is not None and (("401 Unauthorized" in message) or ("fapi/v1/positionSide/dual" in message) or ("Binance API 鉴权失败" in message) or (("鉴权失败" in message) and ("双向持仓" in message or "position side" in message or "hedge mode" in message))):
-                checks.append(
-                    self._precheck_item(
-                        "hedge_mode",
-                        "双向持仓",
-                        "warn",
-                        "当前账户无法读取 FAPI 双向持仓状态，预检阶段已忽略；创建真实会话时将继续按执行链路确认。",
+            auth_read_failed = overview is not None and (("401 Unauthorized" in message) or ("fapi/v1/positionSide/dual" in message) or ("Binance API 鉴权失败" in message) or (("鉴权失败" in message) and ("双向持仓" in message or "position side" in message or "hedge mode" in message)))
+            if auth_read_failed:
+                if strict_hedge_mode:
+                    if self._hedge_mode_fallback_confirmed:
+                        checks.append(
+                            self._precheck_item(
+                                "hedge_mode",
+                                "双向持仓",
+                                "pass",
+                                "无法直接读取 FAPI 双向持仓状态，已按执行链路确认 Hedge Mode 可用。",
+                            )
+                        )
+                    else:
+                        try:
+                            await self._gateway.ensure_hedge_mode()
+                            self._hedge_mode_fallback_confirmed = True
+                            checks.append(
+                                self._precheck_item(
+                                    "hedge_mode",
+                                    "双向持仓",
+                                    "pass",
+                                    "无法直接读取 FAPI 双向持仓状态，已按执行链路确认 Hedge Mode 可用。",
+                                )
+                            )
+                        except Exception as confirm_exc:
+                            checks.append(
+                                self._precheck_item(
+                                    "hedge_mode",
+                                    "双向持仓",
+                                    "fail",
+                                    f"当前账户无法读取 FAPI 双向持仓状态，且执行链路确认失败: {confirm_exc}",
+                                )
+                            )
+                else:
+                    checks.append(
+                        self._precheck_item(
+                            "hedge_mode",
+                            "双向持仓",
+                            "skip",
+                            "普通预检阶段已跳过 Hedge Mode 严格确认。",
+                        )
                     )
-                )
             else:
                 checks.append(self._precheck_item("hedge_mode", "双向持仓", "fail", f"双向持仓状态读取失败: {exc}"))
         try:
@@ -301,30 +335,41 @@ class OpenSessionService:
         except Exception as exc:
             checks.append(self._precheck_item("quote", "参考价格", "fail", f"订单簿参考价格读取失败: {exc}"))
         return checks, overview, rules, current_leverage, quote
-
-    async def _common_precheck_context(self, request: SessionPrecheckRequest) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None, Any | None, int, Any | None]:
+    async def _common_precheck_context(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None, Any | None, int, Any | None]:
         symbol = request.symbol.upper()
-        checks, overview, rules, current_leverage, quote = await self._account_status_snapshot(symbol)
-        system_open_order_count, manual_open_order_count = await self._get_open_order_counts(symbol)
-        checks.append(
-            self._precheck_item(
-                "system_open_orders",
-                "系统挂单冲突",
-                "fail" if system_open_order_count > 0 else "pass",
-                f"当前交易对存在 {system_open_order_count} 笔系统未完成挂单，无法开始" if system_open_order_count > 0 else "当前交易对不存在系统挂单冲突",
-                {"system_open_order_count": system_open_order_count},
-            )
-        )
-        if manual_open_order_count > 0:
+        checks, overview, rules, current_leverage, quote = await self._account_status_snapshot(symbol, strict_hedge_mode=strict_hedge_mode)
+        system_open_order_count, manual_open_order_count, open_order_error = await self._get_open_order_counts(symbol)
+        if open_order_error is not None:
             checks.append(
                 self._precheck_item(
-                    "manual_open_orders",
-                    "手工挂单",
-                    "warn",
-                    f"当前交易对存在 {manual_open_order_count} 笔手工挂单，将忽略但请注意风险",
-                    {"manual_open_order_count": manual_open_order_count},
+                    "system_open_orders",
+                    "系统挂单冲突",
+                    "fail",
+                    f"系统挂单状态读取失败: {open_order_error}",
                 )
             )
+            system_open_order_count = 0
+            manual_open_order_count = 0
+        else:
+            checks.append(
+                self._precheck_item(
+                    "system_open_orders",
+                    "系统挂单冲突",
+                    "fail" if system_open_order_count > 0 else "pass",
+                    f"当前交易对存在 {system_open_order_count} 笔系统未完成挂单，无法开始" if system_open_order_count > 0 else "当前交易对不存在系统挂单冲突",
+                    {"system_open_order_count": system_open_order_count},
+                )
+            )
+            if manual_open_order_count > 0:
+                checks.append(
+                    self._precheck_item(
+                        "manual_open_orders",
+                        "手工挂单",
+                        "warn",
+                        f"当前交易对存在 {manual_open_order_count} 笔手工挂单，将忽略但请注意风险",
+                        {"manual_open_order_count": manual_open_order_count},
+                    )
+                )
         long_qty = self._position_qty(overview or {}, symbol, PositionSide.LONG) if overview else Decimal("0")
         short_qty = self._position_qty(overview or {}, symbol, PositionSide.SHORT) if overview else Decimal("0")
         available_balance = Decimal(str((overview or {}).get("totals", {}).get("available_balance") or "0"))
@@ -348,8 +393,8 @@ class OpenSessionService:
         }
         return checks, derived, overview, rules, current_leverage, quote
 
-    async def _precheck_paired_open(self, request: SessionPrecheckRequest) -> dict[str, Any]:
-        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request)
+    async def _precheck_paired_open(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> dict[str, Any]:
+        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request, strict_hedge_mode=strict_hedge_mode)
         symbol = request.symbol.upper()
         requested_leverage = int(request.leverage or 1)
         allowed = symbol in self._settings.normalized_whitelist
@@ -389,8 +434,8 @@ class OpenSessionService:
             checks.append(self._precheck_item("position_state", "持仓状态", "warn", f"当前双边持仓 LONG={derived['long_qty']} / SHORT={derived['short_qty']}，双向开仓允许继续"))
         return self._finalize_precheck(checks, derived, default_summary="双向开仓预检通过")
 
-    async def _precheck_paired_close(self, request: SessionPrecheckRequest) -> dict[str, Any]:
-        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request)
+    async def _precheck_paired_close(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> dict[str, Any]:
+        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request, strict_hedge_mode=strict_hedge_mode)
         if request.close_qty is None or request.trend_bias is None:
             checks.append(self._precheck_item("request", "参数完整性", "fail", "缺少双向平仓必要参数"))
             return self._finalize_precheck(checks, derived, default_summary="双向平仓预检完成")
@@ -428,8 +473,8 @@ class OpenSessionService:
             checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "skip", "平仓类不校验可用余额 95% 限制"))
         return self._finalize_precheck(checks, derived, default_summary="双向平仓预检通过")
 
-    async def _precheck_single_open(self, request: SessionPrecheckRequest) -> dict[str, Any]:
-        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request)
+    async def _precheck_single_open(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> dict[str, Any]:
+        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request, strict_hedge_mode=strict_hedge_mode)
         symbol = request.symbol.upper()
         allowed = symbol in self._settings.normalized_whitelist
         checks.append(self._precheck_item("whitelist", "白名单", "pass" if allowed else "fail", "交易对白名单校验通过" if allowed else f"{symbol} 不在白名单中，无法真实开仓"))
@@ -491,8 +536,8 @@ class OpenSessionService:
                 checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "pass", "开单金额未超过可用余额 95% 限制"))
         return self._finalize_precheck(checks, derived, default_summary="单向开仓预检通过")
 
-    async def _precheck_single_close(self, request: SessionPrecheckRequest) -> dict[str, Any]:
-        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request)
+    async def _precheck_single_close(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> dict[str, Any]:
+        checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request, strict_hedge_mode=strict_hedge_mode)
         if request.close_qty is None or request.close_mode is None:
             checks.append(self._precheck_item("request", "参数完整性", "fail", "缺少单向平仓必要参数"))
             return self._finalize_precheck(checks, derived, default_summary="单向平仓预检完成")
@@ -557,7 +602,7 @@ class OpenSessionService:
     async def create_open_session(self, request: OpenSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
         async with self._session_creation_lock:
-            precheck = await self.precheck_open_request(request)
+            precheck = await self.precheck_open_request(request, strict_hedge_mode=True)
             if not precheck['ok']:
                 raise SessionPrecheckFailed(precheck)
             if symbol not in self._settings.normalized_whitelist:
@@ -636,7 +681,7 @@ class OpenSessionService:
     async def create_single_open_session(self, request: SingleOpenSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
         async with self._session_creation_lock:
-            precheck = await self.precheck_open_request(request)
+            precheck = await self.precheck_open_request(request, strict_hedge_mode=True)
             if not precheck['ok']:
                 raise SessionPrecheckFailed(precheck)
             if symbol not in self._settings.normalized_whitelist:
@@ -769,7 +814,8 @@ class OpenSessionService:
                     trend_bias=request.trend_bias,
                     close_qty=request.close_qty,
                     round_count=request.round_count,
-                )
+                ),
+                strict_hedge_mode=True,
             )
             if not precheck['ok']:
                 raise SessionPrecheckFailed(precheck)
@@ -867,7 +913,8 @@ class OpenSessionService:
                     round_count=request.round_count,
                     selected_position_side=request.selected_position_side,
                     close_mode=request.close_mode,
-                )
+                ),
+                strict_hedge_mode=True,
             )
             if not precheck['ok']:
                 raise SessionPrecheckFailed(precheck)
@@ -1182,10 +1229,6 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
-
-
-
-
 
 
 

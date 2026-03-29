@@ -1499,9 +1499,11 @@ function startSessionPolling(sessionId) {
   activeSessionPoller = setInterval(pollActiveSession, 2000);
 }
 
-async function refreshSymbolInfo(symbol) {
+async function refreshSymbolInfo(symbol, { applyState = true } = {}) {
   const symbolInfo = await request(`/symbols/${encodeURIComponent(symbol)}`);
-  setSymbolInfo(symbolInfo);
+  if (applyState) {
+    setSymbolInfo(symbolInfo);
+  }
   return symbolInfo;
 }
 
@@ -1556,7 +1558,7 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
   const previousTemporaryCustomSymbol = temporaryCustomSymbol;
   const previousSymbolInfo = { ...currentSymbolInfo };
   try {
-    const symbolInfo = await refreshSymbolInfo(targetSymbol);
+    const symbolInfo = await refreshSymbolInfo(targetSymbol, { applyState: false });
     temporaryCustomSymbol = symbolInfo.allowed ? null : targetSymbol;
     setActiveSymbol(targetSymbol, true);
     setSymbolInfo(symbolInfo);
@@ -1619,13 +1621,13 @@ accountSelect.addEventListener("change", async (event) => {
     return;
   }
   try {
-    closeSse();
     const payload = await request("/config/accounts/select", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ account_id: nextAccountId })
     });
     setCurrentAccount(payload.account.id, payload.account.name, true);
+    closeSse();
     openSse();
     try {
       await refreshSymbolInfo(activeSymbol);
@@ -1661,7 +1663,6 @@ accountSelect.addEventListener("change", async (event) => {
     }
   } catch (error) {
     setCurrentAccount(previousAccount.id, previousAccount.name, true);
-    openSse();
     appendLog("error", `切换账户失败： ${String(error)}`);
   }
 });
@@ -1890,15 +1891,10 @@ function buildModeContextKey(mode = executionMode) {
         : normalizeSymbol(executionSymbol.value || activeSymbol);
   const longQty = Number(positionQty(symbol, "LONG") || 0);
   const shortQty = Number(positionQty(symbol, "SHORT") || 0);
-  const derived = latestPrecheckResultByMode.get(currentMode)?.derived || {};
-  const systemOpenOrderCount = Number(derived.system_open_order_count || 0);
-  const manualOpenOrderCount = Number(derived.manual_open_order_count || 0);
   const baseContext = {
     mode: currentMode,
     accountId: currentAccount.id,
     symbol,
-    system_open_order_count: systemOpenOrderCount,
-    manual_open_order_count: manualOpenOrderCount,
   };
   if (currentMode === "paired_open" || currentMode === "single_open") {
     return JSON.stringify({
@@ -2084,14 +2080,14 @@ function storeModeValidationSnapshot(mode, paramsKey, precheck, contextKey = bui
 }
 function restoreModeValidationSnapshot(mode = executionMode) {
   const decision = getModeValidationDecision(mode);
-  if (!decision.snapshot) {
+  if (!decision.snapshot || decision.reason !== "fresh") {
     return false;
   }
   if (decision.snapshot.precheckResult) {
     applyPrecheckResult(mode, decision.snapshot.precheckResult);
   }
   applyModeDisplaySnapshot(mode, decision.snapshot.displaySnapshot);
-  return decision.reason === "fresh";
+  return true;
 }
 
 function maybeScheduleCurrentModePrecheck(trigger = "price_tick") {
@@ -2487,11 +2483,4 @@ Promise.allSettled([
 setInterval(() => {
   maybeScheduleCurrentModePrecheck("interval");
 }, PRECHECK_INTERVAL_MS);
-
-
-
-
-
-
-
 
