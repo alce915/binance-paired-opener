@@ -418,7 +418,7 @@ async def test_create_session_rejects_round_notional_below_minimum(tmp_path: Pat
     engine = PairedOpeningEngine(gateway, repository)
     service = OpenSessionService(settings, repository, gateway, engine)
 
-    with pytest.raises(ValueError, match="最小开单金额"):
+    with pytest.raises(ValueError, match="最小下单金额"):
         await service.create_session(
             OpenSessionRequest(
                 symbol="BTCUSDT",
@@ -888,3 +888,4 @@ async def test_create_single_open_session_rejects_when_implied_open_amount_excee
                 round_count=1,
             )
         )
+

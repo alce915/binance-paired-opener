@@ -417,7 +417,14 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, normalize_price(stage2_price, rules), rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮平仓金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮平仓金额低于交易所最小下单金额，无法平仓"))
+                checks.append(
+                    self._precheck_item(
+                        "minimum_order",
+                        "最小下单金额",
+                        "fail",
+                        f"每轮平仓金额 {self._format_money(per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, 'min_notional', Decimal('0')))}，无法平仓。",
+                    )
+                )
             checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "skip", "平仓类不校验可用余额 95% 限制"))
         return self._finalize_precheck(checks, derived, default_summary="双向平仓预检通过")
 
@@ -495,7 +502,14 @@ class OpenSessionService:
         close_qty = Decimal(request.close_qty)
         if request.close_mode == SingleCloseMode.ALIGN:
             if long_qty == short_qty:
-                checks.append(self._precheck_item("position_state", "持仓状态", "fail", "当前双边持仓数量已对齐，无需单向平仓"))
+                checks.append(
+                    self._precheck_item(
+                        "position_state",
+                        "持仓状态",
+                        "fail",
+                        "当前交易对不存在持仓" if long_qty <= Decimal("0") else "当前双边持仓数量已对齐，无需单向平仓",
+                    )
+                )
                 selected_position_side = PositionSide.LONG if long_qty >= short_qty else PositionSide.SHORT
                 close_qty = Decimal("0")
             else:
@@ -507,7 +521,7 @@ class OpenSessionService:
         else:
             available_qty = long_qty if selected_position_side == PositionSide.LONG else short_qty
             if available_qty <= Decimal("0"):
-                checks.append(self._precheck_item("position_state", "持仓状态", "fail", f"当前交易对没有 {selected_position_side.value} 持仓可用于单向平仓"))
+                checks.append(self._precheck_item("position_state", "持仓状态", "fail", "当前交易对不存在持仓"))
             elif close_qty > available_qty:
                 checks.append(self._precheck_item("position_state", "持仓状态", "fail", f"平仓数量 {self._stringify_decimal(close_qty)} 超过所选持仓数量 {self._stringify_decimal(available_qty)}"))
             else:
@@ -527,7 +541,14 @@ class OpenSessionService:
                 validate_qty_and_notional(normalized_round_qty, side_price, rules)
                 checks.append(self._precheck_item("minimum_order", "最小下单金额", "pass", "每轮平仓金额满足交易所要求"))
             except ValueError as exc:
-                checks.append(self._precheck_item("minimum_order", "最小下单金额", "fail", "每轮平仓金额低于交易所最小下单金额，无法平仓"))
+                checks.append(
+                    self._precheck_item(
+                        "minimum_order",
+                        "最小下单金额",
+                        "fail",
+                        f"每轮平仓金额 {self._format_money(per_round_notional)} 低于交易所最小下单金额 {self._format_money(getattr(rules, 'min_notional', Decimal('0')))}，无法平仓。",
+                    )
+                )
             checks.append(self._precheck_item("max_open_amount", "最大可承受仓位", "skip", "平仓类不校验可用余额 95% 限制"))
         return self._finalize_precheck(checks, derived, default_summary="单向平仓预检通过")
     async def create_session(self, request: OpenSessionRequest) -> OpenSession:
@@ -781,7 +802,9 @@ class OpenSessionService:
                 validate_qty_and_notional(round_qty, stage1_price, rules)
                 validate_qty_and_notional(round_qty, stage2_price, rules)
             except ValueError as exc:
-                raise ValueError("每轮平仓数量按当前价格换算后低于交易所最小下单金额，无法平仓") from exc
+                raise ValueError(
+                    f"每轮平仓金额 {self._format_money(round_qty * stage1_price)} 低于交易所最小下单金额 {self._format_money(getattr(rules, 'min_notional', Decimal('0')))}，无法平仓。"
+                ) from exc
 
             spec = SessionSpec(
                 symbol=symbol,
@@ -856,7 +879,7 @@ class OpenSessionService:
 
             if request.close_mode == SingleCloseMode.ALIGN:
                 if long_qty == short_qty:
-                    raise ValueError("当前双边持仓数量已对齐，无需单向平仓")
+                    raise ValueError("当前交易对不存在持仓" if long_qty <= Decimal("0") else "当前双边持仓数量已对齐，无需单向平仓")
                 selected_position_side = PositionSide.LONG if long_qty > short_qty else PositionSide.SHORT
                 normalized_close_qty = normalize_qty(abs(long_qty - short_qty), rules)
             else:
@@ -865,7 +888,7 @@ class OpenSessionService:
                 selected_position_side = request.selected_position_side
                 available_qty = long_qty if selected_position_side == PositionSide.LONG else short_qty
                 if available_qty <= Decimal("0"):
-                    raise ValueError(f"当前交易对没有 {selected_position_side.value} 持仓可用于单向平仓")
+                    raise ValueError("当前交易对不存在持仓")
                 normalized_close_qty = normalize_qty(request.close_qty, rules)
                 if normalized_close_qty > available_qty:
                     raise ValueError(
@@ -892,7 +915,9 @@ class OpenSessionService:
                 validate_qty_and_notional(round_qty, single_close_price, rules)
                 validate_qty_and_notional(final_round_qty, single_close_price, rules)
             except ValueError as exc:
-                raise ValueError("每轮平仓数量按当前价格换算后低于交易所最小下单金额，无法单向平仓") from exc
+                raise ValueError(
+                    f"每轮平仓金额 {self._format_money(round_qty * single_close_price)} 低于交易所最小下单金额 {self._format_money(getattr(rules, 'min_notional', Decimal('0')))}，无法平仓。"
+                ) from exc
 
             trend_bias = TrendBias.LONG if selected_position_side == PositionSide.LONG else TrendBias.SHORT
             spec = SessionSpec(
@@ -1157,6 +1182,8 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
+
+
 
 
 

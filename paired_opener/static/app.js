@@ -51,6 +51,9 @@ let latestPrecheckToken = 0;
 const latestPrecheckResultByMode = new Map();
 const latestResolvedPrecheckPayloadByMode = new Map();
 const inFlightPrecheckPayloadByMode = new Map();
+const precheckTimersByMode = new Map();
+const precheckAbortControllersByMode = new Map();
+const latestPrecheckTokensByMode = new Map();
 let precheckPaused = false;
 let lastAutoPrecheckAt = 0;
 let activeSessionId = null;
@@ -71,45 +74,6 @@ let renderFramePending = false;
 function nowTime() {
   return new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
-
-function queueUiRender() {
-  if (renderFramePending) return;
-  renderFramePending = true;
-  requestAnimationFrame(() => {
-    renderFramePending = false;
-    if (pendingOrderbookPayload) {
-      const payload = pendingOrderbookPayload;
-      pendingOrderbookPayload = null;
-      renderLevels(asksContainer, payload.asks || [], "sell");
-      renderLevels(bidsContainer, payload.bids || [], "buy");
-      const bestAsk = Number(payload.asks?.[0]?.price || 0);
-      const bestBid = Number(payload.bids?.[0]?.price || 0);
-      latestReferencePrice = bestAsk > 0 && bestBid > 0 ? (bestAsk + bestBid) / 2 : (bestAsk || bestBid || 0);
-      recalculateOpenAmount();
-      recalculateCloseAmount();
-      recalculateSingleOpenAmount();
-      recalculateSingleCloseAmount();
-      if (symbolInfoReady && !precheckPaused && !precheckTimer && !precheckAbortController) {
-        schedulePrecheck(executionMode, 0);
-      }
-      document.getElementById("streamClock").textContent = nowTime();
-    }
-    if (pendingAccountOverviewPayload) {
-      const payload = pendingAccountOverviewPayload;
-      pendingAccountOverviewPayload = null;
-      renderAccountOverview(payload);
-      document.getElementById("streamClock").textContent = nowTime();
-    }
-    if (pendingLogEntries.length) {
-      const entries = pendingLogEntries.splice(0, pendingLogEntries.length);
-      entries.forEach((entry) => {
-        appendLog(entry.level || "info", entry.message || "", entry.created_at);
-      });
-      document.getElementById("streamClock").textContent = nowTime();
-    }
-  });
-}
-
 
 function request(path, options = {}) {
   return fetch(path, options).then(async (response) => {
@@ -337,7 +301,7 @@ function canRunPrecheck(mode, payload) {
   }
 }
 
-function applyPrecheckResult(mode, precheck) {
+function __legacyApplyPrecheckResult(mode, precheck) {
   if (!precheck) return;
   latestPrecheckResultByMode.set(mode, precheck);
   const derived = precheck.derived || {};
@@ -374,7 +338,7 @@ function applyPrecheckResult(mode, precheck) {
     message: buildModeSuccessHint(mode, precheck),
   });
 }
-async function runPrecheck(mode = executionMode) {
+async function __legacyRunPrecheck(mode = executionMode, trigger = "user_input") {
   if (precheckPaused) return;
   const payload = buildPrecheckPayload(mode);
   if (!canRunPrecheck(mode, payload)) {
@@ -445,7 +409,7 @@ async function runPrecheck(mode = executionMode) {
     }
   }
 }
-function schedulePrecheck(mode = executionMode, delay = 400) {
+function __legacySchedulePrecheck(mode = executionMode, delay = 400, trigger = "user_input") {
   if (precheckPaused) return;
   if (precheckTimer) {
     clearTimeout(precheckTimer);
@@ -469,9 +433,12 @@ function setPrecheckPaused(paused) {
     precheckAbortController.abort();
     precheckAbortController = null;
   }
+  precheckTimersByMode.forEach((timerId) => clearTimeout(timerId));
+  precheckTimersByMode.clear();
+  precheckAbortControllersByMode.forEach((controller) => controller.abort());
+  precheckAbortControllersByMode.clear();
   inFlightPrecheckPayloadByMode.clear();
 }
-
 function isTerminalSession(status) {
   return ["completed", "completed_with_skips", "aborted", "exception"].includes(String(status || ""));
 }
@@ -560,7 +527,7 @@ async function loadWhitelist() {
   return whitelistSymbols;
 }
 
-function setExecutionMode(mode) {
+function __legacySetExecutionMode(mode) {
   executionMode = mode;
   Object.entries(modeButtons).forEach(([key, button]) => {
     if (button) button.classList.toggle("active", key === mode);
@@ -581,7 +548,7 @@ function setExecutionMode(mode) {
   schedulePrecheck(mode, 0);
 }
 
-function setActiveSymbol(symbol, syncInput = true) {
+function __legacySetActiveSymbol(symbol, syncInput = true) {
   activeSymbol = normalizeSymbol(symbol);
   latestReferencePrice = 0;
   document.getElementById("statsSymbol").textContent = activeSymbol;
@@ -593,17 +560,14 @@ function setActiveSymbol(symbol, syncInput = true) {
   updateSymbolUnits(activeSymbol);
   if (syncInput) rebuildSymbolOptions(activeSymbol);
   refreshSingleOpenOrderOptions();
-  refreshSingleClosePositionOptions();
-  recalculateOpenAmount();
-  recalculateCloseAmount();
-  recalculateSingleOpenAmount();
-  recalculateSingleCloseAmount();
+    refreshSingleClosePositionOptions();
+    syncCurrentModeFromAccountOverview();
   const footerStatus = document.getElementById("footerStatus");
   footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
   schedulePrecheck();
 }
 
-function setSymbolInfo(info) {
+function __legacySetSymbolInfo(info) {
   currentSymbolInfo = info || { symbol: activeSymbol, min_notional: 0, allowed: true };
   symbolInfoReady = Boolean(info);
   document.getElementById("statMinNotional").textContent = formatNumber(currentSymbolInfo.min_notional || 0, 4);
@@ -835,6 +799,9 @@ function renderAccountOverview(payload) {
 
   document.getElementById("positionsCount").textContent = String(currentPositions.length);
   const emptyNode = positionsList.querySelector(".empty-state");
+  const syncCurrentModeFromAccountOverview = () => {
+    maybeScheduleCurrentModePrecheck("account_update");
+  };
   if (!currentPositions.length) {
     positionRowCache.forEach((row) => row.remove());
     positionRowCache.clear();
@@ -848,10 +815,7 @@ function renderAccountOverview(payload) {
     positionsList.replaceChildren(placeholder);
     refreshSingleOpenOrderOptions();
     refreshSingleClosePositionOptions();
-    recalculateOpenAmount();
-    recalculateCloseAmount();
-    recalculateSingleOpenAmount();
-    recalculateSingleCloseAmount();
+    syncCurrentModeFromAccountOverview();
     return;
   }
 
@@ -919,11 +883,8 @@ function renderAccountOverview(payload) {
   positionsList.replaceChildren(fragment);
 
   refreshSingleOpenOrderOptions();
-  refreshSingleClosePositionOptions();
-  recalculateOpenAmount();
-  recalculateCloseAmount();
-  recalculateSingleOpenAmount();
-  recalculateSingleCloseAmount();
+    refreshSingleClosePositionOptions();
+    syncCurrentModeFromAccountOverview();
 }
 function updateOpenValidationHint({ canCreate, canSimulate = true, message, tone }) {
   minNotionalHint.className = `validation-hint ${tone || ""}`;
@@ -1193,6 +1154,27 @@ function recalculateSingleCloseAmount() {
   const shortQty = positions.filter((position) => String(position.position_side) === "SHORT").reduce((sum, position) => sum + Number(position.qty || 0), 0);
   let selectedSide = String(orderSelect?.value || "");
   let availableQty = positions.filter((position) => String(position.position_side) === selectedSide).reduce((sum, position) => sum + Number(position.qty || 0), 0);
+
+  if (!positions.length) {
+    if (orderSelect) {
+      orderSelect.disabled = true;
+      orderSelect.value = "";
+      syncPositionSideTone(orderSelect);
+    }
+    if (qtyInput) {
+      qtyInput.disabled = true;
+      qtyInput.value = "0";
+    }
+    document.getElementById("singleCloseRoundQty").value = "0";
+    document.getElementById("singleCloseAvailableQty").textContent = formatNumber(0, 6);
+    document.getElementById("singleCloseTotalNotional").textContent = formatMoney(0);
+    document.getElementById("singleCloseNotionalPerRound").textContent = formatMoney(0);
+    if (executionMode === "single_close") {
+      refreshDerivedStats({ totalNotional: 0, perRoundNotional: 0, estimatedQty: 0 });
+    }
+    updateSingleCloseValidationHint({ canCreate: false, tone: "error", message: "当前交易对不存在持仓" });
+    return;
+  }
 
   if (mode === "align") {
     if (longQty === shortQty) {
@@ -1664,7 +1646,7 @@ accountSelect.addEventListener("change", async (event) => {
         });
       }
       appendLog("success", `已切换账户：${payload.account.name}`);
-      schedulePrecheck();
+      maybeScheduleCurrentModePrecheck("mode_switch");
     } catch (error) {
       connectionToggle.checked = false;
       setConnectionState({
@@ -1843,6 +1825,570 @@ createSingleCloseBtn.addEventListener("click", async () => {
   }
 });
 
+const modeValidationSnapshots = new Map();
+const PRECHECK_INTERVAL_MS = 10000;
+const PRECHECK_PRICE_DRIFT_THRESHOLD = 0.003;
+
+function shouldSilentlyRefreshPairedOpen(mode, trigger) {
+  const snapshot = modeValidationSnapshots.get(mode);
+  return mode === "paired_open" && (trigger === "price_drift" || trigger === "interval") && Boolean(snapshot?.precheckResult);
+}
+
+function buildModeParamsKey(mode = executionMode) {
+  switch (mode) {
+    case "paired_close":
+      return JSON.stringify({
+        mode,
+        accountId: currentAccount.id,
+        symbol: closeExecutionSymbol.value,
+        trend_bias: document.getElementById("closeTrend")?.value || "",
+        close_qty: document.getElementById("closeQty")?.value || "",
+        round_count: Number(document.getElementById("closeRounds")?.value || 0),
+      });
+    case "single_open":
+      return JSON.stringify({
+        mode,
+        accountId: currentAccount.id,
+        symbol: document.getElementById("singleOpenExecutionSymbol")?.value || "",
+        open_mode: document.getElementById("singleOpenMode")?.value || "",
+        selected_position_side: document.getElementById("singleOpenMode")?.value === "align" ? "ALIGN" : (document.getElementById("singleOpenOrder")?.value || ""),
+        open_qty: document.getElementById("singleOpenQty")?.value || "",
+        leverage: Number(document.getElementById("singleOpenLeverage")?.value || 0),
+        round_count: Number(document.getElementById("singleOpenRounds")?.value || 0),
+      });
+    case "single_close":
+      return JSON.stringify({
+        mode,
+        accountId: currentAccount.id,
+        symbol: document.getElementById("singleCloseExecutionSymbol")?.value || "",
+        close_mode: document.getElementById("singleCloseMode")?.value || "",
+        selected_position_side: document.getElementById("singleCloseMode")?.value === "align" ? "ALIGN" : (document.getElementById("singleCloseOrder")?.value || ""),
+        close_qty: document.getElementById("singleCloseQty")?.value || "",
+        round_count: Number(document.getElementById("singleCloseRounds")?.value || 0),
+      });
+    default:
+      return JSON.stringify({
+        mode,
+        accountId: currentAccount.id,
+        symbol: executionSymbol.value,
+        trend_bias: document.getElementById("trend")?.value || "",
+        leverage: Number(document.getElementById("leverage")?.value || 0),
+        round_count: Number(document.getElementById("calcRounds")?.value || 0),
+        open_amount: document.getElementById("calcMargin")?.value || "",
+      });
+  }
+}
+
+function buildModeContextKey(mode = executionMode) {
+  const currentMode = mode || executionMode;
+  const symbol = currentMode === "paired_close"
+    ? normalizeSymbol(closeExecutionSymbol.value)
+    : currentMode === "single_open"
+      ? normalizeSymbol(document.getElementById("singleOpenExecutionSymbol")?.value || activeSymbol)
+      : currentMode === "single_close"
+        ? normalizeSymbol(document.getElementById("singleCloseExecutionSymbol")?.value || activeSymbol)
+        : normalizeSymbol(executionSymbol.value || activeSymbol);
+  const longQty = Number(positionQty(symbol, "LONG") || 0);
+  const shortQty = Number(positionQty(symbol, "SHORT") || 0);
+  const derived = latestPrecheckResultByMode.get(currentMode)?.derived || {};
+  const systemOpenOrderCount = Number(derived.system_open_order_count || 0);
+  const manualOpenOrderCount = Number(derived.manual_open_order_count || 0);
+  const baseContext = {
+    mode: currentMode,
+    accountId: currentAccount.id,
+    symbol,
+    system_open_order_count: systemOpenOrderCount,
+    manual_open_order_count: manualOpenOrderCount,
+  };
+  if (currentMode === "paired_open" || currentMode === "single_open") {
+    return JSON.stringify({
+      ...baseContext,
+      available_balance: Number(latestAvailableBalance ?? 0),
+      long_qty: longQty,
+      short_qty: shortQty,
+    });
+  }
+  return JSON.stringify({
+    ...baseContext,
+    long_qty: longQty,
+    short_qty: shortQty,
+  });
+}
+
+function getModeValidationPrice(mode = executionMode) {
+  const currentPrice = Number(latestReferencePrice || 0);
+  if (currentPrice > 0) return currentPrice;
+  const snapshot = modeValidationSnapshots.get(mode);
+  return Number(snapshot?.validatedPrice || 0);
+}
+
+function extractValidatedPrice(mode, fallbackPrice = 0) {
+  const currentPrice = Number(fallbackPrice || 0);
+  if (currentPrice > 0) {
+    return currentPrice;
+  }
+  const livePrice = Number(latestReferencePrice || 0);
+  if (livePrice > 0) {
+    return livePrice;
+  }
+  const snapshot = modeValidationSnapshots.get(mode);
+  return Number(snapshot?.validatedPrice || 0);
+}
+
+function captureModeDisplaySnapshot(mode) {
+  switch (mode) {
+    case "paired_close":
+      return {
+        roundQty: document.getElementById("closeRoundQty")?.value || "0",
+        totalNotional: document.getElementById("closeTotalNotional")?.textContent || "0.00",
+        perRoundNotional: document.getElementById("closeNotionalPerRound")?.textContent || "0.00",
+        maxCloseableQty: document.getElementById("maxCloseableQty")?.textContent || "0",
+      };
+    case "single_open":
+      return {
+        roundQty: document.getElementById("singleOpenRoundQty")?.value || "0",
+        marginPerRound: document.getElementById("singleOpenMarginPerRound")?.textContent || "0.00",
+        totalNotional: document.getElementById("singleOpenTotalNotional")?.textContent || "0.00",
+        perRoundNotional: document.getElementById("singleOpenNotionalPerRound")?.textContent || "0.00",
+      };
+    case "single_close":
+      return {
+        roundQty: document.getElementById("singleCloseRoundQty")?.value || "0",
+        availableQty: document.getElementById("singleCloseAvailableQty")?.textContent || "0",
+        totalNotional: document.getElementById("singleCloseTotalNotional")?.textContent || "0.00",
+        perRoundNotional: document.getElementById("singleCloseNotionalPerRound")?.textContent || "0.00",
+      };
+    default:
+      return {
+        roundQty: document.getElementById("roundQty")?.value || "0",
+        marginPerRound: document.getElementById("marginPerRound")?.textContent || "0.00",
+        totalNotional: document.getElementById("totalNotional")?.textContent || "0.00",
+        perRoundNotional: document.getElementById("notionalPerRound")?.textContent || "0.00",
+      };
+  }
+}
+
+function applyModeDisplaySnapshot(mode, snapshot) {
+  if (!snapshot) return;
+  switch (mode) {
+    case "paired_close": {
+      const roundQtyInput = document.getElementById("closeRoundQty");
+      const totalNotionalEl = document.getElementById("closeTotalNotional");
+      const perRoundNotionalEl = document.getElementById("closeNotionalPerRound");
+      const maxCloseableQtyEl = document.getElementById("maxCloseableQty");
+      if (roundQtyInput) roundQtyInput.value = snapshot.roundQty || "0";
+      if (totalNotionalEl) totalNotionalEl.textContent = snapshot.totalNotional || "0.00";
+      if (perRoundNotionalEl) perRoundNotionalEl.textContent = snapshot.perRoundNotional || "0.00";
+      if (maxCloseableQtyEl) maxCloseableQtyEl.textContent = snapshot.maxCloseableQty || "0";
+      break;
+    }
+    case "single_open": {
+      const roundQtyInput = document.getElementById("singleOpenRoundQty");
+      const marginPerRoundEl = document.getElementById("singleOpenMarginPerRound");
+      const totalNotionalEl = document.getElementById("singleOpenTotalNotional");
+      const perRoundNotionalEl = document.getElementById("singleOpenNotionalPerRound");
+      if (roundQtyInput) roundQtyInput.value = snapshot.roundQty || "0";
+      if (marginPerRoundEl) marginPerRoundEl.textContent = snapshot.marginPerRound || "0.00";
+      if (totalNotionalEl) totalNotionalEl.textContent = snapshot.totalNotional || "0.00";
+      if (perRoundNotionalEl) perRoundNotionalEl.textContent = snapshot.perRoundNotional || "0.00";
+      break;
+    }
+    case "single_close": {
+      const roundQtyInput = document.getElementById("singleCloseRoundQty");
+      const availableQtyEl = document.getElementById("singleCloseAvailableQty");
+      const totalNotionalEl = document.getElementById("singleCloseTotalNotional");
+      const perRoundNotionalEl = document.getElementById("singleCloseNotionalPerRound");
+      if (roundQtyInput) roundQtyInput.value = snapshot.roundQty || "0";
+      if (availableQtyEl) availableQtyEl.textContent = snapshot.availableQty || "0";
+      if (totalNotionalEl) totalNotionalEl.textContent = snapshot.totalNotional || "0.00";
+      if (perRoundNotionalEl) perRoundNotionalEl.textContent = snapshot.perRoundNotional || "0.00";
+      break;
+    }
+    default: {
+      const roundQtyInput = document.getElementById("roundQty");
+      const marginPerRoundEl = document.getElementById("marginPerRound");
+      const totalNotionalEl = document.getElementById("totalNotional");
+      const perRoundNotionalEl = document.getElementById("notionalPerRound");
+      if (roundQtyInput) roundQtyInput.value = snapshot.roundQty || "0";
+      if (marginPerRoundEl) marginPerRoundEl.textContent = snapshot.marginPerRound || "0.00";
+      if (totalNotionalEl) totalNotionalEl.textContent = snapshot.totalNotional || "0.00";
+      if (perRoundNotionalEl) perRoundNotionalEl.textContent = snapshot.perRoundNotional || "0.00";
+      break;
+    }
+  }
+}
+
+function recalculateMode(mode = executionMode) {
+  if (mode === "paired_open") {
+    recalculateOpenAmount();
+  } else if (mode === "paired_close") {
+    recalculateCloseAmount();
+  } else if (mode === "single_open") {
+    recalculateSingleOpenAmount();
+  } else if (mode === "single_close") {
+    recalculateSingleCloseAmount();
+  }
+}
+
+function getModeValidationDecision(mode = executionMode) {
+  const payload = buildPrecheckPayload(mode);
+  const runnable = symbolInfoReady && canRunPrecheck(mode, payload);
+  const paramsKey = buildModeParamsKey(mode);
+  const contextKey = buildModeContextKey(mode);
+  const snapshot = modeValidationSnapshots.get(mode) || null;
+  if (!runnable) {
+    return { runnable: false, payload, paramsKey, contextKey, snapshot, reason: "not_runnable" };
+  }
+  if (!snapshot) {
+    return { runnable: true, payload, paramsKey, contextKey, snapshot: null, reason: "no_snapshot" };
+  }
+  if (snapshot.paramsKey !== paramsKey) {
+    return { runnable: true, payload, paramsKey, contextKey, snapshot, reason: "params_changed" };
+  }
+  const contextChanged = snapshot.contextKey !== contextKey;
+  const currentPrice = Number(getModeValidationPrice(mode) || 0);
+  const validatedPrice = Number(snapshot.validatedPrice || 0);
+  if (currentPrice > 0 && validatedPrice > 0) {
+    const drift = Math.abs(currentPrice - validatedPrice) / validatedPrice;
+    if (drift > PRECHECK_PRICE_DRIFT_THRESHOLD) {
+      return { runnable: true, payload, paramsKey, contextKey, snapshot, reason: "price_drift", drift };
+    }
+  } else if (currentPrice > 0 && validatedPrice <= 0) {
+    return { runnable: true, payload, paramsKey, contextKey, snapshot, reason: "no_price_baseline" };
+  }
+  if (Date.now() - Number(snapshot.validatedAt || 0) >= PRECHECK_INTERVAL_MS) {
+    return {
+      runnable: true,
+      payload,
+      paramsKey,
+      contextKey,
+      snapshot,
+      reason: contextChanged ? "context_interval" : "interval_elapsed",
+    };
+  }
+  if (contextChanged) {
+    return { runnable: true, payload, paramsKey, contextKey, snapshot, reason: "context_stale" };
+  }
+  return { runnable: true, payload, paramsKey, contextKey, snapshot, reason: "fresh" };
+}
+
+function storeModeValidationSnapshot(mode, paramsKey, precheck, contextKey = buildModeContextKey(mode), validationPrice = 0) {
+  modeValidationSnapshots.set(mode, {
+    paramsKey,
+    contextKey,
+    validatedPrice: extractValidatedPrice(mode, validationPrice),
+    validatedAt: Date.now(),
+    precheckResult: precheck,
+    displaySnapshot: captureModeDisplaySnapshot(mode),
+  });
+}
+function restoreModeValidationSnapshot(mode = executionMode) {
+  const decision = getModeValidationDecision(mode);
+  if (!decision.snapshot) {
+    return false;
+  }
+  if (decision.snapshot.precheckResult) {
+    applyPrecheckResult(mode, decision.snapshot.precheckResult);
+  }
+  applyModeDisplaySnapshot(mode, decision.snapshot.displaySnapshot);
+  return decision.reason === "fresh";
+}
+
+function maybeScheduleCurrentModePrecheck(trigger = "price_tick") {
+  if (precheckPaused) return;
+  const decision = getModeValidationDecision(executionMode);
+  if (!decision.runnable) {
+    return;
+  }
+  const shouldRun =
+    decision.reason === "no_snapshot" ||
+    decision.reason === "params_changed" ||
+    decision.reason === "no_price_baseline" ||
+    decision.reason === "price_drift" ||
+    decision.reason === "interval_elapsed" ||
+    decision.reason === "context_interval";
+  if (shouldRun) {
+    const scheduleTrigger =
+      decision.reason === "price_drift"
+        ? "price_drift"
+        : decision.reason === "context_interval"
+          ? "account_update"
+          : decision.reason === "interval_elapsed"
+            ? "interval"
+            : trigger;
+    schedulePrecheck(executionMode, 0, scheduleTrigger);
+  }
+}
+
+function queueUiRender() {
+  if (renderFramePending) return;
+  renderFramePending = true;
+  requestAnimationFrame(() => {
+    renderFramePending = false;
+    if (pendingOrderbookPayload) {
+      const payload = pendingOrderbookPayload;
+      pendingOrderbookPayload = null;
+      renderLevels(asksContainer, payload.asks || [], "sell");
+      renderLevels(bidsContainer, payload.bids || [], "buy");
+      const bestAsk = Number(payload.asks?.[0]?.price || 0);
+      const bestBid = Number(payload.bids?.[0]?.price || 0);
+      latestReferencePrice = bestAsk > 0 && bestBid > 0 ? (bestAsk + bestBid) / 2 : (bestAsk || bestBid || 0);
+      if (symbolInfoReady) {
+        maybeScheduleCurrentModePrecheck("price_tick");
+      }
+      document.getElementById("streamClock").textContent = nowTime();
+    }
+    if (pendingAccountOverviewPayload) {
+      const payload = pendingAccountOverviewPayload;
+      pendingAccountOverviewPayload = null;
+      renderAccountOverview(payload);
+      document.getElementById("streamClock").textContent = nowTime();
+    }
+    if (pendingLogEntries.length) {
+      const entries = pendingLogEntries.splice(0, pendingLogEntries.length);
+      entries.forEach((entry) => {
+        appendLog(entry.level || "info", entry.message || "", entry.created_at);
+      });
+      document.getElementById("streamClock").textContent = nowTime();
+    }
+  });
+}
+
+function buildPrecheckPayload(mode = executionMode) {
+  switch (mode) {
+    case "paired_close":
+      return {
+        session_kind: "paired_close",
+        symbol: closeExecutionSymbol.value,
+        trend_bias: document.getElementById("closeTrend").value,
+        close_qty: optionalPositiveValue(document.getElementById("closeQty").value),
+        round_count: Number(document.getElementById("closeRounds").value),
+      };
+    case "single_open": {
+      const openMode = document.getElementById("singleOpenMode").value;
+      return {
+        session_kind: "single_open",
+        symbol: document.getElementById("singleOpenExecutionSymbol").value,
+        open_mode: openMode,
+        selected_position_side: openMode === "align" ? null : (document.getElementById("singleOpenOrder").value || null),
+        open_qty: optionalPositiveValue(document.getElementById("singleOpenQty").value),
+        leverage: Number(document.getElementById("singleOpenLeverage").value),
+        round_count: Number(document.getElementById("singleOpenRounds").value),
+      };
+    }
+    case "single_close": {
+      const closeMode = document.getElementById("singleCloseMode").value;
+      return {
+        session_kind: "single_close",
+        symbol: document.getElementById("singleCloseExecutionSymbol").value,
+        close_mode: closeMode,
+        selected_position_side: closeMode === "align" ? null : (document.getElementById("singleCloseOrder").value || null),
+        close_qty: optionalPositiveValue(document.getElementById("singleCloseQty").value),
+        round_count: Number(document.getElementById("singleCloseRounds").value),
+      };
+    }
+    default: {
+      const margin = Number(document.getElementById("calcMargin")?.value || 0);
+      const leverage = Number(document.getElementById("leverage")?.value || 0);
+      const rounds = Math.max(Number(document.getElementById("calcRounds")?.value || 0), 1);
+      const totalNotional = margin * leverage;
+      const notionalPerRound = rounds > 0 ? totalNotional / rounds : 0;
+      const roundQty = latestReferencePrice > 0 ? (notionalPerRound / latestReferencePrice) : 0;
+      return {
+        session_kind: "paired_open",
+        symbol: executionSymbol.value,
+        trend_bias: document.getElementById("trend").value,
+        leverage,
+        round_count: Number(document.getElementById("calcRounds").value),
+        round_qty: roundQty > 0 ? String(roundQty) : null,
+      };
+    }
+  }
+}
+
+function applyPrecheckResult(mode, precheck) {
+  if (!precheck) return;
+  latestPrecheckResultByMode.set(mode, precheck);
+  const derived = precheck.derived || {};
+  if (mode === "paired_open") {
+    syncPairedOpenDerivedPanel(derived);
+  } else if (mode === "single_open") {
+    syncSingleOpenDerivedPanel(derived);
+  }
+  if (mode === executionMode) {
+    refreshDerivedStats({
+      totalNotional: Number(derived.total_notional || 0),
+      perRoundNotional: Number(derived.per_round_notional || 0),
+      estimatedQty: Number(derived.normalized_round_qty || 0),
+      minNotional: Number((derived.min_notional ?? currentSymbolInfo.min_notional) || 0),
+    });
+    document.getElementById("statMode").textContent = formatModeLabel(mode);
+    document.getElementById("statCarryoverQty").textContent = formatNumber(derived.carryover_qty || 0, 6);
+    document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(derived.final_alignment_status);
+  }
+  const failure = firstFailingPrecheckItem(precheck);
+  if (failure) {
+    setHintStateForMode(mode, {
+      canCreate: false,
+      canSimulate: false,
+      tone: "error",
+      message: failure.message || summarizePrecheckMessage(precheck, "参数校验未通过。"),
+    });
+    return;
+  }
+  setHintStateForMode(mode, {
+    canCreate: Boolean(precheck.ok),
+    canSimulate: Boolean(precheck.ok),
+    tone: Boolean(precheck.ok) ? "success" : "",
+    message: buildModeSuccessHint(mode, precheck),
+  });
+}
+
+function shouldSilentlyRefreshMode(mode, trigger) {
+  const snapshot = modeValidationSnapshots.get(mode);
+  if (!snapshot?.precheckResult) return false;
+  return trigger === "price_drift" || trigger === "interval" || trigger === "account_update" || trigger === "mode_switch";
+}
+
+async function runPrecheck(mode = executionMode, trigger = "user_input") {
+  if (precheckPaused || mode !== executionMode) return;
+  const payload = buildPrecheckPayload(mode);
+  if (!canRunPrecheck(mode, payload)) {
+    return;
+  }
+  const requestKey = JSON.stringify({ mode, accountId: currentAccount.id, payload });
+  const paramsKey = buildModeParamsKey(mode);
+  const contextKey = buildModeContextKey(mode);
+  if (inFlightPrecheckPayloadByMode.get(mode) === requestKey) {
+    return;
+  }
+  const currentController = precheckAbortControllersByMode.get(mode);
+  if (currentController) {
+    currentController.abort();
+  }
+  const controller = new AbortController();
+  const validationPrice = Number(getModeValidationPrice(mode) || 0);
+  precheckAbortControllersByMode.set(mode, controller);
+  inFlightPrecheckPayloadByMode.set(mode, requestKey);
+  const token = (latestPrecheckTokensByMode.get(mode) || 0) + 1;
+  latestPrecheckTokensByMode.set(mode, token);
+  const silentRefresh = shouldSilentlyRefreshMode(mode, trigger);
+  if (!silentRefresh) {
+    setHintStateForMode(mode, {
+      canCreate: false,
+      canSimulate: false,
+      tone: "",
+      message: mode === "paired_close" || mode === "single_close" ? "正在校验平仓参数..." : "正在校验开仓参数...",
+    });
+  }
+  try {
+    const precheck = await request("/sessions/precheck", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (controller.signal.aborted || token !== (latestPrecheckTokensByMode.get(mode) || 0) || mode !== executionMode) return;
+    latestResolvedPrecheckPayloadByMode.set(mode, requestKey);
+    applyPrecheckResult(mode, precheck);
+    storeModeValidationSnapshot(mode, paramsKey, precheck, contextKey, validationPrice);
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === "AbortError") {
+      return;
+    }
+    if (token !== (latestPrecheckTokensByMode.get(mode) || 0) || mode !== executionMode) return;
+    latestPrecheckResultByMode.delete(mode);
+    const precheck = error.precheck || null;
+    if (error.validationDetail) {
+      return;
+    }
+    if (precheck) {
+      latestResolvedPrecheckPayloadByMode.set(mode, requestKey);
+      applyPrecheckResult(mode, precheck);
+      storeModeValidationSnapshot(mode, paramsKey, precheck, contextKey, validationPrice);
+      return;
+    }
+    const message = `预检失败： ${String(error)}`;
+    setHintStateForMode(mode, {
+      canCreate: false,
+      canSimulate: false,
+      tone: "error",
+      message,
+    });
+  } finally {
+    if (inFlightPrecheckPayloadByMode.get(mode) === requestKey) {
+      inFlightPrecheckPayloadByMode.delete(mode);
+    }
+    if (precheckAbortControllersByMode.get(mode) === controller) {
+      precheckAbortControllersByMode.delete(mode);
+    }
+  }
+}
+
+function schedulePrecheck(mode = executionMode, delay = 400, trigger = "user_input") {
+  if (precheckPaused) return;
+  const currentTimer = precheckTimersByMode.get(mode);
+  if (currentTimer) {
+    clearTimeout(currentTimer);
+  }
+  const timerId = setTimeout(() => {
+    if (precheckTimersByMode.get(mode) === timerId) {
+      precheckTimersByMode.delete(mode);
+    }
+    if (mode !== executionMode) return;
+    runPrecheck(mode, trigger);
+  }, delay);
+  precheckTimersByMode.set(mode, timerId);
+}
+function setExecutionMode(mode) {
+  executionMode = mode;
+  Object.entries(modeButtons).forEach(([key, button]) => {
+    if (button) button.classList.toggle("active", key === mode);
+  });
+  Object.entries(modePanels).forEach(([key, panel]) => {
+    if (panel) panel.classList.toggle("hidden", key !== mode);
+  });
+  document.getElementById("statMode").textContent = formatModeLabel(mode);
+  const restored = restoreModeValidationSnapshot(mode);
+  if (!restored) {
+    recalculateMode(mode);
+  }
+  maybeScheduleCurrentModePrecheck("mode_switch");
+}
+
+function setActiveSymbol(symbol, syncInput = true) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const symbolChanged = normalizedSymbol !== activeSymbol;
+  activeSymbol = normalizedSymbol;
+  if (symbolChanged) {
+    latestReferencePrice = 0;
+  }
+  document.getElementById("statsSymbol").textContent = activeSymbol;
+  executionSymbol.value = activeSymbol;
+  closeExecutionSymbol.value = activeSymbol;
+  if (singleOpenExecutionSymbol) singleOpenExecutionSymbol.value = activeSymbol;
+  const singleCloseSymbolInput = document.getElementById("singleCloseExecutionSymbol");
+  if (singleCloseSymbolInput) singleCloseSymbolInput.value = activeSymbol;
+  updateSymbolUnits(activeSymbol);
+  if (syncInput) rebuildSymbolOptions(activeSymbol);
+  refreshSingleOpenOrderOptions();
+  refreshSingleClosePositionOptions();
+  if (symbolChanged || !document.getElementById("roundQty")?.value) {
+    recalculateMode(executionMode);
+  }
+  const footerStatus = document.getElementById("footerStatus");
+  footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
+  maybeScheduleCurrentModePrecheck("mode_switch");
+}
+
+function setSymbolInfo(info) {
+  currentSymbolInfo = info || { symbol: activeSymbol, min_notional: 0, allowed: true };
+  symbolInfoReady = Boolean(info);
+  document.getElementById("statMinNotional").textContent = formatNumber(currentSymbolInfo.min_notional || 0, 4);
+  recalculateMode(executionMode);
+  maybeScheduleCurrentModePrecheck("mode_switch");
+}
+
 Object.entries(modeButtons).forEach(([mode, button]) => {
   button.addEventListener("click", () => setExecutionMode(mode));
 });
@@ -1850,58 +2396,58 @@ Object.entries(modeButtons).forEach(([mode, button]) => {
 ["calcMargin", "leverage", "calcRounds"].forEach((id) => {
   document.getElementById(id).addEventListener("input", () => {
     recalculateOpenAmount();
-    schedulePrecheck("paired_open");
+    schedulePrecheck("paired_open", 400, "user_input");
   });
 });
 ["closeQty", "closeRounds"].forEach((id) => {
   document.getElementById(id).addEventListener("input", () => {
     recalculateCloseAmount();
-    schedulePrecheck("paired_close");
+    schedulePrecheck("paired_close", 400, "user_input");
   });
 });
 ["singleOpenQty", "singleOpenRounds", "singleOpenLeverage"].forEach((id) => {
   document.getElementById(id)?.addEventListener("input", () => {
     recalculateSingleOpenAmount();
-    schedulePrecheck("single_open");
+    schedulePrecheck("single_open", 400, "user_input");
   });
 });
 document.getElementById("singleOpenMode")?.addEventListener("change", () => {
   recalculateSingleOpenAmount();
-  schedulePrecheck("single_open");
+  schedulePrecheck("single_open", 400, "user_input");
 });
 document.getElementById("singleOpenOrder")?.addEventListener("change", (event) => {
   syncPositionSideTone(event.target);
   recalculateSingleOpenAmount();
-  schedulePrecheck("single_open");
+  schedulePrecheck("single_open", 400, "user_input");
 });
 ["singleCloseQty", "singleCloseRounds"].forEach((id) => {
   document.getElementById(id)?.addEventListener("input", () => {
     recalculateSingleCloseAmount();
-    schedulePrecheck("single_close");
+    schedulePrecheck("single_close", 400, "user_input");
   });
 });
 document.getElementById("singleCloseMode")?.addEventListener("change", () => {
   recalculateSingleCloseAmount();
-  schedulePrecheck("single_close");
+  schedulePrecheck("single_close", 400, "user_input");
 });
 document.getElementById("singleCloseOrder")?.addEventListener("change", (event) => {
   syncPositionSideTone(event.target);
   recalculateSingleCloseAmount();
-  schedulePrecheck("single_close");
+  schedulePrecheck("single_close", 400, "user_input");
 });
 document.getElementById("trend")?.addEventListener("change", (event) => {
   syncTrendSelectTone(event.target);
-  schedulePrecheck("paired_open");
+  schedulePrecheck("paired_open", 400, "user_input");
 });
 document.getElementById("closeTrend")?.addEventListener("change", (event) => {
   syncTrendSelectTone(event.target);
-  schedulePrecheck("paired_close");
+  schedulePrecheck("paired_close", 400, "user_input");
 });
 
 asksContainer.innerHTML = '<div class="empty-state orderbook-empty">开启连接后加载卖盘</div>';
 bidsContainer.innerHTML = '<div class="empty-state orderbook-empty">开启连接后加载买盘</div>';
 setActiveSymbol(activeSymbol, false);
-renderAccountOverview({ status: "idle", message: "\u5df2\u65ad\u5f00", totals: {}, positions: [], account_id: currentAccount.id, account_name: currentAccount.name });
+renderAccountOverview({ status: "idle", message: "已断开", totals: {}, positions: [], account_id: currentAccount.id, account_name: currentAccount.name });
 updateExecutionStats({
   mode: "paired_open",
   status: "idle",
@@ -1938,15 +2484,9 @@ Promise.allSettled([
     appendLog("error", `加载交易对规则失败： ${String(symbolInfoResult.reason)}`);
   }
 });
-
-
-
-
-
-
-
-
-
+setInterval(() => {
+  maybeScheduleCurrentModePrecheck("interval");
+}, PRECHECK_INTERVAL_MS);
 
 
 
