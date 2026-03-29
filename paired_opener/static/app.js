@@ -1560,10 +1560,7 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
   try {
     const symbolInfo = await refreshSymbolInfo(targetSymbol, { applyState: false });
     temporaryCustomSymbol = symbolInfo.allowed ? null : targetSymbol;
-    setActiveSymbol(targetSymbol, true, { suppressRecalc: true, suppressPrecheck: true });
-    setSymbolInfo(symbolInfo, { suppressRecalc: true, suppressPrecheck: true });
-    recalculateMode(executionMode);
-    maybeScheduleCurrentModePrecheck("mode_switch");
+    applySymbolContext(targetSymbol, symbolInfo, { syncInput: true });
     if (shouldReconnect) {
       openSse();
       await request("/market/connect", {
@@ -1579,10 +1576,7 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
     return true;
   } catch (error) {
     temporaryCustomSymbol = previousTemporaryCustomSymbol;
-    setActiveSymbol(previousSymbol, true, { suppressRecalc: true, suppressPrecheck: true });
-    setSymbolInfo(previousSymbolInfo, { suppressRecalc: true, suppressPrecheck: true });
-    recalculateMode(executionMode);
-    maybeScheduleCurrentModePrecheck("mode_switch");
+    applySymbolContext(previousSymbol, previousSymbolInfo, { syncInput: true });
     appendLog("error", `切换交易对 ${targetSymbol} 失败：${String(error)}`);
     return false;
   }
@@ -1631,8 +1625,10 @@ accountSelect.addEventListener("change", async (event) => {
       body: JSON.stringify({ account_id: nextAccountId })
     });
     setCurrentAccount(payload.account.id, payload.account.name, true);
-    closeSse();
-    openSse();
+    if (shouldReconnect) {
+      closeSse();
+      openSse();
+    }
     try {
       await refreshSymbolInfo(activeSymbol);
       if (shouldReconnect) {
@@ -2106,12 +2102,13 @@ function maybeScheduleCurrentModePrecheck(trigger = "price_tick") {
     decision.reason === "no_price_baseline" ||
     decision.reason === "price_drift" ||
     decision.reason === "interval_elapsed" ||
-    decision.reason === "context_interval";
+    decision.reason === "context_interval" ||
+    decision.reason === "context_stale";
   if (shouldRun) {
     const scheduleTrigger =
       decision.reason === "price_drift"
         ? "price_drift"
-        : decision.reason === "context_interval"
+        : decision.reason === "context_interval" || decision.reason === "context_stale"
           ? "account_update"
           : decision.reason === "interval_elapsed"
             ? "interval"
@@ -2340,6 +2337,33 @@ function schedulePrecheck(mode = executionMode, delay = 400, trigger = "user_inp
   }, delay);
   precheckTimersByMode.set(mode, timerId);
 }
+function applySymbolContext(symbol, info, options = {}) {
+  const { syncInput = true } = options;
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const symbolChanged = normalizedSymbol !== activeSymbol;
+  activeSymbol = normalizedSymbol;
+  currentSymbolInfo = info || { symbol: normalizedSymbol, min_notional: 0, allowed: true };
+  symbolInfoReady = Boolean(info);
+  if (symbolChanged) {
+    latestReferencePrice = 0;
+  }
+  document.getElementById("statsSymbol").textContent = activeSymbol;
+  executionSymbol.value = activeSymbol;
+  closeExecutionSymbol.value = activeSymbol;
+  if (singleOpenExecutionSymbol) singleOpenExecutionSymbol.value = activeSymbol;
+  const singleCloseSymbolInput = document.getElementById("singleCloseExecutionSymbol");
+  if (singleCloseSymbolInput) singleCloseSymbolInput.value = activeSymbol;
+  document.getElementById("statMinNotional").textContent = formatNumber(currentSymbolInfo.min_notional || 0, 4);
+  updateSymbolUnits(activeSymbol);
+  if (syncInput) rebuildSymbolOptions(activeSymbol);
+  refreshSingleOpenOrderOptions();
+  refreshSingleClosePositionOptions();
+  recalculateMode(executionMode);
+  const footerStatus = document.getElementById("footerStatus");
+  footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
+  maybeScheduleCurrentModePrecheck("mode_switch");
+}
+
 function setExecutionMode(mode) {
   executionMode = mode;
   Object.entries(modeButtons).forEach(([key, button]) => {
@@ -2495,6 +2519,11 @@ Promise.allSettled([
 setInterval(() => {
   maybeScheduleCurrentModePrecheck("interval");
 }, PRECHECK_INTERVAL_MS);
+
+
+
+
+
 
 
 

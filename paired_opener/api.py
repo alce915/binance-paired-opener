@@ -28,7 +28,7 @@ from paired_opener.schemas import (
     SessionPrecheckResponse,
     SessionSummary,
     SessionUpdatesResponse,
-    SimulationRequest,
+    SimulationRunRequest,
     SingleCloseSessionRequest,
     SingleOpenSessionRequest,
     SymbolInfoResponse,
@@ -138,15 +138,22 @@ async def disconnect_market() -> dict:
 
 
 @app.post('/simulation/run')
-async def run_simulation(request: SimulationRequest) -> dict:
+async def run_simulation(request: SimulationRunRequest) -> dict:
     market = current_runtime(app).market
     try:
         return await market.run_simulation(
+            session_kind=request.session_kind,
             symbol=request.symbol,
             trend_bias=request.trend_bias,
+            open_mode=request.open_mode,
+            close_mode=request.close_mode,
+            selected_position_side=request.selected_position_side,
             open_amount=request.open_amount,
+            open_qty=request.open_qty,
+            close_qty=request.close_qty,
             leverage=request.leverage,
             round_count=request.round_count,
+            round_interval_seconds=request.round_interval_seconds,
         )
     except Exception as exc:
         _raise_api_error(exc, code='trading_request_failed', source='service')
@@ -333,5 +340,6 @@ async def get_symbol_info(symbol: str) -> SymbolInfoResponse:
     except Exception as exc:
         _raise_api_error(exc, code='trading_request_failed', source='service')
     return SymbolInfoResponse.model_validate(payload)
+
 
 

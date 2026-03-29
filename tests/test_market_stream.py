@@ -1,14 +1,17 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
-from paired_opener.domain import Quote, SymbolRules, TrendBias
+from paired_opener.domain import PositionSide, Quote, SessionKind, SingleCloseMode, SingleOpenMode, SymbolRules, TrendBias
+from paired_opener import api as api_module
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.market_stream import MarketStreamController
+from paired_opener.schemas import SimulationRunRequest
 
 
 class SlowGateway(ExchangeGateway):
@@ -245,3 +248,151 @@ async def test_refresh_account_overview_normalizes_mark_and_liquidation_prices()
     assert message["data"]["positions"][1]["liquidation_price"] == "0"
 
     controller.unsubscribe(queue)
+
+
+class SimulationGateway(SlowGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release.set()
+        self.available_balance = Decimal("900")
+        self.positions: list[dict[str, object]] = []
+        self.open_orders: list[dict[str, object]] = []
+
+    async def get_order_book(self, symbol: str, limit: int = 10) -> dict:
+        return {
+            "symbol": symbol,
+            "bids": [{"price": Decimal("100"), "qty": Decimal("1")}],
+            "asks": [{"price": Decimal("101"), "qty": Decimal("1")}],
+            "event_time": datetime.now(UTC),
+        }
+
+    async def get_account_overview(self) -> dict:
+        return {
+            "status": "ok",
+            "totals": {"available_balance": self.available_balance},
+            "positions": list(self.positions),
+            "updated_at": datetime.now(UTC),
+        }
+
+    async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+        return list(self.open_orders)
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_paired_close_blocks_qty_above_max_closeable() -> None:
+    gateway = SimulationGateway()
+    gateway.positions = [
+        {"symbol": "BTCUSDT", "position_side": "LONG", "qty": Decimal("0.200"), "leverage": 20},
+        {"symbol": "BTCUSDT", "position_side": "SHORT", "qty": Decimal("0.100"), "leverage": 20},
+    ]
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.PAIRED_CLOSE,
+        symbol="BTCUSDT",
+        trend_bias=TrendBias.LONG,
+        close_qty=Decimal("0.150"),
+        round_count=1,
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["session_kind"] == SessionKind.PAIRED_CLOSE.value
+    assert "超过当前可双向平仓数量" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_single_open_align_uses_smaller_side_difference() -> None:
+    gateway = SimulationGateway()
+    gateway.positions = [
+        {"symbol": "BTCUSDT", "position_side": "LONG", "qty": Decimal("0.100"), "leverage": 25},
+        {"symbol": "BTCUSDT", "position_side": "SHORT", "qty": Decimal("0.300"), "leverage": 25},
+    ]
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_OPEN,
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.ALIGN,
+        open_qty=Decimal("0.001"),
+        leverage=25,
+        round_count=2,
+        round_interval_seconds=0,
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["session_kind"] == SessionKind.SINGLE_OPEN.value
+    assert payload["selected_position_side"] == PositionSide.LONG.value
+    assert Decimal(payload["total_notional"]) > Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_single_close_without_positions_returns_blocked() -> None:
+    gateway = SimulationGateway()
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_CLOSE,
+        symbol="BTCUSDT",
+        close_mode=SingleCloseMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        close_qty=Decimal("0.010"),
+        round_count=1,
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["session_kind"] == SessionKind.SINGLE_CLOSE.value
+    assert payload["message"] == "当前交易对不存在持仓"
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_single_close_align_uses_larger_side_difference() -> None:
+    gateway = SimulationGateway()
+    gateway.positions = [
+        {"symbol": "BTCUSDT", "position_side": "LONG", "qty": Decimal("0.300"), "leverage": 15},
+        {"symbol": "BTCUSDT", "position_side": "SHORT", "qty": Decimal("0.100"), "leverage": 15},
+    ]
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_CLOSE,
+        symbol="BTCUSDT",
+        close_mode=SingleCloseMode.ALIGN,
+        close_qty=Decimal("0.001"),
+        round_count=2,
+        round_interval_seconds=0,
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["session_kind"] == SessionKind.SINGLE_CLOSE.value
+    assert payload["selected_position_side"] == PositionSide.LONG.value
+    assert Decimal(payload["total_notional"]) > Decimal("0")
+
+
+
+@pytest.mark.asyncio
+async def test_api_run_simulation_smoke_for_single_open(monkeypatch) -> None:
+    gateway = SimulationGateway()
+    gateway.positions = [
+        {"symbol": "BTCUSDT", "position_side": "LONG", "qty": Decimal("0.100"), "leverage": 25},
+        {"symbol": "BTCUSDT", "position_side": "SHORT", "qty": Decimal("0.300"), "leverage": 25},
+    ]
+    controller = MarketStreamController(gateway)
+    runtime = SimpleNamespace(market=controller)
+    monkeypatch.setattr(api_module, "current_runtime", lambda _app: runtime)
+
+    payload = await api_module.run_simulation(
+        SimulationRunRequest(
+            session_kind=SessionKind.SINGLE_OPEN,
+            symbol="BTCUSDT",
+            open_mode=SingleOpenMode.ALIGN,
+            open_qty=Decimal("0.001"),
+            leverage=25,
+            round_count=2,
+            round_interval_seconds=0,
+        )
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["session_kind"] == SessionKind.SINGLE_OPEN.value
+    assert payload["selected_position_side"] == PositionSide.LONG.value
+

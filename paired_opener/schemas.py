@@ -88,13 +88,22 @@ class MarketConnectRequest(BaseModel):
     symbol: str = Field(default="BTCUSDT")
 
 
-class SimulationRequest(BaseModel):
+class SimulationRunRequest(BaseModel):
+    session_kind: SessionKind = SessionKind.PAIRED_OPEN
     symbol: str = Field(default="BTCUSDT")
-    trend_bias: TrendBias = TrendBias.LONG
-    open_amount: Decimal = Field(..., gt=0)
-    leverage: int = Field(..., ge=1, le=125)
+    trend_bias: TrendBias | None = None
+    open_mode: SingleOpenMode | None = None
+    close_mode: SingleCloseMode | None = None
+    selected_position_side: PositionSide | None = None
+    open_amount: Decimal | None = Field(default=None, gt=0)
+    open_qty: Decimal | None = Field(default=None, gt=0)
+    close_qty: Decimal | None = Field(default=None, gt=0)
+    leverage: int | None = Field(default=None, ge=1, le=125)
     round_count: int = Field(..., ge=1, le=10_000)
+    round_interval_seconds: int | None = Field(default=3, ge=0, le=3600)
 
+
+SimulationRequest = SimulationRunRequest
 
 class PrecheckItem(BaseModel):
     code: str
@@ -222,4 +231,5 @@ class AccountSelectRequest(BaseModel):
 
 class AccountSelectResponse(BaseModel):
     account: AccountSummary
+
 
