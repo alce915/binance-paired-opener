@@ -396,3 +396,19 @@ async def test_api_run_simulation_smoke_for_single_open(monkeypatch) -> None:
     assert payload["session_kind"] == SessionKind.SINGLE_OPEN.value
     assert payload["selected_position_side"] == PositionSide.LONG.value
 
+
+
+
+@pytest.mark.asyncio
+async def test_refresh_account_overview_includes_open_order_counts() -> None:
+    gateway = SimulationGateway()
+    gateway.open_orders = [
+        {"clientOrderId": "123e4567-e89b-12d3-a456-426614174000-order"},
+        {"clientOrderId": "manual-order"},
+    ]
+    controller = MarketStreamController(gateway)
+    await controller._refresh_account_overview()
+
+    assert controller._account_overview["symbol"] == "BTCUSDT"
+    assert controller._account_overview["system_open_order_count"] == 1
+    assert controller._account_overview["manual_open_order_count"] == 1

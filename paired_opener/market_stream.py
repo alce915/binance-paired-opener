@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -10,6 +11,8 @@ from paired_opener.config import Settings
 from paired_opener.domain import PositionSide, SessionKind, SingleCloseMode, SingleOpenMode, TrendBias
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.rounding import normalize_price, normalize_qty, validate_qty_and_notional
+
+SYSTEM_ORDER_ID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-', re.IGNORECASE)
 
 
 class MarketStreamController:
@@ -45,10 +48,13 @@ class MarketStreamController:
         }
         self._account_overview = {
             "status": "idle",
+            "symbol": "BTCUSDT",
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
             "message": "idle",
+            "system_open_order_count": 0,
+            "manual_open_order_count": 0,
             "totals": {
                 "equity": "0",
                 "margin": "0",
@@ -143,6 +149,7 @@ class MarketStreamController:
             self._account_overview = {
                 **self._account_overview,
                 "status": "loading",
+                "symbol": symbol,
                 "updated_at": self._utc_now(),
                 "message": f"正在加载 {symbol} 账户概览",
             }
@@ -195,6 +202,7 @@ class MarketStreamController:
         }
         self._account_overview = {
             **self._account_overview,
+            "symbol": symbol,
             "status": "idle",
             "updated_at": self._utc_now(),
             "message": "已断开",
@@ -220,13 +228,26 @@ class MarketStreamController:
         await asyncio.gather(*active_tasks, return_exceptions=True)
 
     async def _refresh_account_overview(self) -> None:
+        symbol = str(self._state.get("symbol") or self._account_overview.get("symbol") or "BTCUSDT").upper()
         try:
             overview = await self._gateway.get_account_overview()
+            open_orders = await self._gateway.get_open_orders(symbol)
+            system_open_order_count = 0
+            manual_open_order_count = 0
+            for order in open_orders:
+                client_order_id = str(order.get("clientOrderId") or "")
+                if SYSTEM_ORDER_ID_RE.match(client_order_id):
+                    system_open_order_count += 1
+                else:
+                    manual_open_order_count += 1
             overview = {
                 **overview,
                 "status": "ok",
                 "account_id": self._account_id,
                 "account_name": self._account_name,
+                "symbol": symbol,
+                "system_open_order_count": system_open_order_count,
+                "manual_open_order_count": manual_open_order_count,
                 "updated_at": self._utc_now(),
                 "message": "账户概览已同步",
             }
@@ -247,6 +268,7 @@ class MarketStreamController:
             self._account_overview = {
                 **self._account_overview,
                 "status": "error",
+                "symbol": symbol,
                 "updated_at": self._utc_now(),
                 "message": error_message,
             }
@@ -1016,4 +1038,6 @@ class MarketStreamController:
 
 def format_sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 

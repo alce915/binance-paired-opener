@@ -43,6 +43,7 @@ let temporaryCustomSymbol = null;
 let latestReferencePrice = 0;
 let latestAvailableBalance = null;
 let currentPositions = [];
+const latestOpenOrderCountsBySymbol = new Map();
 let currentSymbolInfo = { symbol: activeSymbol, min_notional: 0, allowed: true };
 let symbolInfoReady = false;
 let precheckTimer = null;
@@ -302,122 +303,27 @@ function canRunPrecheck(mode, payload) {
 }
 
 function __legacyApplyPrecheckResult(mode, precheck) {
-  if (!precheck) return;
-  latestPrecheckResultByMode.set(mode, precheck);
-  const derived = precheck.derived || {};
-  if (mode === "paired_open") {
-    syncPairedOpenDerivedPanel(derived);
-  } else if (mode === "single_open") {
-    syncSingleOpenDerivedPanel(derived);
-  }
-  if (mode === executionMode) {
-    refreshDerivedStats({
-      totalNotional: Number(derived.total_notional || 0),
-      perRoundNotional: Number(derived.per_round_notional || 0),
-      estimatedQty: Number(derived.normalized_round_qty || 0),
-      minNotional: Number((derived.min_notional ?? currentSymbolInfo.min_notional) || 0),
-    });
-    document.getElementById("statMode").textContent = formatModeLabel(mode);
-    document.getElementById("statCarryoverQty").textContent = formatNumber(derived.carryover_qty || 0, 6);
-    document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(derived.final_alignment_status);
-  }
-  const failure = firstFailingPrecheckItem(precheck);
-  if (failure) {
-    setHintStateForMode(mode, {
-      canCreate: false,
-      canSimulate: false,
-      tone: "error",
-      message: failure.message || summarizePrecheckMessage(precheck, "参数校验未通过。"),
-    });
-    return;
-  }
-  setHintStateForMode(mode, {
-    canCreate: Boolean(precheck.ok),
-    canSimulate: Boolean(precheck.ok),
-    tone: Boolean(precheck.ok) ? "success" : "",
-    message: buildModeSuccessHint(mode, precheck),
-  });
+  return applyPrecheckResult(mode, precheck);
 }
+
 async function __legacyRunPrecheck(mode = executionMode, trigger = "user_input") {
-  if (precheckPaused) return;
-  const payload = buildPrecheckPayload(mode);
-  if (!canRunPrecheck(mode, payload)) {
-    return;
-  }
-  const payloadKey = JSON.stringify({ mode, accountId: currentAccount.id, payload });
-  if (latestResolvedPrecheckPayloadByMode.get(mode) === payloadKey) {
-    const cachedPrecheck = latestPrecheckResultByMode.get(mode);
-    if (cachedPrecheck) {
-      applyPrecheckResult(mode, cachedPrecheck);
-      return;
-    }
-  }
-  if (inFlightPrecheckPayloadByMode.get(mode) === payloadKey) {
-    return;
-  }
-  if (precheckAbortController) {
-    precheckAbortController.abort();
-  }
-  const controller = new AbortController();
-  precheckAbortController = controller;
-  inFlightPrecheckPayloadByMode.set(mode, payloadKey);
-  const token = ++latestPrecheckToken;
-  setHintStateForMode(mode, {
-    canCreate: false,
-    canSimulate: false,
-    tone: "",
-    message: mode === "paired_close" || mode === "single_close" ? "正在校验平仓参数..." : "正在校验开仓参数...",
-  });
-  try {
-    const precheck = await request("/sessions/precheck", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    if (controller.signal.aborted || token !== latestPrecheckToken) return;
-    latestResolvedPrecheckPayloadByMode.set(mode, payloadKey);
-    applyPrecheckResult(mode, precheck);
-  } catch (error) {
-    if (controller.signal.aborted || error?.name === "AbortError") {
-      return;
-    }
-    if (token !== latestPrecheckToken) return;
-    latestPrecheckResultByMode.delete(mode);
-    const precheck = error.precheck || null;
-    if (error.validationDetail) {
-      return;
-    }
-    if (precheck) {
-      latestResolvedPrecheckPayloadByMode.set(mode, payloadKey);
-      applyPrecheckResult(mode, precheck);
-      return;
-    }
-    const message = `Precheck 失败： ${String(error)}`;
-    setHintStateForMode(mode, {
-      canCreate: false,
-      canSimulate: false,
-      tone: "error",
-      message,
-    });
-  } finally {
-    if (inFlightPrecheckPayloadByMode.get(mode) === payloadKey) {
-      inFlightPrecheckPayloadByMode.delete(mode);
-    }
-    if (precheckAbortController === controller) {
-      precheckAbortController = null;
-    }
-  }
+  return runPrecheck(mode, trigger);
 }
+
 function __legacySchedulePrecheck(mode = executionMode, delay = 400, trigger = "user_input") {
-  if (precheckPaused) return;
-  if (precheckTimer) {
-    clearTimeout(precheckTimer);
-  }
-  precheckTimer = setTimeout(() => {
-    precheckTimer = null;
-    runPrecheck(mode);
-  }, delay);
+  return schedulePrecheck(mode, delay, trigger);
+}
+
+function __legacySetExecutionMode(mode) {
+  return setExecutionMode(mode);
+}
+
+function __legacySetActiveSymbol(symbol, syncInput = true) {
+  return setActiveSymbol(symbol, syncInput);
+}
+
+function __legacySetSymbolInfo(info) {
+  return setSymbolInfo(info);
 }
 
 function setPrecheckPaused(paused) {
@@ -1625,10 +1531,6 @@ accountSelect.addEventListener("change", async (event) => {
       body: JSON.stringify({ account_id: nextAccountId })
     });
     setCurrentAccount(payload.account.id, payload.account.name, true);
-    if (shouldReconnect) {
-      closeSse();
-      openSse();
-    }
     try {
       await refreshSymbolInfo(activeSymbol);
       if (shouldReconnect) {
@@ -1637,7 +1539,10 @@ accountSelect.addEventListener("change", async (event) => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ symbol: activeSymbol })
         });
+        closeSse();
+        openSse();
       } else {
+        closeSse();
         setConnectionState({
           connected: false,
           status: "disconnected",
@@ -1891,10 +1796,13 @@ function buildModeContextKey(mode = executionMode) {
         : normalizeSymbol(executionSymbol.value || activeSymbol);
   const longQty = Number(positionQty(symbol, "LONG") || 0);
   const shortQty = Number(positionQty(symbol, "SHORT") || 0);
+  const openOrderCounts = latestOpenOrderCountsBySymbol.get(symbol) || { system: 0, manual: 0 };
   const baseContext = {
     mode: currentMode,
     accountId: currentAccount.id,
     symbol,
+    system_open_order_count: Number(openOrderCounts.system || 0),
+    manual_open_order_count: Number(openOrderCounts.manual || 0),
   };
   if (currentMode === "paired_open" || currentMode === "single_open") {
     return JSON.stringify({
@@ -2103,13 +2011,15 @@ function maybeScheduleCurrentModePrecheck(trigger = "price_tick") {
     decision.reason === "price_drift" ||
     decision.reason === "interval_elapsed" ||
     decision.reason === "context_interval" ||
-    decision.reason === "context_stale";
+    (decision.reason === "context_stale" && trigger === "mode_switch");
   if (shouldRun) {
     const scheduleTrigger =
       decision.reason === "price_drift"
         ? "price_drift"
-        : decision.reason === "context_interval" || decision.reason === "context_stale"
+        : decision.reason === "context_interval"
           ? "account_update"
+          : decision.reason === "context_stale"
+            ? "mode_switch"
           : decision.reason === "interval_elapsed"
             ? "interval"
             : trigger;
@@ -2519,6 +2429,9 @@ Promise.allSettled([
 setInterval(() => {
   maybeScheduleCurrentModePrecheck("interval");
 }, PRECHECK_INTERVAL_MS);
+
+
+
 
 
 
