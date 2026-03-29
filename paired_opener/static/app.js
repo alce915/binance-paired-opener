@@ -1560,8 +1560,10 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
   try {
     const symbolInfo = await refreshSymbolInfo(targetSymbol, { applyState: false });
     temporaryCustomSymbol = symbolInfo.allowed ? null : targetSymbol;
-    setActiveSymbol(targetSymbol, true);
-    setSymbolInfo(symbolInfo);
+    setActiveSymbol(targetSymbol, true, { suppressRecalc: true, suppressPrecheck: true });
+    setSymbolInfo(symbolInfo, { suppressRecalc: true, suppressPrecheck: true });
+    recalculateMode(executionMode);
+    maybeScheduleCurrentModePrecheck("mode_switch");
     if (shouldReconnect) {
       openSse();
       await request("/market/connect", {
@@ -1577,8 +1579,10 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
     return true;
   } catch (error) {
     temporaryCustomSymbol = previousTemporaryCustomSymbol;
-    setActiveSymbol(previousSymbol, true);
-    setSymbolInfo(previousSymbolInfo);
+    setActiveSymbol(previousSymbol, true, { suppressRecalc: true, suppressPrecheck: true });
+    setSymbolInfo(previousSymbolInfo, { suppressRecalc: true, suppressPrecheck: true });
+    recalculateMode(executionMode);
+    maybeScheduleCurrentModePrecheck("mode_switch");
     appendLog("error", `切换交易对 ${targetSymbol} 失败：${String(error)}`);
     return false;
   }
@@ -2352,7 +2356,8 @@ function setExecutionMode(mode) {
   maybeScheduleCurrentModePrecheck("mode_switch");
 }
 
-function setActiveSymbol(symbol, syncInput = true) {
+function setActiveSymbol(symbol, syncInput = true, options = {}) {
+  const { suppressRecalc = false, suppressPrecheck = false } = options;
   const normalizedSymbol = normalizeSymbol(symbol);
   const symbolChanged = normalizedSymbol !== activeSymbol;
   activeSymbol = normalizedSymbol;
@@ -2369,20 +2374,27 @@ function setActiveSymbol(symbol, syncInput = true) {
   if (syncInput) rebuildSymbolOptions(activeSymbol);
   refreshSingleOpenOrderOptions();
   refreshSingleClosePositionOptions();
-  if (symbolChanged || !document.getElementById("roundQty")?.value) {
+  if (!suppressRecalc && (symbolChanged || !document.getElementById("roundQty")?.value)) {
     recalculateMode(executionMode);
   }
   const footerStatus = document.getElementById("footerStatus");
   footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
-  maybeScheduleCurrentModePrecheck("mode_switch");
+  if (!suppressPrecheck) {
+    maybeScheduleCurrentModePrecheck("mode_switch");
+  }
 }
 
-function setSymbolInfo(info) {
+function setSymbolInfo(info, options = {}) {
+  const { suppressRecalc = false, suppressPrecheck = false } = options;
   currentSymbolInfo = info || { symbol: activeSymbol, min_notional: 0, allowed: true };
   symbolInfoReady = Boolean(info);
   document.getElementById("statMinNotional").textContent = formatNumber(currentSymbolInfo.min_notional || 0, 4);
-  recalculateMode(executionMode);
-  maybeScheduleCurrentModePrecheck("mode_switch");
+  if (!suppressRecalc) {
+    recalculateMode(executionMode);
+  }
+  if (!suppressPrecheck) {
+    maybeScheduleCurrentModePrecheck("mode_switch");
+  }
 }
 
 Object.entries(modeButtons).forEach(([mode, button]) => {
@@ -2483,4 +2495,7 @@ Promise.allSettled([
 setInterval(() => {
   maybeScheduleCurrentModePrecheck("interval");
 }, PRECHECK_INTERVAL_MS);
+
+
+
 
