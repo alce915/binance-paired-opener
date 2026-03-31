@@ -110,7 +110,7 @@ class MarketStreamController:
         if self._disconnect_task is not None and not self._disconnect_task.done():
             self._disconnect_task.cancel()
         self._disconnect_task = None
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=self._settings.sse_queue_maxsize)
         self._subscribers.add(queue)
         await queue.put({"event": "connection_status", "data": self._normalize(self._state)})
         await queue.put({"event": "account_overview", "data": self._normalize(self._account_overview)})

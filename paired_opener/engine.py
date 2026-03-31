@@ -60,10 +60,27 @@ class PairedOpeningEngine:
         self._sleep = sleep_func or asyncio.sleep
         self._monotonic = monotonic_func or time.monotonic
 
-    async def execute_session(self, session: OpenSession, control: SessionControl) -> tuple[int, int]:
+    def _resume_round_progress(self, session: OpenSession) -> tuple[int, int, int]:
         completed_rounds = 0
         skipped_rounds = 0
-        for round_index in range(1, session.spec.round_count + 1):
+        next_round_index = 1
+        for round_payload in self._repository.list_rounds(session.session_id):
+            round_index = int(round_payload.get("round_index") or 0)
+            status_value = str(round_payload.get("status") or "")
+            if status_value == RoundStatus.ROUND_COMPLETED.value:
+                completed_rounds += 1
+            elif status_value == RoundStatus.STAGE1_SKIPPED.value:
+                skipped_rounds += 1
+            elif status_value:
+                raise ExchangeStateError(
+                    f"Session {session.session_id} has non-terminal persisted round {round_index}: {status_value}"
+                )
+            next_round_index = max(next_round_index, round_index + 1)
+        return next_round_index, completed_rounds, skipped_rounds
+
+    async def execute_session(self, session: OpenSession, control: SessionControl) -> tuple[int, int]:
+        next_round_index, completed_rounds, skipped_rounds = self._resume_round_progress(session)
+        for round_index in range(next_round_index, session.spec.round_count + 1):
             await self._respect_control(control)
             execution = await self.execute_round(session=session, round_index=round_index, control=control)
             self._repository.update_session_runtime(session)
@@ -681,9 +698,8 @@ class PairedOpeningEngine:
 
 class SingleOpeningEngine(PairedOpeningEngine):
     async def execute_session(self, session: OpenSession, control: SessionControl) -> tuple[int, int]:
-        completed_rounds = 0
-        skipped_rounds = 0
-        for round_index in range(1, session.spec.round_count + 1):
+        next_round_index, completed_rounds, skipped_rounds = self._resume_round_progress(session)
+        for round_index in range(next_round_index, session.spec.round_count + 1):
             await self._respect_control(control)
             execution = await self.execute_round(session=session, round_index=round_index, control=control)
             self._repository.update_session_runtime(session)
@@ -927,12 +943,12 @@ class SingleOpeningEngine(PairedOpeningEngine):
 
 class SingleClosingEngine(PairedOpeningEngine):
     async def execute_session(self, session: OpenSession, control: SessionControl) -> tuple[int, int]:
-        completed_rounds = 0
-        skipped_rounds = 0
-        session.stage2_carryover_qty = Decimal("0")
-        session.final_unaligned_qty = Decimal("0")
-        session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
-        for round_index in range(1, session.spec.round_count + 1):
+        next_round_index, completed_rounds, skipped_rounds = self._resume_round_progress(session)
+        if next_round_index <= 1:
+            session.stage2_carryover_qty = Decimal("0")
+            session.final_unaligned_qty = Decimal("0")
+            session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
+        for round_index in range(next_round_index, session.spec.round_count + 1):
             await self._respect_control(control)
             execution = await self.execute_round(session=session, round_index=round_index, control=control)
             self._repository.update_session_runtime(session)
@@ -1181,12 +1197,12 @@ class SingleClosingEngine(PairedOpeningEngine):
         return OrderSide.BUY, lambda quote: quote.ask_price
 class PairedClosingEngine(PairedOpeningEngine):
     async def execute_session(self, session: OpenSession, control: SessionControl) -> tuple[int, int]:
-        completed_rounds = 0
-        skipped_rounds = 0
-        session.stage2_carryover_qty = Decimal("0")
-        session.final_unaligned_qty = Decimal("0")
-        session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
-        for round_index in range(1, session.spec.round_count + 1):
+        next_round_index, completed_rounds, skipped_rounds = self._resume_round_progress(session)
+        if next_round_index <= 1:
+            session.stage2_carryover_qty = Decimal("0")
+            session.final_unaligned_qty = Decimal("0")
+            session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
+        for round_index in range(next_round_index, session.spec.round_count + 1):
             await self._respect_control(control)
             execution = await self.execute_round(session=session, round_index=round_index, control=control)
             self._repository.update_session_runtime(session)

@@ -412,3 +412,14 @@ async def test_refresh_account_overview_includes_open_order_counts() -> None:
     assert controller._account_overview["symbol"] == "BTCUSDT"
     assert controller._account_overview["system_open_order_count"] == 1
     assert controller._account_overview["manual_open_order_count"] == 1
+
+@pytest.mark.asyncio
+async def test_subscribe_uses_configured_sse_queue_maxsize() -> None:
+    gateway = SlowGateway()
+    settings = api_module.Settings(_env_file=None, sse_queue_maxsize=7)
+    controller = MarketStreamController(gateway, settings=settings)
+
+    queue = await controller.subscribe()
+
+    assert queue.maxsize == 7
+    controller.unsubscribe(queue)

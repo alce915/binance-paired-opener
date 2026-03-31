@@ -1,10 +1,11 @@
 ﻿$ErrorActionPreference = 'Stop'
 
 $projectRoot = 'D:\codex\币安自动开单系统'
-$venvPython = 'D:\codex\币安自动开单系统\.venv\Scripts\python.exe'
+$systemPython = 'C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe'
 $hostAddress = '127.0.0.1'
 $port = 8000
 $runtimeLog = Join-Path $projectRoot 'api.runtime.log'
+$pythonPathValue = "$projectRoot;$projectRoot\.venv\Lib\site-packages"
 
 Set-Location $projectRoot
 
@@ -22,12 +23,11 @@ foreach ($connection in $connections) {
     }
 }
 
-if (Test-Path $runtimeLog) {
-    Remove-Item $runtimeLog -Force -ErrorAction SilentlyContinue
-}
+$env:PYTHONPATH = $pythonPathValue
+& $systemPython -m paired_opener.log_retention --file $runtimeLog
 
-$childCommand = "Set-Location '$projectRoot'; & '$venvPython' -m uvicorn paired_opener.api:app --host $hostAddress --port $port *>> '$runtimeLog'"
-Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command',$childCommand -WindowStyle Hidden | Out-Null
+$cmdArgs = ('/c set PYTHONPATH={0}&& cd /d "{1}"&& "{2}" -m uvicorn paired_opener.api:app --host {3} --port {4} >> "{5}" 2>&1' -f $pythonPathValue, $projectRoot, $systemPython, $hostAddress, $port, $runtimeLog)
+Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdArgs -WindowStyle Hidden | Out-Null
 
 $deadline = (Get-Date).AddSeconds(20)
 $started = $false

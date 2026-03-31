@@ -11,14 +11,20 @@ from paired_opener.config import Settings
 from paired_opener.domain import (
     ExchangeOrder,
     ExchangeOrderStatus,
+    ExchangeStateError,
     FinalAlignmentStatus,
     OpenSession,
     OrderSide,
     PositionSide,
     Quote,
+    RecoveryStatus,
+    RoundExecution,
+    RoundStatus,
     SessionAbortedError,
+    SessionKind,
     SessionSpec,
     SessionStatus,
+    SingleCloseMode,
     SymbolRules,
     TrendBias,
 )
@@ -28,7 +34,6 @@ from paired_opener.exchange import ExchangeGateway
 from paired_opener.service import ManagedSession, OpenSessionService
 from paired_opener.schemas import CloseSessionRequest, OpenSessionRequest, SessionPrecheckRequest, SingleCloseSessionRequest, SingleOpenSessionRequest
 from paired_opener.storage import SqliteRepository
-
 
 class SimpleGateway(ExchangeGateway):
     def __init__(self) -> None:
@@ -363,7 +368,8 @@ def test_repository_persists_round_interval_seconds(tmp_path: Path) -> None:
     assert payload["round_interval_seconds"] == 7
 
 
-def test_service_marks_incomplete_sessions_exception_on_startup(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_service_marks_incomplete_sessions_exception_on_startup(tmp_path: Path) -> None:
     repository = SqliteRepository(tmp_path / "restart.db")
     session = OpenSession.create(
         SessionSpec(
@@ -371,7 +377,7 @@ def test_service_marks_incomplete_sessions_exception_on_startup(tmp_path: Path) 
             trend_bias=TrendBias.LONG,
             leverage=50,
             round_count=1,
-            round_qty=Decimal("0.010"),
+            round_qty=Decimal("0.100"),
             poll_interval_ms=50,
             order_ttl_ms=3000,
             max_zero_fill_retries=2,
@@ -383,12 +389,16 @@ def test_service_marks_incomplete_sessions_exception_on_startup(tmp_path: Path) 
     repository.create_session(session)
     repository.update_session_status(session.session_id, SessionStatus.RUNNING)
 
-    service = OpenSessionService(Settings(_env_file=None), repository, SimpleGateway(), object())
+    gateway = SimpleGateway()
+    service = OpenSessionService(Settings(_env_file=None), repository, gateway, PairedOpeningEngine(gateway, repository))
+    results = await service.evaluate_startup_recovery()
     payload = service.get_session(session.session_id)
 
+    assert len(results) == 1
     assert payload["status"] == SessionStatus.EXCEPTION.value
     assert payload["last_error"] == "Service restarted before session completion"
-    assert any(event["event_type"] == "session_recovered_on_startup" for event in payload["events"])
+    assert payload["recovery_status"] == RecoveryStatus.RECOVERABLE
+    assert any(event["event_type"] == "session_recovery_evaluated" for event in payload["events"])
 
 
 @pytest.mark.asyncio
@@ -1028,4 +1038,229 @@ async def test_strict_precheck_fails_when_hedge_mode_confirmation_also_fails(tmp
     assert "执行链路确认失败" in failure["message"]
 
 
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_marks_recoverable_session_and_persists_summary(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "startup-recovery-recoverable.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=2,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.PAIRED_OPEN,
+        )
+    )
+    repository.create_session(session)
+
+    results = await service.evaluate_startup_recovery()
+    payload = repository.get_session(session.session_id)
+
+    assert len(results) == 1
+    assert payload is not None
+    assert payload["status"] == SessionStatus.EXCEPTION.value
+    assert payload["recovery_status"] == RecoveryStatus.RECOVERABLE
+    assert payload["recovery_summary"]
+    assert any(event["event_type"] == "session_recovery_evaluated" for event in payload["events"])
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_marks_manual_confirmation_when_session_order_still_open(tmp_path: Path) -> None:
+    class ActiveSessionOrderGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.session_id = ""
+
+        async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "orderId": "open-1",
+                    "clientOrderId": f"{self.session_id}-1-stage1-1",
+                    "status": "NEW",
+                }
+            ]
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "startup-recovery-manual.db")
+    gateway = ActiveSessionOrderGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.PAIRED_OPEN,
+        )
+    )
+    gateway.session_id = session.session_id
+    repository.create_session(session)
+
+    await service.evaluate_startup_recovery()
+    payload = repository.get_session(session.session_id)
+
+    assert payload is not None
+    assert payload["recovery_status"] == RecoveryStatus.MANUAL_CONFIRMATION
+    assert "系统挂单" in str(payload["recovery_summary"])
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_marks_non_recoverable_when_single_close_position_missing(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "startup-recovery-nonrecoverable.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=1,
+            round_count=1,
+            round_qty=Decimal("0.010"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.SINGLE_CLOSE,
+            close_mode=SingleCloseMode.REGULAR,
+            selected_position_side=PositionSide.LONG,
+            target_close_qty=Decimal("0.100"),
+        )
+    )
+    repository.create_session(session)
+
+    await service.evaluate_startup_recovery()
+    payload = repository.get_session(session.session_id)
+
+    assert payload is not None
+    assert payload["recovery_status"] == RecoveryStatus.NON_RECOVERABLE
+    assert "不存在持仓" in str(payload["recovery_summary"])
+
+
+@pytest.mark.asyncio
+async def test_resume_recoverable_exception_session_restarts_from_next_round(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "resume-recoverable.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=2,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.PAIRED_OPEN,
+        )
+    )
+    repository.create_session(session)
+    repository.upsert_round(
+        RoundExecution(
+            session_id=session.session_id,
+            round_index=1,
+            status=RoundStatus.ROUND_COMPLETED,
+            stage1_filled_qty=Decimal("0.100"),
+            stage2_filled_qty=Decimal("0.100"),
+            ended_at=datetime.now(UTC),
+        )
+    )
+    await service.evaluate_startup_recovery()
+
+    status = await service.resume_session(session.session_id)
+    await service._managed[session.session_id].task
+    payload = service.get_session(session.session_id)
+
+    assert status == SessionStatus.RUNNING
+    assert len(gateway.order_calls) == 2
+    assert payload["status"] == SessionStatus.COMPLETED.value
+    assert payload["recovery_status"] is None
+    assert payload["recovery_summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_manual_confirmation_and_non_recoverable_sessions(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "resume-rejects.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+
+    manual_session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.PAIRED_OPEN,
+        )
+    )
+    repository.create_session(manual_session)
+    repository.update_session_status(manual_session.session_id, SessionStatus.EXCEPTION)
+    repository.update_session_recovery(
+        manual_session.session_id,
+        RecoveryStatus.MANUAL_CONFIRMATION,
+        "需人工确认",
+        datetime.now(UTC),
+        {"reason": "open_orders"},
+    )
+
+    blocked_session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=1,
+            round_count=1,
+            round_qty=Decimal("0.010"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.SINGLE_CLOSE,
+            close_mode=SingleCloseMode.REGULAR,
+            selected_position_side=PositionSide.LONG,
+            target_close_qty=Decimal("0.100"),
+        )
+    )
+    repository.create_session(blocked_session)
+    repository.update_session_status(blocked_session.session_id, SessionStatus.EXCEPTION)
+    repository.update_session_recovery(
+        blocked_session.session_id,
+        RecoveryStatus.NON_RECOVERABLE,
+        "不可恢复",
+        datetime.now(UTC),
+        {"reason": "no_position"},
+    )
+
+    with pytest.raises(ExchangeStateError, match="人工确认"):
+        await service.resume_session(manual_session.session_id)
+    with pytest.raises(ExchangeStateError, match="不可恢复"):
+        await service.resume_session(blocked_session.session_id)
 

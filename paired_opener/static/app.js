@@ -62,7 +62,8 @@ let activeSessionPoller = null;
 let activeSessionState = null;
 let latestSessionEventId = 0;
 const seenSessionEventIds = new Set();
-const MAX_LOG_LINES = 200;
+const APP_CONFIG = window.__APP_CONFIG__ || {};
+const MAX_LOG_LINES = Number(APP_CONFIG.frontend_execution_log_lines || 200);
 const LOG_LEVEL_LABELS = { info: '提示', success: '成功', warn: '警告', error: '错误' };
 const CONNECTION_STATUS_LABELS = { connected: '已连接', connecting: '连接中', disconnected: '已断开', error: '异常', idle: '空闲' };
 const orderBookRowCache = { sell: [], buy: [] };
@@ -302,30 +303,6 @@ function canRunPrecheck(mode, payload) {
   }
 }
 
-function __legacyApplyPrecheckResult(mode, precheck) {
-  return applyPrecheckResult(mode, precheck);
-}
-
-async function __legacyRunPrecheck(mode = executionMode, trigger = "user_input") {
-  return runPrecheck(mode, trigger);
-}
-
-function __legacySchedulePrecheck(mode = executionMode, delay = 400, trigger = "user_input") {
-  return schedulePrecheck(mode, delay, trigger);
-}
-
-function __legacySetExecutionMode(mode) {
-  return setExecutionMode(mode);
-}
-
-function __legacySetActiveSymbol(symbol, syncInput = true) {
-  return setActiveSymbol(symbol, syncInput);
-}
-
-function __legacySetSymbolInfo(info) {
-  return setSymbolInfo(info);
-}
-
 function setPrecheckPaused(paused) {
   precheckPaused = Boolean(paused);
   if (!precheckPaused) {
@@ -431,57 +408,6 @@ async function loadWhitelist() {
   temporaryCustomSymbol = whitelistSymbols.includes(currentSymbol) ? null : currentSymbol;
   rebuildSymbolOptions(currentSymbol);
   return whitelistSymbols;
-}
-
-function __legacySetExecutionMode(mode) {
-  executionMode = mode;
-  Object.entries(modeButtons).forEach(([key, button]) => {
-    if (button) button.classList.toggle("active", key === mode);
-  });
-  Object.entries(modePanels).forEach(([key, panel]) => {
-    if (panel) panel.classList.toggle("hidden", key !== mode);
-  });
-  document.getElementById("statMode").textContent = formatModeLabel(mode);
-  if (mode === "paired_open") {
-    recalculateOpenAmount();
-  } else if (mode === "paired_close") {
-    recalculateCloseAmount();
-  } else if (mode === "single_open") {
-    recalculateSingleOpenAmount();
-  } else if (mode === "single_close") {
-    recalculateSingleCloseAmount();
-  }
-  schedulePrecheck(mode, 0);
-}
-
-function __legacySetActiveSymbol(symbol, syncInput = true) {
-  activeSymbol = normalizeSymbol(symbol);
-  latestReferencePrice = 0;
-  document.getElementById("statsSymbol").textContent = activeSymbol;
-  executionSymbol.value = activeSymbol;
-  closeExecutionSymbol.value = activeSymbol;
-  if (singleOpenExecutionSymbol) singleOpenExecutionSymbol.value = activeSymbol;
-  const singleCloseSymbolInput = document.getElementById("singleCloseExecutionSymbol");
-  if (singleCloseSymbolInput) singleCloseSymbolInput.value = activeSymbol;
-  updateSymbolUnits(activeSymbol);
-  if (syncInput) rebuildSymbolOptions(activeSymbol);
-  refreshSingleOpenOrderOptions();
-    refreshSingleClosePositionOptions();
-    syncCurrentModeFromAccountOverview();
-  const footerStatus = document.getElementById("footerStatus");
-  footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
-  schedulePrecheck();
-}
-
-function __legacySetSymbolInfo(info) {
-  currentSymbolInfo = info || { symbol: activeSymbol, min_notional: 0, allowed: true };
-  symbolInfoReady = Boolean(info);
-  document.getElementById("statMinNotional").textContent = formatNumber(currentSymbolInfo.min_notional || 0, 4);
-  recalculateOpenAmount();
-  recalculateCloseAmount();
-  recalculateSingleOpenAmount();
-  recalculateSingleCloseAmount();
-  schedulePrecheck();
 }
 
 function renderLevels(container, levels, side) {
@@ -2429,6 +2355,7 @@ Promise.allSettled([
 setInterval(() => {
   maybeScheduleCurrentModePrecheck("interval");
 }, PRECHECK_INTERVAL_MS);
+
 
 
 

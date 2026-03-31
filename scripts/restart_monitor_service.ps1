@@ -40,9 +40,8 @@ foreach ($connection in $connections) {
     }
 }
 
-if (Test-Path $runtimeLog) {
-    Remove-Item $runtimeLog -Force -ErrorAction SilentlyContinue
-}
+$env:PYTHONPATH = $pythonPathValue
+& $pythonExecutable -m paired_opener.log_retention --file $runtimeLog
 
 $childCommand = "Set-Location '$projectRoot'; `$env:PYTHONPATH = '$pythonPathValue'; & '$pythonExecutable' -m uvicorn paired_opener.monitor_api:app --host $hostAddress --port $port *>> '$runtimeLog'"
 Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command',$childCommand -WindowStyle Hidden | Out-Null

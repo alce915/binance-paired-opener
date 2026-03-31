@@ -1,12 +1,13 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from paired_opener.account_runtime import AccountRuntimeManager
@@ -48,11 +49,17 @@ async def lifespan(app: FastAPI):
     app_settings = Settings()
     app_settings.load_persisted_whitelist()
     app_settings.load_accounts(include_accounts_file=False)
-    repository = SqliteRepository(app_settings.database_path)
+    repository = SqliteRepository(
+        app_settings.database_path,
+        session_event_retention_days=app_settings.session_event_retention_days,
+        session_event_retention_per_session=app_settings.session_event_retention_per_session,
+    )
+    repository.prune_event_retention()
     runtime_manager = AccountRuntimeManager(app_settings, repository)
     app.state.settings = app_settings
     app.state.repository = repository
     app.state.runtime_manager = runtime_manager
+    await runtime_manager.initialize_startup_recovery()
     try:
         yield
     finally:
@@ -71,6 +78,23 @@ def _static_file_response(name: str, *, media_type: str | None = None, cache_hea
     return FileResponse(STATIC_DIR.joinpath(name), media_type=media_type, headers=cache_headers or STATIC_CACHE_HEADERS)
 
 
+def _render_index_html(app_settings: Settings) -> str:
+    html = STATIC_DIR.joinpath('index.html').read_text(encoding='utf-8')
+    config_payload = json.dumps(
+        {
+            'frontend_execution_log_lines': app_settings.frontend_execution_log_lines,
+            'sse_queue_maxsize': app_settings.sse_queue_maxsize,
+        },
+        ensure_ascii=True,
+        separators=(',', ':'),
+    )
+    script_tag = '<script src="/static/app.js?v=20260331-log-retention"></script>'
+    inline_config = f'<script>window.__APP_CONFIG__ = {config_payload};</script>\n        {script_tag}'
+    if script_tag in html:
+        return html.replace(script_tag, inline_config, 1)
+    return html.replace('</body>', f'        {inline_config}\n  </body>', 1)
+
+
 def _raise_api_error(
     exc: Exception,
     *,
@@ -87,8 +111,8 @@ def _raise_api_error(
 
 
 @app.get('/', include_in_schema=False)
-async def index() -> FileResponse:
-    return _static_file_response('index.html', cache_headers=HTML_CACHE_HEADERS)
+async def index() -> HTMLResponse:
+    return HTMLResponse(_render_index_html(app.state.settings), headers=HTML_CACHE_HEADERS)
 
 
 @app.get('/static/app.js', include_in_schema=False)
@@ -274,6 +298,8 @@ async def resume_session(session_id: str) -> SessionActionResponse:
         status = await service.resume_session(session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail='Session not found') from exc
+    except (TradingError, ValueError, SessionConflictError, ExchangeStateError) as exc:
+        _raise_api_error(exc, code='trading_request_failed', source='service')
     return SessionActionResponse(
         session_id=session_id,
         status=status,
@@ -340,6 +366,7 @@ async def get_symbol_info(symbol: str) -> SymbolInfoResponse:
     except Exception as exc:
         _raise_api_error(exc, code='trading_request_failed', source='service')
     return SymbolInfoResponse.model_validate(payload)
+
 
 
 

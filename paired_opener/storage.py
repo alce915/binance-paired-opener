@@ -3,12 +3,12 @@
 import json
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from paired_opener.domain import OpenSession, RoundExecution, SessionStatus
+from paired_opener.domain import OpenSession, RecoveryStatus, RoundExecution, SessionStatus
 
 
 def _json_dumps(payload: dict[str, Any]) -> str:
@@ -32,11 +32,19 @@ def _json_loads(payload: str) -> dict[str, Any]:
 
 
 class SqliteRepository:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        session_event_retention_days: int = 30,
+        session_event_retention_per_session: int = 2_000,
+    ) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        self._session_event_retention_days = max(int(session_event_retention_days), 0)
+        self._session_event_retention_per_session = max(int(session_event_retention_per_session), 0)
         self._initialize()
 
     def _initialize(self) -> None:
@@ -72,6 +80,10 @@ class SqliteRepository:
                     last_error_strategy TEXT,
                     last_error_code TEXT,
                     last_error_operator_action TEXT,
+                    recovery_status TEXT,
+                    recovery_summary TEXT,
+                    recovery_checked_at TEXT,
+                    recovery_details_json TEXT,
                     stage2_carryover_qty TEXT NOT NULL DEFAULT '0',
                     final_alignment_status TEXT NOT NULL DEFAULT 'not_needed',
                     final_unaligned_qty TEXT NOT NULL DEFAULT '0',
@@ -118,6 +130,10 @@ class SqliteRepository:
             self._ensure_column("sessions", "last_error_strategy", "TEXT")
             self._ensure_column("sessions", "last_error_code", "TEXT")
             self._ensure_column("sessions", "last_error_operator_action", "TEXT")
+            self._ensure_column("sessions", "recovery_status", "TEXT")
+            self._ensure_column("sessions", "recovery_summary", "TEXT")
+            self._ensure_column("sessions", "recovery_checked_at", "TEXT")
+            self._ensure_column("sessions", "recovery_details_json", "TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -183,32 +199,93 @@ class SqliteRepository:
         last_error_strategy: str | None = None,
         last_error_code: str | None = None,
         last_error_operator_action: str | None = None,
+        clear_recovery: bool = False,
     ) -> None:
         with self._lock, self._connection:
+            if clear_recovery:
+                self._connection.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?,
+                        updated_at = ?,
+                        last_error = ?,
+                        last_error_category = ?,
+                        last_error_strategy = ?,
+                        last_error_code = ?,
+                        last_error_operator_action = ?,
+                        recovery_status = NULL,
+                        recovery_summary = NULL,
+                        recovery_checked_at = NULL,
+                        recovery_details_json = NULL
+                    WHERE session_id = ?
+                    """,
+                    (
+                        status.value,
+                        datetime.now(UTC).isoformat(),
+                        last_error,
+                        last_error_category,
+                        last_error_strategy,
+                        last_error_code,
+                        last_error_operator_action,
+                        session_id,
+                    ),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?,
+                        updated_at = ?,
+                        last_error = ?,
+                        last_error_category = ?,
+                        last_error_strategy = ?,
+                        last_error_code = ?,
+                        last_error_operator_action = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        status.value,
+                        datetime.now(UTC).isoformat(),
+                        last_error,
+                        last_error_category,
+                        last_error_strategy,
+                        last_error_code,
+                        last_error_operator_action,
+                        session_id,
+                    ),
+                )
+
+    def update_session_recovery(
+        self,
+        session_id: str,
+        recovery_status: RecoveryStatus | str | None,
+        recovery_summary: str | None,
+        recovery_checked_at: datetime | str | None,
+        recovery_details: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock, self._connection:
+            status_value = recovery_status.value if isinstance(recovery_status, RecoveryStatus) else recovery_status
+            checked_at_value = recovery_checked_at.isoformat() if isinstance(recovery_checked_at, datetime) else recovery_checked_at
+            details_value = None if recovery_details is None else _json_dumps(recovery_details)
             self._connection.execute(
                 """
                 UPDATE sessions
-                SET status = ?,
-                    updated_at = ?,
-                    last_error = ?,
-                    last_error_category = ?,
-                    last_error_strategy = ?,
-                    last_error_code = ?,
-                    last_error_operator_action = ?
+                SET recovery_status = ?,
+                    recovery_summary = ?,
+                    recovery_checked_at = ?,
+                    recovery_details_json = ?,
+                    updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
-                    status.value,
+                    status_value,
+                    recovery_summary,
+                    checked_at_value,
+                    details_value,
                     datetime.now(UTC).isoformat(),
-                    last_error,
-                    last_error_category,
-                    last_error_strategy,
-                    last_error_code,
-                    last_error_operator_action,
                     session_id,
                 ),
             )
-
     def update_session_runtime(self, session: OpenSession) -> None:
         with self._lock, self._connection:
             self._connection.execute(
@@ -273,12 +350,58 @@ class SqliteRepository:
         payload: dict[str, Any],
         *,
         round_index: int | None = None,
+        created_at: datetime | None = None,
     ) -> None:
+        event_created_at = (created_at or datetime.now(UTC)).isoformat()
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT INTO events (session_id, round_index, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                (session_id, round_index, event_type, _json_dumps(payload), datetime.now(UTC).isoformat()),
+                (session_id, round_index, event_type, _json_dumps(payload), event_created_at),
             )
+            self._prune_session_events_locked(session_id)
+
+    def prune_event_retention(self, *, now: datetime | None = None) -> None:
+        cutoff_iso = None
+        if self._session_event_retention_days > 0:
+            cutoff_iso = ((now or datetime.now(UTC)) - timedelta(days=self._session_event_retention_days)).isoformat()
+        with self._lock, self._connection:
+            if cutoff_iso is not None:
+                self._connection.execute(
+                    "DELETE FROM events WHERE created_at < ?",
+                    (cutoff_iso,),
+                )
+            if self._session_event_retention_per_session > 0:
+                rows = self._connection.execute(
+                    "SELECT DISTINCT session_id FROM events"
+                ).fetchall()
+                for row in rows:
+                    self._prune_session_events_locked(row["session_id"])
+
+    def _prune_session_events_locked(self, session_id: str) -> None:
+        if self._session_event_retention_days > 0:
+            cutoff_iso = (datetime.now(UTC) - timedelta(days=self._session_event_retention_days)).isoformat()
+            self._connection.execute(
+                "DELETE FROM events WHERE session_id = ? AND created_at < ?",
+                (session_id, cutoff_iso),
+            )
+        if self._session_event_retention_per_session <= 0:
+            return
+        self._connection.execute(
+            """
+            DELETE FROM events
+            WHERE session_id = ?
+              AND event_id NOT IN (
+                  SELECT event_id FROM (
+                      SELECT event_id
+                      FROM events
+                      WHERE session_id = ?
+                      ORDER BY event_id DESC
+                      LIMIT ?
+                  )
+              )
+            """,
+            (session_id, session_id, self._session_event_retention_per_session),
+        )
 
     def get_session_record(self, session_id: str, account_id: str | None = None) -> dict[str, Any] | None:
         if account_id is None:
@@ -300,6 +423,26 @@ class SqliteRepository:
         session["events"] = self.list_events(session_id)
         return session
 
+
+    def list_incomplete_sessions(self, account_id: str | None = None) -> list[dict[str, Any]]:
+        params: tuple[Any, ...]
+        if account_id is None:
+            query = "SELECT * FROM sessions WHERE status IN (?, ?, ?) ORDER BY created_at ASC"
+            params = (
+                SessionStatus.PENDING.value,
+                SessionStatus.RUNNING.value,
+                SessionStatus.PAUSED.value,
+            )
+        else:
+            query = "SELECT * FROM sessions WHERE account_id = ? AND status IN (?, ?, ?) ORDER BY created_at ASC"
+            params = (
+                account_id,
+                SessionStatus.PENDING.value,
+                SessionStatus.RUNNING.value,
+                SessionStatus.PAUSED.value,
+            )
+        rows = self._connection.execute(query, params).fetchall()
+        return [self._deserialize_session_row(row) for row in rows]
     def fail_incomplete_sessions(self, reason: str) -> list[str]:
         with self._lock, self._connection:
             rows = self._connection.execute(
@@ -438,5 +581,16 @@ class SqliteRepository:
     def _deserialize_session_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["completed_with_final_alignment"] = bool(payload.get("completed_with_final_alignment"))
+        recovery_status = payload.get("recovery_status")
+        if recovery_status:
+            payload["recovery_status"] = RecoveryStatus(recovery_status)
+        details_payload = _json_loads(payload.pop("recovery_details_json", "{}"))
+        payload["recovery_details"] = details_payload
         return payload
+
+
+
+
+
+
 

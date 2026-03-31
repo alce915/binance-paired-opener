@@ -46,6 +46,12 @@ class SessionStatus(StrEnum):
     EXCEPTION = "exception"
 
 
+class RecoveryStatus(StrEnum):
+    RECOVERABLE = "recoverable"
+    NON_RECOVERABLE = "non_recoverable"
+    MANUAL_CONFIRMATION = "manual_confirmation"
+
+
 class RoundStatus(StrEnum):
     STAGE1_PENDING = "stage1_pending"
     STAGE1_RETRYING = "stage1_retrying"
@@ -154,6 +160,10 @@ class OpenSession:
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    recovery_status: RecoveryStatus | None = None
+    recovery_summary: str | None = None
+    recovery_checked_at: datetime | None = None
+    recovery_details: dict[str, Any] = field(default_factory=dict)
     stage2_carryover_qty: Decimal = Decimal("0")
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
@@ -193,6 +203,7 @@ class SessionConflictError(RuntimeError):
 
 class SessionAbortedError(RuntimeError):
     pass
+
 
 
 

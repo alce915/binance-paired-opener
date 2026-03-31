@@ -49,6 +49,20 @@ class AccountRuntimeManager:
     def current(self) -> RuntimeBundle:
         return self._runtime
 
+    async def initialize_startup_recovery(self) -> list[dict[str, object]]:
+        evaluated: list[dict[str, object]] = []
+        active_runtime = self._runtime
+        evaluated.extend(await active_runtime.service.evaluate_startup_recovery())
+        for account_id, account in self._settings.accounts.items():
+            if account_id == active_runtime.account.account_id:
+                continue
+            temp_runtime = self._build_runtime(account)
+            try:
+                evaluated.extend(await temp_runtime.service.evaluate_startup_recovery())
+            finally:
+                await self._shutdown_runtime(temp_runtime)
+        return evaluated
+
     async def _shutdown_runtime(self, runtime: RuntimeBundle) -> None:
         try:
             await runtime.market.disconnect()
@@ -103,6 +117,3 @@ class AccountRuntimeManager:
         await self._runtime.gateway.close()
         if self._cleanup_tasks:
             await asyncio.gather(*tuple(self._cleanup_tasks), return_exceptions=True)
-
-
-

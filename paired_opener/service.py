@@ -3,14 +3,18 @@
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from paired_opener.config import Settings
 from paired_opener.domain import (
+    ExchangeStateError,
     FinalAlignmentStatus,
     OpenSession,
     PositionSide,
+    RecoveryStatus,
+    RoundStatus,
     SessionConflictError,
     SessionKind,
     SessionSpec,
@@ -83,12 +87,6 @@ class OpenSessionService:
         self._managed: dict[str, ManagedSession] = {}
         self._session_creation_lock = asyncio.Lock()
         self._hedge_mode_fallback_confirmed = False
-        for session_id in self._repository.fail_incomplete_sessions("Service restarted before session completion"):
-            self._repository.add_event(
-                session_id,
-                "session_recovered_on_startup",
-                {"error": "Service restarted before session completion", "status": SessionStatus.EXCEPTION.value},
-            )
 
 
     async def close(self, *, timeout_seconds: float = 5.0) -> None:
@@ -108,6 +106,335 @@ class OpenSessionService:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         self._managed.clear()
+    def _parse_datetime(self, value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value
+        if value:
+            return datetime.fromisoformat(str(value))
+        return datetime.now(UTC)
+
+    def _enum_value(self, value: Any, enum_type: Any, default: Any = None):
+        if value is None:
+            return default
+        if isinstance(value, enum_type):
+            return value
+        return enum_type(str(value))
+
+    def _build_session_from_payload(self, payload: dict[str, Any]) -> OpenSession:
+        spec = SessionSpec(
+            symbol=str(payload["symbol"]),
+            trend_bias=self._enum_value(payload.get("trend_bias"), TrendBias, TrendBias.LONG),
+            leverage=int(payload.get("leverage") or 1),
+            round_count=int(payload.get("round_count") or 1),
+            round_qty=Decimal(str(payload.get("round_qty") or "0")),
+            poll_interval_ms=int(payload.get("poll_interval_ms") or self._settings.default_poll_interval_ms),
+            order_ttl_ms=int(payload.get("order_ttl_ms") or self._settings.default_order_ttl_ms),
+            max_zero_fill_retries=int(payload.get("max_zero_fill_retries") or self._settings.default_max_zero_fill_retries),
+            market_fallback_attempts=int(payload.get("market_fallback_attempts") or self._settings.default_market_fallback_attempts),
+            round_interval_seconds=int(payload.get("round_interval_seconds")) if payload.get("round_interval_seconds") is not None else 3,
+            created_by=str(payload.get("created_by") or "manual"),
+            session_kind=self._enum_value(payload.get("session_kind"), SessionKind, SessionKind.PAIRED_OPEN),
+            open_mode=self._enum_value(payload.get("open_mode"), SingleOpenMode),
+            close_mode=self._enum_value(payload.get("close_mode"), SingleCloseMode),
+            selected_position_side=self._enum_value(payload.get("selected_position_side"), PositionSide),
+            target_open_qty=Decimal(str(payload.get("target_open_qty") or "0")),
+            target_close_qty=Decimal(str(payload.get("target_close_qty") or "0")),
+        )
+        return OpenSession(
+            session_id=str(payload["session_id"]),
+            spec=spec,
+            account_id=str(payload.get("account_id") or self._account_id),
+            account_name=str(payload.get("account_name") or self._account_name),
+            status=self._enum_value(payload.get("status"), SessionStatus, SessionStatus.PENDING),
+            created_at=self._parse_datetime(payload.get("created_at")),
+            updated_at=self._parse_datetime(payload.get("updated_at")),
+            last_error=payload.get("last_error"),
+            last_error_category=payload.get("last_error_category"),
+            last_error_strategy=payload.get("last_error_strategy"),
+            last_error_code=payload.get("last_error_code"),
+            last_error_operator_action=payload.get("last_error_operator_action"),
+            recovery_status=self._enum_value(payload.get("recovery_status"), RecoveryStatus),
+            recovery_summary=payload.get("recovery_summary"),
+            recovery_checked_at=self._parse_datetime(payload.get("recovery_checked_at")) if payload.get("recovery_checked_at") else None,
+            recovery_details=dict(payload.get("recovery_details") or {}),
+            stage2_carryover_qty=Decimal(str(payload.get("stage2_carryover_qty") or "0")),
+            final_alignment_status=self._enum_value(payload.get("final_alignment_status"), FinalAlignmentStatus, FinalAlignmentStatus.NOT_NEEDED),
+            final_unaligned_qty=Decimal(str(payload.get("final_unaligned_qty") or "0")),
+            completed_with_final_alignment=bool(payload.get("completed_with_final_alignment")),
+        )
+
+    def _extract_session_order_ids(self, payload: dict[str, Any]) -> list[str]:
+        order_ids: set[str] = set()
+        for event in payload.get("events", []):
+            event_payload = event.get("payload") or {}
+            order_id = event_payload.get("order_id")
+            if order_id:
+                order_ids.add(str(order_id))
+        return sorted(order_ids)
+
+    def _recovery_round_progress(self, payload: dict[str, Any]) -> dict[str, Any]:
+        completed_rounds = 0
+        skipped_rounds = 0
+        stage1_filled_total = Decimal("0")
+        stage2_filled_total = Decimal("0")
+        non_terminal_rounds: list[dict[str, Any]] = []
+        next_round_index = 1
+        for round_payload in payload.get("rounds", []):
+            round_index = int(round_payload.get("round_index") or 0)
+            next_round_index = max(next_round_index, round_index + 1)
+            status_value = str(round_payload.get("status") or "")
+            stage1_filled_total += Decimal(str(round_payload.get("stage1_filled_qty") or "0"))
+            stage2_filled_total += Decimal(str(round_payload.get("stage2_filled_qty") or "0"))
+            if status_value == RoundStatus.ROUND_COMPLETED.value:
+                completed_rounds += 1
+            elif status_value == RoundStatus.STAGE1_SKIPPED.value:
+                skipped_rounds += 1
+            elif status_value:
+                non_terminal_rounds.append({"round_index": round_index, "status": status_value})
+        return {
+            "completed_rounds": completed_rounds,
+            "skipped_rounds": skipped_rounds,
+            "stage1_filled_total": stage1_filled_total,
+            "stage2_filled_total": stage2_filled_total,
+            "next_round_index": next_round_index,
+            "non_terminal_rounds": non_terminal_rounds,
+        }
+
+    def _recovery_result(
+        self,
+        recovery_status: RecoveryStatus,
+        summary: str,
+        checked_at: datetime,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "recovery_status": recovery_status,
+            "recovery_summary": summary,
+            "recovery_checked_at": checked_at,
+            "recovery_details": details,
+        }
+
+    async def _evaluate_recovery_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self._build_session_from_payload(payload)
+        checked_at = datetime.now(UTC)
+        progress = self._recovery_round_progress(payload)
+        details: dict[str, Any] = {
+            "session_kind": session.spec.session_kind.value,
+            "account_id": session.account_id,
+            "account_name": session.account_name,
+            "symbol": session.spec.symbol,
+            "round_progress": {
+                "completed_rounds": progress["completed_rounds"],
+                "skipped_rounds": progress["skipped_rounds"],
+                "next_round_index": progress["next_round_index"],
+                "stage1_filled_total": str(progress["stage1_filled_total"]),
+                "stage2_filled_total": str(progress["stage2_filled_total"]),
+                "non_terminal_rounds": progress["non_terminal_rounds"],
+            },
+            "stage2_carryover_qty": str(session.stage2_carryover_qty),
+        }
+        if progress["non_terminal_rounds"]:
+            return self._recovery_result(
+                RecoveryStatus.MANUAL_CONFIRMATION,
+                "会话存在未终态轮次，需人工确认后处理。",
+                checked_at,
+                details,
+            )
+
+        try:
+            open_orders = await self._gateway.get_open_orders(session.spec.symbol)
+        except Exception as exc:
+            details["open_order_query_error"] = str(exc)
+            return self._recovery_result(
+                RecoveryStatus.MANUAL_CONFIRMATION,
+                f"恢复判断时无法读取当前挂单状态: {exc}",
+                checked_at,
+                details,
+            )
+
+        session_prefix = f"{session.session_id}-"
+        active_session_orders: list[dict[str, Any]] = []
+        for order in open_orders:
+            client_order_id = str(order.get("clientOrderId") or order.get("client_order_id") or "")
+            if client_order_id.startswith(session_prefix):
+                active_session_orders.append(
+                    {
+                        "order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                        "client_order_id": client_order_id,
+                        "status": str(order.get("status") or ""),
+                    }
+                )
+        details["active_session_orders"] = active_session_orders
+        if active_session_orders:
+            return self._recovery_result(
+                RecoveryStatus.MANUAL_CONFIRMATION,
+                "会话仍存在未完成系统挂单，需人工确认后处理。",
+                checked_at,
+                details,
+            )
+
+        known_order_statuses: list[dict[str, Any]] = []
+        for order_id in self._extract_session_order_ids(payload):
+            try:
+                order = await self._gateway.get_order(symbol=session.spec.symbol, order_id=order_id)
+            except Exception as exc:
+                details["order_query_error"] = {"order_id": order_id, "error": str(exc)}
+                return self._recovery_result(
+                    RecoveryStatus.MANUAL_CONFIRMATION,
+                    f"恢复判断时无法确认订单状态: {exc}",
+                    checked_at,
+                    details,
+                )
+            status_value = order.status.value if hasattr(order.status, "value") else str(order.status)
+            known_order_statuses.append({"order_id": order_id, "status": status_value})
+            if status_value in {"NEW", "PARTIALLY_FILLED"}:
+                details["known_order_statuses"] = known_order_statuses
+                return self._recovery_result(
+                    RecoveryStatus.MANUAL_CONFIRMATION,
+                    "会话存在未终态订单，需人工确认后处理。",
+                    checked_at,
+                    details,
+                )
+        details["known_order_statuses"] = known_order_statuses
+
+        try:
+            overview = await self._gateway.get_account_overview()
+            rules = await self._gateway.get_symbol_rules(session.spec.symbol)
+            quote = await self._gateway.get_quote(session.spec.symbol)
+        except Exception as exc:
+            details["context_error"] = str(exc)
+            return self._recovery_result(
+                RecoveryStatus.NON_RECOVERABLE,
+                f"当前账户或交易对上下文不可读，无法恢复: {exc}",
+                checked_at,
+                details,
+            )
+
+        long_qty = self._position_qty(overview, session.spec.symbol, PositionSide.LONG)
+        short_qty = self._position_qty(overview, session.spec.symbol, PositionSide.SHORT)
+        details["account_context"] = {
+            "available_balance": str(overview.get("totals", {}).get("available_balance") or "0"),
+            "long_qty": str(long_qty),
+            "short_qty": str(short_qty),
+            "min_notional": str(rules.min_notional),
+            "bid_price": str(quote.bid_price),
+            "ask_price": str(quote.ask_price),
+        }
+
+        if session.spec.session_kind == SessionKind.PAIRED_CLOSE:
+            remaining_close_qty = max(Decimal("0"), session.spec.target_close_qty - progress["stage1_filled_total"])
+            details["remaining_target_close_qty"] = str(remaining_close_qty)
+            if remaining_close_qty <= Decimal("0") and session.stage2_carryover_qty <= Decimal("0"):
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "双向平仓剩余数量已完成，无需恢复。",
+                    checked_at,
+                    details,
+                )
+            if long_qty <= Decimal("0") or short_qty <= Decimal("0"):
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "当前已不存在可继续双向平仓的双边持仓。",
+                    checked_at,
+                    details,
+                )
+        elif session.spec.session_kind == SessionKind.SINGLE_CLOSE:
+            remaining_close_qty = max(Decimal("0"), session.spec.target_close_qty - progress["stage1_filled_total"])
+            details["remaining_target_close_qty"] = str(remaining_close_qty)
+            if session.spec.close_mode == SingleCloseMode.ALIGN:
+                if long_qty == short_qty:
+                    return self._recovery_result(
+                        RecoveryStatus.NON_RECOVERABLE,
+                        "当前对齐差值已消失，无法继续恢复。",
+                        checked_at,
+                        details,
+                    )
+                expected_side = PositionSide.LONG if long_qty > short_qty else PositionSide.SHORT
+                details["align_expected_side"] = expected_side.value
+                if session.spec.selected_position_side and expected_side != session.spec.selected_position_side:
+                    return self._recovery_result(
+                        RecoveryStatus.NON_RECOVERABLE,
+                        "当前对齐方向已变化，无法继续恢复。",
+                        checked_at,
+                        details,
+                    )
+            else:
+                available_qty = long_qty if session.spec.selected_position_side == PositionSide.LONG else short_qty
+                details["available_close_qty"] = str(available_qty)
+                if available_qty <= Decimal("0"):
+                    return self._recovery_result(
+                        RecoveryStatus.NON_RECOVERABLE,
+                        "当前交易对不存在持仓。",
+                        checked_at,
+                        details,
+                    )
+            if remaining_close_qty <= Decimal("0") and session.stage2_carryover_qty <= Decimal("0"):
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "单向平仓剩余数量已完成，无需恢复。",
+                    checked_at,
+                    details,
+                )
+        elif session.spec.session_kind == SessionKind.SINGLE_OPEN and session.spec.open_mode == SingleOpenMode.ALIGN:
+            if long_qty == short_qty:
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "当前对齐差值已消失，无法继续恢复。",
+                    checked_at,
+                    details,
+                )
+            expected_side = PositionSide.LONG if long_qty < short_qty else PositionSide.SHORT
+            details["align_expected_side"] = expected_side.value
+            if session.spec.selected_position_side and expected_side != session.spec.selected_position_side:
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "当前对齐方向已变化，无法继续恢复。",
+                    checked_at,
+                    details,
+                )
+
+        return self._recovery_result(
+            RecoveryStatus.RECOVERABLE,
+            "会话已无未决系统单，且当前上下文允许手动恢复。",
+            checked_at,
+            details,
+        )
+
+    async def evaluate_startup_recovery(self) -> list[dict[str, Any]]:
+        evaluated: list[dict[str, Any]] = []
+        for payload in self._repository.list_incomplete_sessions(self._account_id):
+            full_payload = self._repository.get_session(payload["session_id"], self._account_id)
+            if full_payload is None:
+                continue
+            recovery = await self._evaluate_recovery_payload(full_payload)
+            self._repository.update_session_status(
+                full_payload["session_id"],
+                SessionStatus.EXCEPTION,
+                last_error="Service restarted before session completion",
+            )
+            self._repository.update_session_recovery(
+                full_payload["session_id"],
+                recovery["recovery_status"],
+                recovery["recovery_summary"],
+                recovery["recovery_checked_at"],
+                recovery["recovery_details"],
+            )
+            self._repository.add_event(
+                full_payload["session_id"],
+                "session_recovery_evaluated",
+                {
+                    "status": SessionStatus.EXCEPTION.value,
+                    "recovery_status": recovery["recovery_status"].value,
+                    "summary": recovery["recovery_summary"],
+                    "checked_at": recovery["recovery_checked_at"].isoformat(),
+                },
+            )
+            evaluated.append({
+                "session_id": full_payload["session_id"],
+                "recovery_status": recovery["recovery_status"].value,
+                "summary": recovery["recovery_summary"],
+            })
+        return evaluated
 
     def _error_context(self, *, session: OpenSession | None = None, stage: str | None = None, **context: Any) -> dict[str, Any]:
         payload = dict(context)
@@ -1102,11 +1429,33 @@ class OpenSessionService:
 
     async def resume_session(self, session_id: str) -> SessionStatus:
         managed = self._managed.get(session_id)
-        if managed is None:
+        if managed is not None:
+            managed.control.paused = False
+            self._repository.update_session_status(session_id, SessionStatus.RUNNING)
+            self._repository.add_event(session_id, "session_resumed", {})
+            return SessionStatus.RUNNING
+
+        payload = self._repository.get_session(session_id, self._account_id)
+        if payload is None:
             raise KeyError(session_id)
-        managed.control.paused = False
-        self._repository.update_session_status(session_id, SessionStatus.RUNNING)
-        self._repository.add_event(session_id, "session_resumed", {})
+        recovery_status = self._enum_value(payload.get("recovery_status"), RecoveryStatus)
+        if self._enum_value(payload.get("status"), SessionStatus) != SessionStatus.EXCEPTION:
+            raise ExchangeStateError("当前会话不处于可恢复状态。", code="session_resume_invalid_status")
+        if recovery_status == RecoveryStatus.MANUAL_CONFIRMATION:
+            raise ExchangeStateError("当前会话需人工确认后才能恢复。", code="session_resume_manual_confirmation")
+        if recovery_status != RecoveryStatus.RECOVERABLE:
+            raise ExchangeStateError("当前会话已判定为不可恢复。", code="session_resume_non_recoverable")
+
+        session = self._build_session_from_payload(payload)
+        self._ensure_no_active_symbol_session(session.spec.symbol)
+        session.status = SessionStatus.RUNNING
+        session.recovery_status = None
+        session.recovery_summary = None
+        session.recovery_checked_at = None
+        session.recovery_details = {}
+        self._repository.update_session_status(session_id, SessionStatus.RUNNING, clear_recovery=True)
+        self._repository.add_event(session_id, "session_resumed", {"recovered_from_restart": True})
+        self._launch_session(session)
         return SessionStatus.RUNNING
 
     async def abort_session(self, session_id: str) -> SessionStatus:
@@ -1229,6 +1578,7 @@ class OpenSessionService:
         for session_id in stale:
             self._managed.pop(session_id, None)
         return False
+
 
 
 

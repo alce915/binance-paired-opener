@@ -78,6 +78,12 @@ class Settings(BaseSettings):
     active_account_file: Path = CONFIG_DIR / "active_account.json"
     symbol_whitelist: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
     symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"
+    session_event_retention_days: int = 30
+    session_event_retention_per_session: int = 2_000
+    runtime_log_max_bytes: int = 20 * 1024 * 1024
+    runtime_log_backup_count: int = 5
+    frontend_execution_log_lines: int = 200
+    sse_queue_maxsize: int = 100
 
     default_poll_interval_ms: int = 50
     default_order_ttl_ms: int = 3_000

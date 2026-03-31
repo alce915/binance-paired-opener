@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from paired_opener.domain import FinalAlignmentStatus, PositionSide, SessionKind, SessionStatus, SingleCloseMode, SingleOpenMode, TrendBias
+from paired_opener.domain import FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SingleCloseMode, SingleOpenMode, TrendBias
 
 
 class OpenSessionRequest(BaseModel):
@@ -143,6 +143,9 @@ class SessionSummary(BaseModel):
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    recovery_status: RecoveryStatus | None = None
+    recovery_summary: str | None = None
+    recovery_checked_at: datetime | None = None
 
 
 class SessionDetail(BaseModel):
@@ -173,6 +176,9 @@ class SessionDetail(BaseModel):
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    recovery_status: RecoveryStatus | None = None
+    recovery_summary: str | None = None
+    recovery_checked_at: datetime | None = None
     stage2_carryover_qty: Decimal = Decimal("0")
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
@@ -231,5 +237,6 @@ class AccountSelectRequest(BaseModel):
 
 class AccountSelectResponse(BaseModel):
     account: AccountSummary
+
 
 
