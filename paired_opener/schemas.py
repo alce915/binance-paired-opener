@@ -6,10 +6,19 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from paired_opener.domain import FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SingleCloseMode, SingleOpenMode, TrendBias
+from paired_opener.domain import ExecutionProfile, FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SingleCloseMode, SingleOpenMode, TrendBias
 
 
-class OpenSessionRequest(BaseModel):
+class ExecutionPolicyFields(BaseModel):
+    execution_profile: ExecutionProfile | None = None
+    market_fallback_max_ratio: Decimal | None = Field(default=None, ge=0)
+    market_fallback_min_residual_qty: Decimal | None = Field(default=None, ge=0)
+    max_reprice_ticks: int | None = Field(default=None, ge=0, le=10_000)
+    max_spread_bps: int | None = Field(default=None, ge=0, le=10_000)
+    max_reference_deviation_bps: int | None = Field(default=None, ge=0, le=10_000)
+
+
+class OpenSessionRequest(ExecutionPolicyFields):
     symbol: str = Field(..., examples=["BTCUSDT"])
     trend_bias: TrendBias
     leverage: int = Field(..., ge=1, le=125)
@@ -23,7 +32,7 @@ class OpenSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class CloseSessionRequest(BaseModel):
+class CloseSessionRequest(ExecutionPolicyFields):
     symbol: str = Field(..., examples=["BTCUSDT"])
     trend_bias: TrendBias
     close_qty: Decimal = Field(..., gt=0)
@@ -36,7 +45,7 @@ class CloseSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class SingleCloseSessionRequest(BaseModel):
+class SingleCloseSessionRequest(ExecutionPolicyFields):
     symbol: str = Field(..., examples=["BTCUSDT"])
     close_mode: SingleCloseMode
     selected_position_side: PositionSide | None = None
@@ -50,7 +59,7 @@ class SingleCloseSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class SingleOpenSessionRequest(BaseModel):
+class SingleOpenSessionRequest(ExecutionPolicyFields):
     symbol: str = Field(..., examples=["BTCUSDT"])
     open_mode: SingleOpenMode
     selected_position_side: PositionSide | None = None
@@ -65,7 +74,7 @@ class SingleOpenSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class SessionPrecheckRequest(BaseModel):
+class SessionPrecheckRequest(ExecutionPolicyFields):
     session_kind: SessionKind
     symbol: str = Field(..., examples=["BTCUSDT"])
     trend_bias: TrendBias | None = None
@@ -88,7 +97,7 @@ class MarketConnectRequest(BaseModel):
     symbol: str = Field(default="BTCUSDT")
 
 
-class SimulationRunRequest(BaseModel):
+class SimulationRunRequest(ExecutionPolicyFields):
     session_kind: SessionKind = SessionKind.PAIRED_OPEN
     symbol: str = Field(default="BTCUSDT")
     trend_bias: TrendBias | None = None
@@ -135,6 +144,12 @@ class SessionSummary(BaseModel):
     selected_position_side: PositionSide | None = None
     target_open_qty: Decimal = Decimal("0")
     target_close_qty: Decimal = Decimal("0")
+    execution_profile: ExecutionProfile = ExecutionProfile.BALANCED
+    market_fallback_max_ratio: Decimal = Decimal("1")
+    market_fallback_min_residual_qty: Decimal = Decimal("0")
+    max_reprice_ticks: int | None = 8
+    max_spread_bps: int | None = 20
+    max_reference_deviation_bps: int | None = 40
     status: SessionStatus
     created_at: datetime
     updated_at: datetime
@@ -146,6 +161,9 @@ class SessionSummary(BaseModel):
     recovery_status: RecoveryStatus | None = None
     recovery_summary: str | None = None
     recovery_checked_at: datetime | None = None
+    stage2_carryover_qty: Decimal = Decimal("0")
+    final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
+    final_unaligned_qty: Decimal = Decimal("0")
 
 
 class SessionDetail(BaseModel):
@@ -167,6 +185,12 @@ class SessionDetail(BaseModel):
     order_ttl_ms: int
     max_zero_fill_retries: int
     market_fallback_attempts: int
+    execution_profile: ExecutionProfile = ExecutionProfile.BALANCED
+    market_fallback_max_ratio: Decimal = Decimal("1")
+    market_fallback_min_residual_qty: Decimal = Decimal("0")
+    max_reprice_ticks: int | None = 8
+    max_spread_bps: int | None = 20
+    max_reference_deviation_bps: int | None = 40
     round_interval_seconds: int | None = None
     status: SessionStatus
     created_at: datetime

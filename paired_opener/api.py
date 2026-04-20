@@ -88,7 +88,7 @@ def _render_index_html(app_settings: Settings) -> str:
         ensure_ascii=True,
         separators=(',', ':'),
     )
-    script_tag = '<script src="/static/app.js?v=20260331-log-retention"></script>'
+    script_tag = '<script src="/static/app.js?v=20260420-residual-display"></script>'
     inline_config = f'<script>window.__APP_CONFIG__ = {config_payload};</script>\n        {script_tag}'
     if script_tag in html:
         return html.replace(script_tag, inline_config, 1)
@@ -178,6 +178,12 @@ async def run_simulation(request: SimulationRunRequest) -> dict:
             leverage=request.leverage,
             round_count=request.round_count,
             round_interval_seconds=request.round_interval_seconds,
+            execution_profile=request.execution_profile.value if request.execution_profile is not None else None,
+            market_fallback_max_ratio=request.market_fallback_max_ratio,
+            market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+            max_reprice_ticks=request.max_reprice_ticks,
+            max_spread_bps=request.max_spread_bps,
+            max_reference_deviation_bps=request.max_reference_deviation_bps,
         )
     except Exception as exc:
         _raise_api_error(exc, code='trading_request_failed', source='service')

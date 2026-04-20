@@ -135,6 +135,19 @@ function formatDisplayPrice(value, digits = 2) {
   return formatNumber(numeric, digits);
 }
 
+function resolveResidualQty(source = {}) {
+  if (source.final_unaligned_qty !== undefined && source.final_unaligned_qty !== null) {
+    return source.final_unaligned_qty;
+  }
+  if (source.stage2_carryover_qty !== undefined && source.stage2_carryover_qty !== null) {
+    return source.stage2_carryover_qty;
+  }
+  if (source.carryover_qty !== undefined && source.carryover_qty !== null) {
+    return source.carryover_qty;
+  }
+  return 0;
+}
+
 function normalizeSymbol(value) {
   return (value || "BTCUSDT").trim().toUpperCase();
 }
@@ -573,8 +586,12 @@ function updateExecutionStats(stats) {
   if (stats.min_notional !== undefined) {
     document.getElementById("statMinNotional").textContent = formatNumber(stats.min_notional || 0, 4);
   }
-  if (stats.carryover_qty !== undefined) {
-    document.getElementById("statCarryoverQty").textContent = formatNumber(stats.carryover_qty || 0, 6);
+  if (
+    stats.carryover_qty !== undefined
+    || stats.stage2_carryover_qty !== undefined
+    || stats.final_unaligned_qty !== undefined
+  ) {
+    document.getElementById("statCarryoverQty").textContent = formatNumber(resolveResidualQty(stats), 6);
   }
   if (stats.final_alignment_status !== undefined) {
     document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(stats.final_alignment_status);
@@ -1132,15 +1149,15 @@ function summarizeSessionEvent(event) {
     case "stage2_zero_fill_retry":
       return { level: "warn", message: `第 ${payload.round_index} 轮 \u9636\u6bb52 零成交重试，第 ${payload.retry} 次` };
     case "stage2_below_min_carryover":
-      return { level: "warn", message: `第 ${payload.round_index} 轮 \u9636\u6bb52 剩余 ${payload.remaining_qty} 金额低于最小下单金额，残量结转到下一轮` };
+      return { level: "warn", message: `第 ${payload.round_index} 轮 \u9636\u6bb52 剩余 ${payload.remaining_qty} 金额低于最小下单金额，未完成数量顺延到下一轮` };
     case "stage2_carryover_persisted":
-      return { level: "warn", message: `第 ${payload.round_index} 轮保留待补残量 ${payload.carryover_qty}` };
+      return { level: "warn", message: `第 ${payload.round_index} 轮保留未完成数量 ${payload.carryover_qty}` };
     case "round_completed":
-      return { level: "success", message: `第 ${payload.round_index} 轮开仓完成，残量 ${payload.stage2_remaining_qty || "0"}` };
+      return { level: "success", message: `第 ${payload.round_index} 轮开仓完成，未完成数量 ${payload.stage2_remaining_qty || "0"}` };
     case "round_skipped":
       return { level: "warn", message: `第 ${payload.round_index} 轮因 \u9636\u6bb51 连续零成交被跳过` };
     case "final_alignment_started":
-      return { level: "warn", message: `开始最终市价对齐，当前残量 ${payload.carryover_qty}` };
+      return { level: "warn", message: `开始最终市价对齐，当前未完成数量 ${payload.carryover_qty}` };
     case "final_alignment_market_reduce":
       return { level: "warn", message: `最终对齐减仓 ${payload.position_side} ${payload.qty}` };
     case "final_alignment_flatten_both_sides":
@@ -1244,7 +1261,7 @@ function updateRealSessionStats(session) {
   document.getElementById("statSessionStatus").textContent = session.status || "idle";
   document.getElementById("statMode").textContent = formatModeLabel(session.session_kind || executionMode);
   document.getElementById("statRounds").textContent = `${terminalRounds} / ${session.round_count || 0}`;
-  document.getElementById("statCarryoverQty").textContent = formatNumber(session.stage2_carryover_qty || 0, 6);
+  document.getElementById("statCarryoverQty").textContent = formatNumber(resolveResidualQty(session), 6);
   document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(session.final_alignment_status);
   document.getElementById("statLastQty").textContent = formatNumber(session.round_qty || 0, 8);
   accountSelect.disabled = !isTerminalSession(session.status);
@@ -2056,7 +2073,7 @@ function applyPrecheckResult(mode, precheck) {
       minNotional: Number((derived.min_notional ?? currentSymbolInfo.min_notional) || 0),
     });
     document.getElementById("statMode").textContent = formatModeLabel(mode);
-    document.getElementById("statCarryoverQty").textContent = formatNumber(derived.carryover_qty || 0, 6);
+    document.getElementById("statCarryoverQty").textContent = formatNumber(resolveResidualQty(derived), 6);
     document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(derived.final_alignment_status);
   }
   const failure = firstFailingPrecheckItem(precheck);

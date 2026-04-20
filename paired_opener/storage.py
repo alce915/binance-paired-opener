@@ -65,6 +65,12 @@ class SqliteRepository:
                     order_ttl_ms INTEGER NOT NULL,
                     max_zero_fill_retries INTEGER NOT NULL,
                     market_fallback_attempts INTEGER NOT NULL,
+                    execution_profile TEXT NOT NULL DEFAULT 'balanced',
+                    market_fallback_max_ratio TEXT NOT NULL DEFAULT '1',
+                    market_fallback_min_residual_qty TEXT NOT NULL DEFAULT '0',
+                    max_reprice_ticks INTEGER,
+                    max_spread_bps INTEGER,
+                    max_reference_deviation_bps INTEGER,
                     round_interval_seconds INTEGER NOT NULL DEFAULT 3,
                     open_mode TEXT,
                     close_mode TEXT,
@@ -117,6 +123,12 @@ class SqliteRepository:
             self._ensure_column("sessions", "account_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column("sessions", "account_name", "TEXT NOT NULL DEFAULT '默认账户'")
             self._ensure_column("sessions", "round_interval_seconds", "INTEGER NOT NULL DEFAULT 3")
+            self._ensure_column("sessions", "execution_profile", "TEXT NOT NULL DEFAULT 'balanced'")
+            self._ensure_column("sessions", "market_fallback_max_ratio", "TEXT NOT NULL DEFAULT '1'")
+            self._ensure_column("sessions", "market_fallback_min_residual_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "max_reprice_ticks", "INTEGER")
+            self._ensure_column("sessions", "max_spread_bps", "INTEGER")
+            self._ensure_column("sessions", "max_reference_deviation_bps", "INTEGER")
             self._ensure_column("sessions", "open_mode", "TEXT")
             self._ensure_column("sessions", "close_mode", "TEXT")
             self._ensure_column("sessions", "selected_position_side", "TEXT")
@@ -148,10 +160,12 @@ class SqliteRepository:
                 INSERT INTO sessions (
                     session_id, session_kind, account_id, account_name, symbol, trend_bias, leverage, round_count, round_qty,
                     poll_interval_ms, order_ttl_ms, max_zero_fill_retries, market_fallback_attempts,
+                    execution_profile, market_fallback_max_ratio, market_fallback_min_residual_qty,
+                    max_reprice_ticks, max_spread_bps, max_reference_deviation_bps,
                     round_interval_seconds, open_mode, close_mode, selected_position_side, target_open_qty, target_close_qty, created_by, status, created_at, updated_at, last_error,
                     last_error_category, last_error_strategy, last_error_code, last_error_operator_action,
                     stage2_carryover_qty, final_alignment_status, final_unaligned_qty, completed_with_final_alignment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.session_id,
@@ -167,6 +181,12 @@ class SqliteRepository:
                     session.spec.order_ttl_ms,
                     session.spec.max_zero_fill_retries,
                     session.spec.market_fallback_attempts,
+                    session.spec.execution_profile.value,
+                    str(session.spec.market_fallback_max_ratio),
+                    str(session.spec.market_fallback_min_residual_qty),
+                    session.spec.max_reprice_ticks,
+                    session.spec.max_spread_bps,
+                    session.spec.max_reference_deviation_bps,
                     session.spec.round_interval_seconds,
                     session.spec.open_mode.value if session.spec.open_mode else None,
                     session.spec.close_mode.value if session.spec.close_mode else None,

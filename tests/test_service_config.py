@@ -9,6 +9,7 @@ import pytest
 
 from paired_opener.config import Settings
 from paired_opener.domain import (
+    ExecutionProfile,
     ExchangeOrder,
     ExchangeOrderStatus,
     ExchangeStateError,
@@ -25,14 +26,15 @@ from paired_opener.domain import (
     SessionSpec,
     SessionStatus,
     SingleCloseMode,
+    SingleOpenMode,
     SymbolRules,
     TrendBias,
 )
 from paired_opener.engine import PairedOpeningEngine, SessionControl
 from paired_opener.errors import ErrorCategory, ErrorStrategy, TradingError
 from paired_opener.exchange import ExchangeGateway
-from paired_opener.service import ManagedSession, OpenSessionService
-from paired_opener.schemas import CloseSessionRequest, OpenSessionRequest, SessionPrecheckRequest, SingleCloseSessionRequest, SingleOpenSessionRequest
+from paired_opener.service import ManagedSession, OpenSessionService, SessionPrecheckFailed
+from paired_opener.schemas import CloseSessionRequest, OpenSessionRequest, SessionPrecheckRequest, SessionSummary, SingleCloseSessionRequest, SingleOpenSessionRequest
 from paired_opener.storage import SqliteRepository
 
 class SimpleGateway(ExchangeGateway):
@@ -72,13 +74,13 @@ class SimpleGateway(ExchangeGateway):
         )
 
     async def get_quote(self, symbol: str) -> Quote:
-        return Quote(symbol=symbol, bid_price=Decimal("100"), ask_price=Decimal("101"))
+        return Quote(symbol=symbol, bid_price=Decimal("100"), ask_price=Decimal("100.01"))
 
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict:
         return {
             "symbol": symbol,
             "bids": [{"price": Decimal("100"), "qty": Decimal("1")}],
-            "asks": [{"price": Decimal("101"), "qty": Decimal("1")}],
+            "asks": [{"price": Decimal("100.01"), "qty": Decimal("1")}],
             "event_time": datetime.now(UTC),
         }
 
@@ -254,6 +256,16 @@ class RoundAbortClock:
             self.control.aborted = True
             self.aborted = True
 
+
+class ResidualEngine:
+    def __init__(self, residual_qty: Decimal) -> None:
+        self.residual_qty = residual_qty
+
+    async def execute_session(self, session: OpenSession, control: SessionControl) -> tuple[int, int]:
+        session.final_unaligned_qty = self.residual_qty
+        session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
+        return 1, 0
+
 @pytest.mark.asyncio
 async def test_update_whitelist_persists_symbols(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"], symbol_whitelist_file=tmp_path / "wl.json")
@@ -403,13 +415,24 @@ async def test_service_marks_incomplete_sessions_exception_on_startup(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_create_single_open_session_rejects_symbol_outside_whitelist(tmp_path: Path) -> None:
+    class HedgeModeUnreadableGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            self.ensure_calls += 1
+
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
     repository = SqliteRepository(tmp_path / "single-open-whitelist.db")
-    gateway = SimpleGateway()
+    gateway = HedgeModeUnreadableGateway()
     engine = PairedOpeningEngine(gateway, repository)
     service = OpenSessionService(settings, repository, gateway, engine)
 
-    with pytest.raises(ValueError, match="白名单|无法真实开仓"):
+    with pytest.raises(ValueError, match="whitelist|白名单|Symbol"):
         await service.create_single_open_session(
             SingleOpenSessionRequest(
                 symbol="ETHUSDT",
@@ -420,6 +443,48 @@ async def test_create_single_open_session_rejects_symbol_outside_whitelist(tmp_p
                 round_count=1,
             )
         )
+
+    assert gateway.ensure_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_create_open_session_system_order_conflict_does_not_confirm_hedge_mode(tmp_path: Path) -> None:
+    class HedgeModeUnreadableGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            self.ensure_calls += 1
+
+        async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+            return [{"clientOrderId": "12345678-1234-1234-1234-123456789abc-stage1", "status": "NEW"}]
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "open-session-system-order-conflict.db")
+    gateway = HedgeModeUnreadableGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    with pytest.raises(SessionPrecheckFailed) as exc_info:
+        await service.create_open_session(
+            OpenSessionRequest(
+                symbol="BTCUSDT",
+                trend_bias=TrendBias.LONG,
+                leverage=10,
+                round_count=1,
+                round_qty=Decimal("0.050"),
+            )
+        )
+
+    failure = next(item for item in exc_info.value.precheck["checks"] if item["code"] == "system_open_orders")
+    assert failure["status"] == "fail"
+    assert gateway.ensure_calls == 0
+
+
 @pytest.mark.asyncio
 async def test_create_session_rejects_round_notional_below_minimum(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
@@ -428,7 +493,7 @@ async def test_create_session_rejects_round_notional_below_minimum(tmp_path: Pat
     engine = PairedOpeningEngine(gateway, repository)
     service = OpenSessionService(settings, repository, gateway, engine)
 
-    with pytest.raises(ValueError, match="最小下单金额"):
+    with pytest.raises(ValueError, match="最小.*金额|无法开单"):
         await service.create_session(
             OpenSessionRequest(
                 symbol="BTCUSDT",
@@ -438,6 +503,39 @@ async def test_create_session_rejects_round_notional_below_minimum(tmp_path: Pat
                 round_qty=Decimal("0.001"),
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_create_open_session_invalid_symbol_does_not_confirm_hedge_mode(tmp_path: Path) -> None:
+    class HedgeModeUnreadableGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            self.ensure_calls += 1
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "open-session-whitelist.db")
+    gateway = HedgeModeUnreadableGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    with pytest.raises(ValueError, match="whitelist|Symbol"):
+        await service.create_open_session(
+            OpenSessionRequest(
+                symbol="ETHUSDT",
+                trend_bias=TrendBias.LONG,
+                leverage=10,
+                round_count=1,
+                round_qty=Decimal("0.050"),
+            )
+        )
+
+    assert gateway.ensure_calls == 0
 
 
 
@@ -856,6 +954,111 @@ async def test_create_single_open_session_regular_short_uses_sell_short_orders(t
 
 
 @pytest.mark.asyncio
+async def test_create_single_open_session_regular_still_requires_hedge_mode_confirmation(tmp_path: Path) -> None:
+    class HedgeModeUnreadableGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            self.ensure_calls += 1
+            raise RuntimeError("Binance API 鉴权失败")
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "single-open-regular-hedge-mode.db")
+    gateway = HedgeModeUnreadableGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    with pytest.raises(SessionPrecheckFailed):
+        await service.create_single_open_session(
+            SingleOpenSessionRequest(
+                symbol="BTCUSDT",
+                open_mode="regular",
+                selected_position_side=PositionSide.LONG,
+                open_qty=Decimal("0.050"),
+                leverage=50,
+                round_count=1,
+            )
+        )
+
+    assert gateway.ensure_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_single_open_regular_display_precheck_stays_read_only_when_hedge_state_unreadable(tmp_path: Path) -> None:
+    class HedgeModeUnreadableGateway(SimpleGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            self.ensure_calls += 1
+            raise RuntimeError("Binance API 鉴权失败")
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "single-open-regular-precheck-hedge-mode.db")
+    gateway = HedgeModeUnreadableGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    precheck = await service.precheck_request(
+        SessionPrecheckRequest(
+            session_kind="single_open",
+            symbol="BTCUSDT",
+            open_mode="regular",
+            selected_position_side=PositionSide.LONG,
+            open_qty=Decimal("0.050"),
+            leverage=50,
+            round_count=1,
+        )
+    )
+
+    assert precheck["ok"] is True
+    hedge_check = next(item for item in precheck["checks"] if item["code"] == "hedge_mode")
+    assert hedge_check["status"] == "skip"
+    assert "普通预检阶段已跳过 Hedge Mode 严格确认" in hedge_check["message"]
+    assert gateway.ensure_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_create_single_open_session_align_still_requires_hedge_mode_confirmation(tmp_path: Path) -> None:
+    class HedgeModeUnreadableGateway(SimpleGateway):
+        async def is_hedge_mode_enabled(self) -> bool:
+            raise RuntimeError("Binance API 鉴权失败")
+
+        async def ensure_hedge_mode(self) -> None:
+            raise RuntimeError("Binance API 鉴权失败")
+
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "single-open-align-hedge-mode.db")
+    gateway = HedgeModeUnreadableGateway()
+    gateway.positions = [
+        {"symbol": "BTCUSDT", "position_side": "LONG", "qty": Decimal("0.100"), "leverage": 50},
+        {"symbol": "BTCUSDT", "position_side": "SHORT", "qty": Decimal("0.250"), "leverage": 50},
+    ]
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    with pytest.raises(SessionPrecheckFailed):
+        await service.create_single_open_session(
+            SingleOpenSessionRequest(
+                symbol="BTCUSDT",
+                open_mode="align",
+                open_qty=Decimal("0.001"),
+                leverage=50,
+                round_count=1,
+            )
+        )
+
+
+@pytest.mark.asyncio
 async def test_create_single_open_session_rejects_when_existing_position_leverage_mismatches(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
     repository = SqliteRepository(tmp_path / "single-open-leverage-mismatch.db")
@@ -1038,6 +1241,109 @@ async def test_strict_precheck_fails_when_hedge_mode_confirmation_also_fails(tmp
     assert "执行链路确认失败" in failure["message"]
 
 
+@pytest.mark.asyncio
+async def test_single_open_precheck_exposes_resolved_execution_policy_fields(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "precheck-policy.db")
+    gateway = SimpleGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    precheck = await service.precheck_request(
+        SessionPrecheckRequest(
+            session_kind="single_open",
+            symbol="BTCUSDT",
+            open_mode="regular",
+            selected_position_side=PositionSide.LONG,
+            open_qty=Decimal("0.100"),
+            leverage=20,
+            round_count=2,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.4"),
+            max_spread_bps=6,
+        )
+    )
+
+    assert precheck["ok"] is True
+    assert precheck["derived"]["resolved_execution_profile"] == ExecutionProfile.MAKER_FIRST.value
+    assert precheck["derived"]["resolved_market_fallback_max_ratio"] == "0.4"
+    assert precheck["derived"]["resolved_market_fallback_min_residual_qty"] == "0"
+    assert precheck["derived"]["resolved_max_spread_bps"] == 6
+
+
+@pytest.mark.asyncio
+async def test_run_session_marks_completed_with_skips_when_residual_remains(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "session-residual-status.db")
+    gateway = SimpleGateway()
+    residual_engine = ResidualEngine(Decimal("0.005"))
+    service = OpenSessionService(
+        settings,
+        repository,
+        gateway,
+        PairedOpeningEngine(gateway, repository),
+        single_open_engine=residual_engine,
+    )
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=20,
+            round_count=1,
+            round_qty=Decimal("0.010"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repository.create_session(session)
+
+    await service._run_session(session, SessionControl())
+    payload = service.get_session(session.session_id)
+
+    assert payload["status"] == SessionStatus.COMPLETED_WITH_SKIPS.value
+    assert Decimal(payload["final_unaligned_qty"]) == Decimal("0.005")
+
+
+def test_session_summary_includes_residual_fields_for_incremental_updates() -> None:
+    summary = SessionSummary.model_validate(
+        {
+            "session_id": "session-1",
+            "session_kind": SessionKind.SINGLE_OPEN,
+            "account_id": "default",
+            "account_name": "默认账户",
+            "symbol": "BTCUSDT",
+            "trend_bias": TrendBias.LONG,
+            "leverage": 20,
+            "round_count": 1,
+            "round_qty": Decimal("0.010"),
+            "status": SessionStatus.COMPLETED_WITH_SKIPS,
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+            "stage2_carryover_qty": Decimal("0.005"),
+            "final_alignment_status": FinalAlignmentStatus.NOT_NEEDED,
+            "final_unaligned_qty": Decimal("0.005"),
+        }
+    )
+
+    payload = summary.model_dump(mode="json")
+
+    assert payload["stage2_carryover_qty"] == "0.005"
+    assert payload["final_alignment_status"] == FinalAlignmentStatus.NOT_NEEDED.value
+    assert payload["final_unaligned_qty"] == "0.005"
+
+
 
 
 @pytest.mark.asyncio
@@ -1155,6 +1461,94 @@ async def test_startup_recovery_marks_non_recoverable_when_single_close_position
 
 
 @pytest.mark.asyncio
+async def test_startup_recovery_marks_finished_paired_open_as_non_recoverable(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "startup-recovery-finished-open.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.PAIRED_OPEN,
+        )
+    )
+    repository.create_session(session)
+    repository.upsert_round(
+        RoundExecution(
+            session_id=session.session_id,
+            round_index=1,
+            status=RoundStatus.ROUND_COMPLETED,
+            stage1_filled_qty=Decimal("0.100"),
+            stage2_filled_qty=Decimal("0.100"),
+            ended_at=datetime.now(UTC),
+        )
+    )
+
+    await service.evaluate_startup_recovery()
+    payload = repository.get_session(session.session_id)
+
+    assert payload is not None
+    assert payload["status"] == SessionStatus.COMPLETED.value
+    assert payload["recovery_status"] is None
+    assert payload["recovery_summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_marks_exhausted_single_open_with_residual_as_non_recoverable(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "startup-recovery-finished-single-open.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=25,
+            round_count=1,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.SINGLE_OPEN,
+            open_mode=SingleOpenMode.REGULAR,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.100"),
+        )
+    )
+    repository.create_session(session)
+    repository.upsert_round(
+        RoundExecution(
+            session_id=session.session_id,
+            round_index=1,
+            status=RoundStatus.ROUND_COMPLETED,
+            stage1_filled_qty=Decimal("0.050"),
+            ended_at=datetime.now(UTC),
+        )
+    )
+    session.final_unaligned_qty = Decimal("0.050")
+    repository.update_session_runtime(session)
+
+    await service.evaluate_startup_recovery()
+    payload = repository.get_session(session.session_id)
+
+    assert payload is not None
+    assert payload["status"] == SessionStatus.COMPLETED_WITH_SKIPS.value
+    assert payload["recovery_status"] is None
+    assert payload["recovery_summary"] is None
+
+
+@pytest.mark.asyncio
 async def test_resume_recoverable_exception_session_restarts_from_next_round(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
     repository = SqliteRepository(tmp_path / "resume-recoverable.db")
@@ -1263,4 +1657,99 @@ async def test_resume_rejects_manual_confirmation_and_non_recoverable_sessions(t
         await service.resume_session(manual_session.session_id)
     with pytest.raises(ExchangeStateError, match="不可恢复"):
         await service.resume_session(blocked_session.session_id)
+
+
+def test_build_session_from_payload_preserves_null_price_guards_for_recovery(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "build-session-null-price-guards.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.PAIRED_OPEN,
+            max_reprice_ticks=None,
+            max_spread_bps=None,
+            max_reference_deviation_bps=None,
+        )
+    )
+    repository.create_session(session)
+
+    payload = repository.get_session(session.session_id)
+
+    assert payload is not None
+    rebuilt = service._build_session_from_payload(payload)
+
+    assert rebuilt.spec.max_reprice_ticks is None
+    assert rebuilt.spec.max_spread_bps is None
+    assert rebuilt.spec.max_reference_deviation_bps is None
+
+
+def test_repository_backfills_null_tick_guard_for_legacy_sessions(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-tick-guard.db"
+    repository = SqliteRepository(db_path)
+    with repository._connection:
+        repository._connection.execute("DROP TABLE sessions")
+        repository._connection.execute(
+            '''
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                trend_bias TEXT NOT NULL,
+                leverage INTEGER NOT NULL,
+                round_count INTEGER NOT NULL,
+                round_qty TEXT NOT NULL,
+                poll_interval_ms INTEGER NOT NULL,
+                order_ttl_ms INTEGER NOT NULL,
+                max_zero_fill_retries INTEGER NOT NULL,
+                market_fallback_attempts INTEGER NOT NULL,
+                created_by TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_error TEXT
+            )
+            '''
+        )
+        repository._connection.execute(
+            """
+            INSERT INTO sessions (
+                session_id, symbol, trend_bias, leverage, round_count, round_qty,
+                poll_interval_ms, order_ttl_ms, max_zero_fill_retries, market_fallback_attempts,
+                created_by, status, created_at, updated_at, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-session",
+                "BTCUSDT",
+                "long",
+                20,
+                1,
+                "0.100",
+                50,
+                3000,
+                2,
+                2,
+                "test",
+                "running",
+                datetime.now(UTC).isoformat(),
+                datetime.now(UTC).isoformat(),
+                None,
+            ),
+        )
+    repository._initialize()
+
+    payload = repository.get_session("legacy-session")
+
+    assert payload is not None
+    assert payload["max_reprice_ticks"] is None
 

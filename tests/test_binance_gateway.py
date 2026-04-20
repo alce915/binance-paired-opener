@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -156,3 +157,86 @@ async def test_get_account_overview_includes_mark_and_liquidation_prices() -> No
     assert payload["source"] == "papi"
     assert payload["positions"][0]["mark_price"] == Decimal("80500")
     assert payload["positions"][0]["liquidation_price"] == Decimal("70000")
+
+
+@pytest.mark.asyncio
+async def test_gateway_exposes_cached_order_and_stream_health() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
+    gateway._order_cache["123"] = ExchangeOrder(
+        symbol="BTCUSDT",
+        order_id="123",
+        client_order_id="123",
+        side=OrderSide.BUY,
+        position_side=PositionSide.LONG,
+        type="LIMIT",
+        price=Decimal("100"),
+        orig_qty=Decimal("1"),
+        executed_qty=Decimal("0.4"),
+        status=ExchangeOrderStatus.PARTIALLY_FILLED,
+        update_time=datetime.now(UTC),
+    )
+    gateway._user_stream_last_activity = gateway._monotonic()
+    gateway._user_stream_connected = True
+    gateway._user_stream_task = asyncio.create_task(asyncio.sleep(1))
+    try:
+        cached = gateway.get_cached_order("BTCUSDT", "123")
+        healthy = gateway.is_order_stream_healthy()
+    finally:
+        await gateway.close()
+
+    assert cached is not None
+    assert cached.order_id == "123"
+    assert healthy is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_treats_new_user_stream_as_healthy_before_first_event() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
+    started = asyncio.Event()
+
+    async def fake_start_listen_key() -> str:
+        return "listen-key"
+
+    async def fake_run_user_stream() -> None:
+        gateway._user_stream_connected = True
+        started.set()
+        await asyncio.sleep(10)
+
+    gateway._start_listen_key = fake_start_listen_key  # type: ignore[method-assign]
+    gateway._run_user_stream = fake_run_user_stream  # type: ignore[method-assign]
+    try:
+        await gateway._ensure_user_stream()
+        await asyncio.wait_for(started.wait(), timeout=1)
+        healthy = gateway.is_order_stream_healthy()
+    finally:
+        await gateway.close()
+
+    assert healthy is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_keeps_connected_but_quiet_user_stream_healthy() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
+    gateway._user_stream_last_activity = gateway._monotonic() - 30
+    gateway._user_stream_connected = True
+    gateway._user_stream_task = asyncio.create_task(asyncio.sleep(1))
+    try:
+        healthy = gateway.is_order_stream_healthy()
+    finally:
+        await gateway.close()
+
+    assert healthy is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_treats_reconnecting_user_stream_as_unhealthy() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
+    gateway._user_stream_last_activity = gateway._monotonic()
+    gateway._user_stream_connected = False
+    gateway._user_stream_task = asyncio.create_task(asyncio.sleep(1))
+    try:
+        healthy = gateway.is_order_stream_healthy()
+    finally:
+        await gateway.close()
+
+    assert healthy is False

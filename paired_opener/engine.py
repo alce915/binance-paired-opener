@@ -24,6 +24,8 @@ from paired_opener.domain import (
     SymbolRules,
     TrendBias,
 )
+from paired_opener.errors import MatchingFailureError
+from paired_opener.execution_policy import compute_market_fallback_qty, evaluate_price_guard, policy_from_spec
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.rounding import min_qty_for_notional, normalize_price, normalize_qty, validate_qty_and_notional
 from paired_opener.storage import SqliteRepository
@@ -217,25 +219,101 @@ class PairedOpeningEngine:
         max_zero_fill_retries: int,
         market_fallback_attempts: int = 0,
     ) -> _StageResult:
+        return await self._execute_limit_leg(
+            session=session,
+            control=control,
+            label=label,
+            round_index=round_index,
+            side=side,
+            position_side=position_side,
+            qty=qty,
+            price_selector=price_selector,
+            max_zero_fill_retries=max_zero_fill_retries,
+            market_fallback_attempts=market_fallback_attempts,
+            allow_partial_requote=label != "stage1",
+            allow_market_fallback=label != "stage1",
+            residual_event_name="stage2_below_min_carryover" if label == "stage2" else f"{label}_below_min_residual",
+        )
+
+    async def _execute_limit_leg(
+        self,
+        *,
+        session: OpenSession,
+        control: SessionControl,
+        label: str,
+        round_index: int,
+        side: OrderSide,
+        position_side: PositionSide,
+        qty: Decimal,
+        price_selector: Callable[[Quote], Decimal],
+        max_zero_fill_retries: int,
+        market_fallback_attempts: int,
+        allow_partial_requote: bool,
+        allow_market_fallback: bool,
+        residual_event_name: str,
+    ) -> _StageResult:
         spec = session.spec
+        policy = policy_from_spec(spec)
         rules = await self._gateway.get_symbol_rules(spec.symbol)
         remaining_qty = normalize_qty(qty, rules)
         total_filled = Decimal("0")
         zero_fill_retries = 0
         market_fallback_used = False
+        reference_price: Decimal | None = None
+        last_price: Decimal | None = None
 
         while remaining_qty > Decimal("0"):
             await self._respect_control(control)
             quote = await self._gateway.get_quote(spec.symbol)
             price = normalize_price(price_selector(quote), rules)
+            if reference_price is None:
+                reference_price = price
+            guard = evaluate_price_guard(
+                policy=policy,
+                side=side,
+                quote=quote,
+                candidate_price=price,
+                reference_price=reference_price,
+                rules=rules,
+            )
+            if guard is not None:
+                self._repository.add_event(
+                    session.session_id,
+                    "price_guard_blocked",
+                    {
+                        "round_index": round_index,
+                        "label": label,
+                        "code": guard.code,
+                        "message": guard.message,
+                        **guard.details,
+                    },
+                    round_index=round_index,
+                )
+                return _StageResult(
+                    filled_qty=total_filled,
+                    remaining_qty=remaining_qty,
+                    zero_fill_retries=zero_fill_retries,
+                    market_fallback_used=market_fallback_used,
+                )
+            if last_price is not None and price != last_price:
+                self._repository.add_event(
+                    session.session_id,
+                    "execution_repriced",
+                    {
+                        "round_index": round_index,
+                        "label": label,
+                        "from_price": str(last_price),
+                        "to_price": str(price),
+                    },
+                    round_index=round_index,
+                )
+            last_price = price
             try:
                 validate_qty_and_notional(remaining_qty, price, rules)
             except ValueError as exc:
-                if label != "stage2":
-                    raise
                 self._repository.add_event(
                     session.session_id,
-                    "stage2_below_min_carryover",
+                    residual_event_name,
                     {
                         "round_index": round_index,
                         "remaining_qty": str(remaining_qty),
@@ -268,10 +346,18 @@ class PairedOpeningEngine:
                     "price": str(price),
                     "side": side.value,
                     "position_side": position_side.value,
+                    "execution_profile": policy.execution_profile.value,
                 },
                 round_index=round_index,
             )
-            observation = await self._observe_order(spec, order, control=control)
+            observation = await self._observe_order(
+                spec,
+                order,
+                control=control,
+                session=session,
+                round_index=round_index,
+                label=label,
+            )
             if observation.order.executed_qty > Decimal("0"):
                 cancel_state = await self._cancel_if_open(observation.order)
                 filled_qty = max(observation.order.executed_qty, cancel_state.executed_qty)
@@ -289,12 +375,10 @@ class PairedOpeningEngine:
                     },
                     round_index=round_index,
                 )
-                if label == "stage1":
-                    return _StageResult(filled_qty=total_filled, remaining_qty=remaining_qty, zero_fill_retries=0, market_fallback_used=False)
-                if remaining_qty <= Decimal("0"):
+                if not allow_partial_requote or remaining_qty <= Decimal("0"):
                     return _StageResult(
                         filled_qty=total_filled,
-                        remaining_qty=Decimal("0"),
+                        remaining_qty=remaining_qty,
                         zero_fill_retries=0,
                         market_fallback_used=market_fallback_used,
                     )
@@ -317,12 +401,10 @@ class PairedOpeningEngine:
                     },
                     round_index=round_index,
                 )
-                if label == "stage1":
-                    return _StageResult(filled_qty=total_filled, remaining_qty=remaining_qty, zero_fill_retries=0, market_fallback_used=False)
-                if remaining_qty <= Decimal("0"):
+                if not allow_partial_requote or remaining_qty <= Decimal("0"):
                     return _StageResult(
                         filled_qty=total_filled,
-                        remaining_qty=Decimal("0"),
+                        remaining_qty=remaining_qty,
                         zero_fill_retries=0,
                         market_fallback_used=market_fallback_used,
                     )
@@ -335,31 +417,78 @@ class PairedOpeningEngine:
                 {"round_index": round_index, "order_id": order.order_id, "retry": zero_fill_retries},
                 round_index=round_index,
             )
-            if zero_fill_retries >= max_zero_fill_retries:
-                if label == "stage1":
-                    return _StageResult(
-                        filled_qty=Decimal("0"),
-                        remaining_qty=remaining_qty,
-                        zero_fill_retries=zero_fill_retries,
-                        market_fallback_used=False,
-                    )
-                market_fallback_used = True
-                total_filled += await self._market_fill_remaining(
-                    session=session,
-                    round_index=round_index,
-                    side=side,
-                    position_side=position_side,
+            if zero_fill_retries < max_zero_fill_retries:
+                continue
+            if not allow_market_fallback:
+                return _StageResult(
+                    filled_qty=total_filled,
                     remaining_qty=remaining_qty,
-                    attempts=market_fallback_attempts,
-                    label=label,
-                    control=control,
+                    zero_fill_retries=zero_fill_retries,
+                    market_fallback_used=market_fallback_used,
+                )
+
+            fallback_qty = compute_market_fallback_qty(policy, remaining_qty, rules)
+            if fallback_qty <= Decimal("0"):
+                self._repository.add_event(
+                    session.session_id,
+                    "session_residual_recorded",
+                    {
+                        "round_index": round_index,
+                        "label": label,
+                        "remaining_qty": str(remaining_qty),
+                        "reason": "market_fallback_disabled_or_zero",
+                    },
+                    round_index=round_index,
                 )
                 return _StageResult(
                     filled_qty=total_filled,
-                    remaining_qty=Decimal("0"),
+                    remaining_qty=remaining_qty,
                     zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=True,
+                    market_fallback_used=market_fallback_used,
                 )
+
+            market_fallback_used = True
+            filled_market = await self._market_fill_qty(
+                session=session,
+                round_index=round_index,
+                side=side,
+                position_side=position_side,
+                qty=fallback_qty,
+                attempts=market_fallback_attempts,
+                label=label,
+                control=control,
+            )
+            total_filled += filled_market
+            remaining_qty = normalize_qty(remaining_qty - filled_market, rules)
+            self._repository.add_event(
+                session.session_id,
+                "market_fallback_applied",
+                {
+                    "round_index": round_index,
+                    "label": label,
+                    "filled_qty": str(filled_market),
+                    "remaining_qty": str(remaining_qty),
+                    "fallback_qty": str(fallback_qty),
+                },
+                round_index=round_index,
+            )
+            if remaining_qty > Decimal("0"):
+                self._repository.add_event(
+                    session.session_id,
+                    "session_residual_recorded",
+                    {
+                        "round_index": round_index,
+                        "label": label,
+                        "remaining_qty": str(remaining_qty),
+                    },
+                    round_index=round_index,
+                )
+            return _StageResult(
+                filled_qty=total_filled,
+                remaining_qty=remaining_qty,
+                zero_fill_retries=zero_fill_retries,
+                market_fallback_used=market_fallback_used,
+            )
 
         return _StageResult(
             filled_qty=total_filled,
@@ -540,9 +669,32 @@ class PairedOpeningEngine:
         label: str,
         control: SessionControl,
     ) -> Decimal:
+        return await self._market_fill_qty(
+            session=session,
+            round_index=round_index,
+            side=side,
+            position_side=position_side,
+            qty=remaining_qty,
+            attempts=attempts,
+            label=label,
+            control=control,
+        )
+
+    async def _market_fill_qty(
+        self,
+        *,
+        session: OpenSession,
+        round_index: int,
+        side: OrderSide,
+        position_side: PositionSide,
+        qty: Decimal,
+        attempts: int,
+        label: str,
+        control: SessionControl,
+    ) -> Decimal:
         spec = session.spec
         rules = await self._gateway.get_symbol_rules(spec.symbol)
-        rest_qty = normalize_qty(remaining_qty, rules)
+        rest_qty = normalize_qty(qty, rules)
         filled_total = Decimal("0")
         for attempt in range(1, attempts + 1):
             if rest_qty <= Decimal("0"):
@@ -554,7 +706,15 @@ class PairedOpeningEngine:
                 qty=rest_qty,
                 client_order_id=f"{session.session_id}-{round_index}-{label}-market-{attempt}",
             )
-            observation = await self._observe_order(spec, order, control=control, ttl_override_ms=1000)
+            observation = await self._observe_order(
+                spec,
+                order,
+                control=control,
+                ttl_override_ms=1000,
+                session=session,
+                round_index=round_index,
+                label=label,
+            )
             filled_qty = observation.order.executed_qty
             filled_total += filled_qty
             rest_qty = normalize_qty(rest_qty - filled_qty, rules)
@@ -585,13 +745,40 @@ class PairedOpeningEngine:
         *,
         control: SessionControl,
         ttl_override_ms: int | None = None,
+        session: OpenSession | None = None,
+        round_index: int | None = None,
+        label: str | None = None,
     ) -> PollObservation:
         deadline = self._monotonic() + ((ttl_override_ms or spec.order_ttl_ms) / 1000)
         current = order
         poll_schedule = self._poll_delay_schedule(spec.poll_interval_ms)
         poll_index = 0
+        degraded_recorded = False
         while self._monotonic() < deadline:
             await self._respect_control(control, allow_abort=False, allow_pause=False)
+            cached = self._gateway.get_cached_order(spec.symbol, order.order_id)
+            stream_healthy = self._gateway.is_order_stream_healthy()
+            if cached is not None and stream_healthy:
+                current = cached
+                if current.status == ExchangeOrderStatus.REJECTED:
+                    raise MatchingFailureError(
+                        f"Order {order.order_id} was rejected by exchange",
+                        code="order_rejected",
+                        context={"symbol": spec.symbol, "order_id": order.order_id},
+                    )
+                if current.status == ExchangeOrderStatus.FILLED:
+                    return PollObservation(order=current, filled_qty=current.executed_qty, had_fill=True, terminal=True)
+                if current.executed_qty > Decimal("0"):
+                    return PollObservation(order=current, filled_qty=current.executed_qty, had_fill=True, terminal=False)
+            if cached is not None and not stream_healthy:
+                if session is not None and not degraded_recorded:
+                    self._repository.add_event(
+                        session.session_id,
+                        "user_stream_degraded",
+                        {"round_index": round_index, "label": label, "order_id": order.order_id},
+                        round_index=round_index,
+                    )
+                    degraded_recorded = True
             current = await self._gateway.get_order(symbol=spec.symbol, order_id=order.order_id)
             if current.status == ExchangeOrderStatus.REJECTED:
                 raise MatchingFailureError(
@@ -699,6 +886,10 @@ class PairedOpeningEngine:
 class SingleOpeningEngine(PairedOpeningEngine):
     async def execute_session(self, session: OpenSession, control: SessionControl) -> tuple[int, int]:
         next_round_index, completed_rounds, skipped_rounds = self._resume_round_progress(session)
+        if next_round_index <= 1:
+            session.stage2_carryover_qty = Decimal("0")
+            session.final_unaligned_qty = Decimal("0")
+            session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
         for round_index in range(next_round_index, session.spec.round_count + 1):
             await self._respect_control(control)
             execution = await self.execute_round(session=session, round_index=round_index, control=control)
@@ -787,6 +978,9 @@ class SingleOpeningEngine(PairedOpeningEngine):
         execution.notes["round_target_qty"] = str(target_qty)
         execution.notes["round_remaining_qty"] = str(stage_result.remaining_qty)
         execution.notes["remaining_target_qty_out"] = str(normalize_qty(remaining_target_qty - stage_result.filled_qty, rules))
+        session.stage2_carryover_qty = Decimal("0")
+        session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
+        session.final_unaligned_qty = normalize_qty(remaining_target_qty - stage_result.filled_qty, rules)
         execution.status = RoundStatus.ROUND_COMPLETED if stage_result.filled_qty > Decimal("0") else RoundStatus.STAGE1_SKIPPED
         execution.ended_at = datetime.now(UTC)
         self._repository.upsert_round(execution)
@@ -819,114 +1013,20 @@ class SingleOpeningEngine(PairedOpeningEngine):
         max_zero_fill_retries: int,
         market_fallback_attempts: int = 0,
     ) -> _StageResult:
-        spec = session.spec
-        rules = await self._gateway.get_symbol_rules(spec.symbol)
-        target_qty = normalize_qty(qty, rules)
-        zero_fill_retries = 0
-        market_fallback_used = False
-
-        while target_qty > Decimal("0"):
-            await self._respect_control(control)
-            quote = await self._gateway.get_quote(spec.symbol)
-            price = normalize_price(price_selector(quote), rules)
-            validate_qty_and_notional(target_qty, price, rules)
-            order = await self._gateway.place_limit_order(
-                symbol=spec.symbol,
-                side=side,
-                position_side=position_side,
-                qty=target_qty,
-                price=price,
-                client_order_id=f"{session.session_id}-{round_index}-{label}-{zero_fill_retries + 1}",
-            )
-            self._repository.add_event(
-                session.session_id,
-                f"{label}_order_placed",
-                {
-                    "round_index": round_index,
-                    "order_id": order.order_id,
-                    "qty": str(target_qty),
-                    "price": str(price),
-                    "side": side.value,
-                    "position_side": position_side.value,
-                },
-                round_index=round_index,
-            )
-            observation = await self._observe_order(spec, order, control=control)
-            if observation.order.executed_qty > Decimal("0"):
-                cancel_state = await self._cancel_if_open(observation.order)
-                filled_qty = max(observation.order.executed_qty, cancel_state.executed_qty)
-                remaining_qty = normalize_qty(target_qty - filled_qty, rules)
-                self._repository.add_event(
-                    session.session_id,
-                    f"{label}_fill",
-                    {
-                        "round_index": round_index,
-                        "order_id": order.order_id,
-                        "filled_qty": str(filled_qty),
-                        "remaining_qty": str(remaining_qty),
-                    },
-                    round_index=round_index,
-                )
-                return _StageResult(
-                    filled_qty=filled_qty,
-                    remaining_qty=remaining_qty,
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=market_fallback_used,
-                )
-
-            cancel_state = await self._cancel_if_open(observation.order)
-            if cancel_state.executed_qty > Decimal("0"):
-                filled_qty = cancel_state.executed_qty
-                remaining_qty = normalize_qty(target_qty - filled_qty, rules)
-                self._repository.add_event(
-                    session.session_id,
-                    f"{label}_late_fill",
-                    {
-                        "round_index": round_index,
-                        "order_id": order.order_id,
-                        "filled_qty": str(filled_qty),
-                        "remaining_qty": str(remaining_qty),
-                    },
-                    round_index=round_index,
-                )
-                return _StageResult(
-                    filled_qty=filled_qty,
-                    remaining_qty=remaining_qty,
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=market_fallback_used,
-                )
-
-            zero_fill_retries += 1
-            self._repository.add_event(
-                session.session_id,
-                f"{label}_zero_fill_retry",
-                {"round_index": round_index, "order_id": order.order_id, "retry": zero_fill_retries},
-                round_index=round_index,
-            )
-            if zero_fill_retries >= max_zero_fill_retries:
-                market_fallback_used = True
-                filled_qty = await self._market_fill_remaining(
-                    session=session,
-                    round_index=round_index,
-                    side=side,
-                    position_side=position_side,
-                    remaining_qty=target_qty,
-                    attempts=market_fallback_attempts,
-                    label=label,
-                    control=control,
-                )
-                return _StageResult(
-                    filled_qty=filled_qty,
-                    remaining_qty=Decimal("0"),
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=True,
-                )
-
-        return _StageResult(
-            filled_qty=Decimal("0"),
-            remaining_qty=Decimal("0"),
-            zero_fill_retries=zero_fill_retries,
-            market_fallback_used=market_fallback_used,
+        return await self._execute_limit_leg(
+            session=session,
+            control=control,
+            label=label,
+            round_index=round_index,
+            side=side,
+            position_side=position_side,
+            qty=qty,
+            price_selector=price_selector,
+            max_zero_fill_retries=max_zero_fill_retries,
+            market_fallback_attempts=market_fallback_attempts,
+            allow_partial_requote=False,
+            allow_market_fallback=True,
+            residual_event_name=f"{label}_below_min_residual",
         )
 
     def _single_open_opened_qty(self, session: OpenSession) -> Decimal:
@@ -1043,6 +1143,9 @@ class SingleClosingEngine(PairedOpeningEngine):
         execution.notes["round_target_qty"] = str(target_qty)
         execution.notes["round_remaining_qty"] = str(stage_result.remaining_qty)
         execution.notes["remaining_target_qty_out"] = str(normalize_qty(remaining_target_qty - stage_result.filled_qty, rules))
+        session.stage2_carryover_qty = Decimal("0")
+        session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
+        session.final_unaligned_qty = normalize_qty(remaining_target_qty - stage_result.filled_qty, rules)
         execution.status = RoundStatus.ROUND_COMPLETED if stage_result.filled_qty > Decimal("0") else RoundStatus.STAGE1_SKIPPED
         execution.ended_at = datetime.now(UTC)
         self._repository.upsert_round(execution)
@@ -1075,114 +1178,20 @@ class SingleClosingEngine(PairedOpeningEngine):
         max_zero_fill_retries: int,
         market_fallback_attempts: int = 0,
     ) -> _StageResult:
-        spec = session.spec
-        rules = await self._gateway.get_symbol_rules(spec.symbol)
-        target_qty = normalize_qty(qty, rules)
-        zero_fill_retries = 0
-        market_fallback_used = False
-
-        while target_qty > Decimal("0"):
-            await self._respect_control(control)
-            quote = await self._gateway.get_quote(spec.symbol)
-            price = normalize_price(price_selector(quote), rules)
-            validate_qty_and_notional(target_qty, price, rules)
-            order = await self._gateway.place_limit_order(
-                symbol=spec.symbol,
-                side=side,
-                position_side=position_side,
-                qty=target_qty,
-                price=price,
-                client_order_id=f"{session.session_id}-{round_index}-{label}-{zero_fill_retries + 1}",
-            )
-            self._repository.add_event(
-                session.session_id,
-                f"{label}_order_placed",
-                {
-                    "round_index": round_index,
-                    "order_id": order.order_id,
-                    "qty": str(target_qty),
-                    "price": str(price),
-                    "side": side.value,
-                    "position_side": position_side.value,
-                },
-                round_index=round_index,
-            )
-            observation = await self._observe_order(spec, order, control=control)
-            if observation.order.executed_qty > Decimal("0"):
-                cancel_state = await self._cancel_if_open(observation.order)
-                filled_qty = max(observation.order.executed_qty, cancel_state.executed_qty)
-                remaining_qty = normalize_qty(target_qty - filled_qty, rules)
-                self._repository.add_event(
-                    session.session_id,
-                    f"{label}_fill",
-                    {
-                        "round_index": round_index,
-                        "order_id": order.order_id,
-                        "filled_qty": str(filled_qty),
-                        "remaining_qty": str(remaining_qty),
-                    },
-                    round_index=round_index,
-                )
-                return _StageResult(
-                    filled_qty=filled_qty,
-                    remaining_qty=remaining_qty,
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=market_fallback_used,
-                )
-
-            cancel_state = await self._cancel_if_open(observation.order)
-            if cancel_state.executed_qty > Decimal("0"):
-                filled_qty = cancel_state.executed_qty
-                remaining_qty = normalize_qty(target_qty - filled_qty, rules)
-                self._repository.add_event(
-                    session.session_id,
-                    f"{label}_late_fill",
-                    {
-                        "round_index": round_index,
-                        "order_id": order.order_id,
-                        "filled_qty": str(filled_qty),
-                        "remaining_qty": str(remaining_qty),
-                    },
-                    round_index=round_index,
-                )
-                return _StageResult(
-                    filled_qty=filled_qty,
-                    remaining_qty=remaining_qty,
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=market_fallback_used,
-                )
-
-            zero_fill_retries += 1
-            self._repository.add_event(
-                session.session_id,
-                f"{label}_zero_fill_retry",
-                {"round_index": round_index, "order_id": order.order_id, "retry": zero_fill_retries},
-                round_index=round_index,
-            )
-            if zero_fill_retries >= max_zero_fill_retries:
-                market_fallback_used = True
-                filled_qty = await self._market_fill_remaining(
-                    session=session,
-                    round_index=round_index,
-                    side=side,
-                    position_side=position_side,
-                    remaining_qty=target_qty,
-                    attempts=market_fallback_attempts,
-                    label=label,
-                    control=control,
-                )
-                return _StageResult(
-                    filled_qty=filled_qty,
-                    remaining_qty=Decimal("0"),
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=True,
-                )
-
-        return _StageResult(
-            filled_qty=Decimal("0"),
-            remaining_qty=Decimal("0"),
-            zero_fill_retries=zero_fill_retries,
-            market_fallback_used=market_fallback_used,
+        return await self._execute_limit_leg(
+            session=session,
+            control=control,
+            label=label,
+            round_index=round_index,
+            side=side,
+            position_side=position_side,
+            qty=qty,
+            price_selector=price_selector,
+            max_zero_fill_retries=max_zero_fill_retries,
+            market_fallback_attempts=market_fallback_attempts,
+            allow_partial_requote=False,
+            allow_market_fallback=True,
+            residual_event_name=f"{label}_below_min_residual",
         )
 
     def _single_close_closed_qty(self, session: OpenSession) -> Decimal:
@@ -1368,154 +1377,20 @@ class PairedClosingEngine(PairedOpeningEngine):
         max_zero_fill_retries: int,
         market_fallback_attempts: int = 0,
     ) -> _StageResult:
-        spec = session.spec
-        rules = await self._gateway.get_symbol_rules(spec.symbol)
-        remaining_qty = normalize_qty(qty, rules)
-        total_filled = Decimal("0")
-        zero_fill_retries = 0
-        market_fallback_used = False
-
-        while remaining_qty > Decimal("0"):
-            await self._respect_control(control)
-            quote = await self._gateway.get_quote(spec.symbol)
-            price = normalize_price(price_selector(quote), rules)
-            try:
-                validate_qty_and_notional(remaining_qty, price, rules)
-            except ValueError:
-                if label != "close_stage2":
-                    raise
-                self._repository.add_event(
-                    session.session_id,
-                    "close_stage2_below_min_carryover",
-                    {
-                        "round_index": round_index,
-                        "remaining_qty": str(remaining_qty),
-                        "price": str(price),
-                    },
-                    round_index=round_index,
-                )
-                return _StageResult(
-                    filled_qty=total_filled,
-                    remaining_qty=remaining_qty,
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=market_fallback_used,
-                )
-            order = await self._gateway.place_limit_order(
-                symbol=spec.symbol,
-                side=side,
-                position_side=position_side,
-                qty=remaining_qty,
-                price=price,
-                client_order_id=f"{session.session_id}-{round_index}-{label}-{zero_fill_retries + 1}",
-            )
-            self._repository.add_event(
-                session.session_id,
-                f"{label}_order_placed",
-                {
-                    "round_index": round_index,
-                    "order_id": order.order_id,
-                    "qty": str(remaining_qty),
-                    "price": str(price),
-                    "side": side.value,
-                    "position_side": position_side.value,
-                },
-                round_index=round_index,
-            )
-            observation = await self._observe_order(spec, order, control=control)
-            if observation.order.executed_qty > Decimal("0"):
-                cancel_state = await self._cancel_if_open(observation.order)
-                filled_qty = max(observation.order.executed_qty, cancel_state.executed_qty)
-                total_filled += filled_qty
-                remaining_qty = normalize_qty(remaining_qty - filled_qty, rules)
-                zero_fill_retries = 0
-                self._repository.add_event(
-                    session.session_id,
-                    f"{label}_fill",
-                    {
-                        "round_index": round_index,
-                        "order_id": order.order_id,
-                        "filled_qty": str(filled_qty),
-                        "remaining_qty": str(remaining_qty),
-                    },
-                    round_index=round_index,
-                )
-                if label == "close_stage1":
-                    return _StageResult(filled_qty=total_filled, remaining_qty=remaining_qty, zero_fill_retries=0, market_fallback_used=False)
-                if remaining_qty <= Decimal("0"):
-                    return _StageResult(
-                        filled_qty=total_filled,
-                        remaining_qty=Decimal("0"),
-                        zero_fill_retries=0,
-                        market_fallback_used=market_fallback_used,
-                    )
-                continue
-
-            cancel_state = await self._cancel_if_open(observation.order)
-            if cancel_state.executed_qty > Decimal("0"):
-                filled_qty = cancel_state.executed_qty
-                total_filled += filled_qty
-                remaining_qty = normalize_qty(remaining_qty - filled_qty, rules)
-                zero_fill_retries = 0
-                self._repository.add_event(
-                    session.session_id,
-                    f"{label}_late_fill",
-                    {
-                        "round_index": round_index,
-                        "order_id": order.order_id,
-                        "filled_qty": str(filled_qty),
-                        "remaining_qty": str(remaining_qty),
-                    },
-                    round_index=round_index,
-                )
-                if label == "close_stage1":
-                    return _StageResult(filled_qty=total_filled, remaining_qty=remaining_qty, zero_fill_retries=0, market_fallback_used=False)
-                if remaining_qty <= Decimal("0"):
-                    return _StageResult(
-                        filled_qty=total_filled,
-                        remaining_qty=Decimal("0"),
-                        zero_fill_retries=0,
-                        market_fallback_used=market_fallback_used,
-                    )
-                continue
-
-            zero_fill_retries += 1
-            self._repository.add_event(
-                session.session_id,
-                f"{label}_zero_fill_retry",
-                {"round_index": round_index, "order_id": order.order_id, "retry": zero_fill_retries},
-                round_index=round_index,
-            )
-            if zero_fill_retries >= max_zero_fill_retries:
-                if label == "close_stage1":
-                    return _StageResult(
-                        filled_qty=Decimal("0"),
-                        remaining_qty=remaining_qty,
-                        zero_fill_retries=zero_fill_retries,
-                        market_fallback_used=False,
-                    )
-                market_fallback_used = True
-                total_filled += await self._market_fill_remaining(
-                    session=session,
-                    round_index=round_index,
-                    side=side,
-                    position_side=position_side,
-                    remaining_qty=remaining_qty,
-                    attempts=market_fallback_attempts,
-                    label=label,
-                    control=control,
-                )
-                return _StageResult(
-                    filled_qty=total_filled,
-                    remaining_qty=Decimal("0"),
-                    zero_fill_retries=zero_fill_retries,
-                    market_fallback_used=True,
-                )
-
-        return _StageResult(
-            filled_qty=total_filled,
-            remaining_qty=remaining_qty,
-            zero_fill_retries=zero_fill_retries,
-            market_fallback_used=market_fallback_used,
+        return await self._execute_limit_leg(
+            session=session,
+            control=control,
+            label=label,
+            round_index=round_index,
+            side=side,
+            position_side=position_side,
+            qty=qty,
+            price_selector=price_selector,
+            max_zero_fill_retries=max_zero_fill_retries,
+            market_fallback_attempts=market_fallback_attempts,
+            allow_partial_requote=label != "close_stage1",
+            allow_market_fallback=label != "close_stage1",
+            residual_event_name="close_stage2_below_min_carryover" if label == "close_stage2" else f"{label}_below_min_residual",
         )
 
     async def _run_close_final_alignment(self, session: OpenSession, control: SessionControl) -> None:

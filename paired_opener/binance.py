@@ -66,6 +66,8 @@ class BinanceFuturesGateway(ExchangeGateway):
         self._depth_tasks: dict[str, asyncio.Task[None]] = {}
         self._user_stream_task: asyncio.Task[None] | None = None
         self._listen_key: str | None = None
+        self._user_stream_last_activity: float | None = None
+        self._user_stream_connected = False
 
     def _monotonic(self) -> float:
         return asyncio.get_running_loop().time()
@@ -82,6 +84,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         self._quote_tasks.clear()
         self._depth_tasks.clear()
         self._user_stream_task = None
+        self._user_stream_connected = False
         await self._client.aclose()
         await self._papi_client.aclose()
 
@@ -128,10 +131,13 @@ class BinanceFuturesGateway(ExchangeGateway):
         if self._user_stream_task is not None or not self._account.api_key:
             return
         self._listen_key = await self._start_listen_key()
+        self._user_stream_last_activity = self._monotonic()
+        self._user_stream_connected = False
         self._user_stream_task = asyncio.create_task(self._run_user_stream())
 
     def _order_from_stream(self, payload: dict[str, Any]) -> ExchangeOrder:
         order = payload["o"]
+        event_time = payload.get("E") or payload.get("T")
         return ExchangeOrder(
             symbol=order["s"],
             order_id=str(order["i"]),
@@ -143,6 +149,7 @@ class BinanceFuturesGateway(ExchangeGateway):
             orig_qty=Decimal(order.get("q") or "0"),
             executed_qty=Decimal(order.get("z") or "0"),
             status=ExchangeOrderStatus(order["X"]),
+            update_time=datetime.fromtimestamp(event_time / 1000, tz=UTC) if event_time else datetime.now(UTC),
             raw=payload,
         )
 
@@ -154,19 +161,26 @@ class BinanceFuturesGateway(ExchangeGateway):
             stream = f"{self._account.effective_websocket_base_url}/{listen_key}"
             try:
                 async with websockets.connect(stream, ping_interval=20, ping_timeout=20) as websocket:
+                    self._user_stream_connected = True
+                    self._user_stream_last_activity = self._monotonic()
                     async for message in websocket:
                         now = self._monotonic()
                         if now >= keepalive_at:
                             await self._keepalive_listen_key()
                             keepalive_at = now + 30 * 60
                         payload = json.loads(message)
+                        self._user_stream_last_activity = now
                         if payload.get("e") == "ORDER_TRADE_UPDATE":
                             order = self._order_from_stream(payload)
                             self._order_cache[order.order_id] = order
             except asyncio.CancelledError:
+                self._user_stream_connected = False
                 raise
             except Exception:
+                self._user_stream_connected = False
                 await asyncio.sleep(1)
+            finally:
+                self._user_stream_connected = False
 
     async def ensure_hedge_mode(self) -> None:
         await self._ensure_user_stream()
@@ -788,6 +802,21 @@ class BinanceFuturesGateway(ExchangeGateway):
         order = self._to_order(payload)
         self._order_cache[order.order_id] = order
         return order
+
+    def get_cached_order(self, symbol: str, order_id: str) -> ExchangeOrder | None:
+        cached = self._order_cache.get(order_id)
+        if cached is None:
+            return None
+        if cached.symbol.upper() != symbol.upper():
+            return None
+        return cached
+
+    def is_order_stream_healthy(self) -> bool:
+        return (
+            self._user_stream_task is not None
+            and not self._user_stream_task.done()
+            and self._user_stream_connected
+        )
 
 
 

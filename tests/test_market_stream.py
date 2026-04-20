@@ -42,7 +42,7 @@ class SlowGateway(ExchangeGateway):
         )
 
     async def get_quote(self, symbol: str) -> Quote:
-        return Quote(symbol=symbol, bid_price=Decimal("100"), ask_price=Decimal("101"))
+        return Quote(symbol=symbol, bid_price=Decimal("100"), ask_price=Decimal("100.01"))
 
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict:
         self.started.set()
@@ -50,7 +50,7 @@ class SlowGateway(ExchangeGateway):
         return {
             "symbol": symbol,
             "bids": [{"price": Decimal("100"), "qty": Decimal("1")}],
-            "asks": [{"price": Decimal("101"), "qty": Decimal("1")}],
+            "asks": [{"price": Decimal("100.01"), "qty": Decimal("1")}],
             "event_time": datetime.now(UTC),
         }
 
@@ -139,10 +139,10 @@ async def test_run_simulation_keeps_min_notional_fields_in_progress_stats() -> N
         round_count=1,
     )
 
-    assert payload["status"] == "completed"
+    assert payload["status"] == "completed_with_skips"
     assert payload["min_notional"] == "5"
-    assert payload["carryover_qty"] == "0"
-    assert payload["final_alignment_status"] == "not_needed"
+    assert payload["carryover_qty"] == "1.688"
+    assert payload["final_alignment_status"] == "carryover_pending"
 
 
 @pytest.mark.asyncio
@@ -262,7 +262,7 @@ class SimulationGateway(SlowGateway):
         return {
             "symbol": symbol,
             "bids": [{"price": Decimal("100"), "qty": Decimal("1")}],
-            "asks": [{"price": Decimal("101"), "qty": Decimal("1")}],
+            "asks": [{"price": Decimal("100.01"), "qty": Decimal("1")}],
             "event_time": datetime.now(UTC),
         }
 
@@ -276,6 +276,26 @@ class SimulationGateway(SlowGateway):
 
     async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
         return list(self.open_orders)
+
+
+class SequencedSimulationGateway(SimulationGateway):
+    def __init__(self, order_books: list[tuple[Decimal, Decimal]]) -> None:
+        super().__init__()
+        self._order_books = list(order_books)
+        self._order_book_index = 0
+
+    async def get_order_book(self, symbol: str, limit: int = 10) -> dict:
+        if self._order_book_index < len(self._order_books):
+            bid_price, ask_price = self._order_books[self._order_book_index]
+            self._order_book_index += 1
+        else:
+            bid_price, ask_price = self._order_books[-1]
+        return {
+            "symbol": symbol,
+            "bids": [{"price": bid_price, "qty": Decimal("1")}],
+            "asks": [{"price": ask_price, "qty": Decimal("1")}],
+            "event_time": datetime.now(UTC),
+        }
 
 
 @pytest.mark.asyncio
@@ -319,9 +339,10 @@ async def test_run_simulation_single_open_align_uses_smaller_side_difference() -
         round_interval_seconds=0,
     )
 
-    assert payload["status"] == "completed"
+    assert payload["status"] == "completed_with_skips"
     assert payload["session_kind"] == SessionKind.SINGLE_OPEN.value
     assert payload["selected_position_side"] == PositionSide.LONG.value
+    assert payload["carryover_qty"] == "0.150"
     assert Decimal(payload["total_notional"]) > Decimal("0")
 
 
@@ -392,9 +413,215 @@ async def test_api_run_simulation_smoke_for_single_open(monkeypatch) -> None:
         )
     )
 
-    assert payload["status"] == "completed"
+    assert payload["status"] == "completed_with_skips"
     assert payload["session_kind"] == SessionKind.SINGLE_OPEN.value
     assert payload["selected_position_side"] == PositionSide.LONG.value
+    assert payload["carryover_qty"] == "0.150"
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_returns_resolved_execution_policy_fields() -> None:
+    gateway = SimulationGateway()
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_OPEN,
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        open_qty=Decimal("0.050"),
+        leverage=25,
+        round_count=1,
+        round_interval_seconds=0,
+        execution_profile="maker_first",
+        market_fallback_max_ratio=Decimal("0.4"),
+        market_fallback_min_residual_qty=Decimal("0.001"),
+        max_reprice_ticks=2,
+        max_spread_bps=7,
+        max_reference_deviation_bps=12,
+    )
+
+    assert payload["status"] == "completed_with_skips"
+    assert payload["carryover_qty"] == "0.030"
+    assert payload["resolved_execution_profile"] == "maker_first"
+    assert payload["resolved_market_fallback_max_ratio"] == "0.4"
+    assert payload["resolved_market_fallback_min_residual_qty"] == "0.001"
+    assert payload["resolved_max_reprice_ticks"] == 2
+    assert payload["resolved_max_spread_bps"] == 7
+    assert payload["resolved_max_reference_deviation_bps"] == 12
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_paired_open_derives_stage2_from_stage1_fill(monkeypatch) -> None:
+    gateway = SimulationGateway()
+    controller = MarketStreamController(gateway)
+    calls: list[tuple[Decimal, bool]] = []
+
+    def scripted_simulate_leg_fill(*, requested_qty: Decimal, rules: SymbolRules, allow_market_fallback: bool) -> tuple[Decimal, Decimal]:
+        calls.append((requested_qty, allow_market_fallback))
+        if len(calls) == 1:
+            return Decimal("4"), Decimal("5")
+        if len(calls) == 2:
+            return Decimal("3"), Decimal("1")
+        raise AssertionError("unexpected extra stage simulation call")
+
+    monkeypatch.setattr(controller, "_simulate_leg_fill", scripted_simulate_leg_fill)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.PAIRED_OPEN,
+        symbol="BTCUSDT",
+        trend_bias=TrendBias.LONG,
+        open_amount=Decimal("90"),
+        leverage=10,
+        round_count=1,
+        round_interval_seconds=0,
+    )
+
+    assert calls == [(Decimal("9"), False), (Decimal("4"), True)]
+    assert payload["status"] == "completed_with_skips"
+    assert payload["carryover_qty"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_paired_open_keeps_stage1_progress_when_stage2_guard_hits(monkeypatch) -> None:
+    class Stage2GuardGateway(SimulationGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self._quote_calls = 0
+
+        async def get_quote(self, symbol: str) -> Quote:
+            self._quote_calls += 1
+            if self._quote_calls == 1:
+                return Quote(symbol=symbol, bid_price=Decimal("100"), ask_price=Decimal("100.01"))
+            return Quote(symbol=symbol, bid_price=Decimal("100"), ask_price=Decimal("102"))
+
+    gateway = Stage2GuardGateway()
+    controller = MarketStreamController(gateway)
+
+    def scripted_simulate_leg_fill(*, requested_qty: Decimal, rules: SymbolRules, allow_market_fallback: bool) -> tuple[Decimal, Decimal]:
+        if allow_market_fallback:
+            raise AssertionError("stage2 fill should not run once the guard blocks")
+        return Decimal("4"), Decimal("5")
+
+    monkeypatch.setattr(controller, "_simulate_leg_fill", scripted_simulate_leg_fill)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.PAIRED_OPEN,
+        symbol="BTCUSDT",
+        trend_bias=TrendBias.LONG,
+        open_amount=Decimal("90"),
+        leverage=10,
+        round_count=1,
+        round_interval_seconds=0,
+        max_spread_bps=8,
+    )
+
+    assert payload["status"] == "completed_with_skips"
+    assert payload["rounds_completed"] == 1
+    assert Decimal(payload["carryover_qty"]) == Decimal("4")
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_uses_default_maker_first_fallback_without_explicit_override() -> None:
+    gateway = SimulationGateway()
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_OPEN,
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        open_qty=Decimal("0.080"),
+        leverage=25,
+        round_count=1,
+        round_interval_seconds=0,
+    )
+
+    assert payload["resolved_execution_profile"] == "maker_first"
+    assert payload["resolved_market_fallback_max_ratio"] == "0.25"
+    assert payload["status"] == "completed_with_skips"
+    assert payload["carryover_qty"] == "0.060"
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_resets_price_guard_reference_each_round() -> None:
+    gateway = SequencedSimulationGateway(
+        [
+            (Decimal("100"), Decimal("100.01")),
+            (Decimal("101"), Decimal("101.01")),
+        ]
+    )
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_OPEN,
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        open_qty=Decimal("0.100"),
+        leverage=25,
+        round_count=2,
+        round_interval_seconds=0,
+        execution_profile="maker_first",
+        market_fallback_max_ratio=Decimal("1"),
+        max_reprice_ticks=3,
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["rounds_completed"] == 2
+    assert Decimal(payload["carryover_qty"]) == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_keeps_partial_progress_when_price_guard_hits_mid_session() -> None:
+    gateway = SequencedSimulationGateway(
+        [
+            (Decimal("100"), Decimal("100.01")),
+            (Decimal("100"), Decimal("102")),
+        ]
+    )
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_OPEN,
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        open_qty=Decimal("0.100"),
+        leverage=25,
+        round_count=2,
+        round_interval_seconds=0,
+        execution_profile="maker_first",
+        market_fallback_max_ratio=Decimal("1"),
+        max_spread_bps=8,
+    )
+
+    assert payload["status"] == "completed_with_skips"
+    assert payload["rounds_completed"] == 1
+    assert payload["carryover_qty"] == "0.050"
+    assert "价差" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_run_simulation_blocks_when_price_guard_hits() -> None:
+    gateway = SimulationGateway()
+    controller = MarketStreamController(gateway)
+
+    payload = await controller.run_simulation(
+        session_kind=SessionKind.SINGLE_OPEN,
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        open_qty=Decimal("0.050"),
+        leverage=25,
+        round_count=1,
+        round_interval_seconds=0,
+        execution_profile="maker_first",
+        max_spread_bps=0,
+    )
+
+    assert payload["status"] == "blocked"
+    assert "价差" in payload["message"]
 
 
 

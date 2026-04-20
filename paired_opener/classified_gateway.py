@@ -318,4 +318,10 @@ class ClassifiedExchangeGateway(ExchangeGateway):
     async def cancel_order(self, *, symbol: str, order_id: str) -> ExchangeOrder:
         return await self._call("cancel_order", lambda: self._delegate.cancel_order(symbol=symbol, order_id=order_id), symbol=symbol, order_id=order_id)
 
+    def get_cached_order(self, symbol: str, order_id: str) -> ExchangeOrder | None:
+        return self._delegate.get_cached_order(symbol, order_id)
+
+    def is_order_stream_healthy(self) -> bool:
+        return self._delegate.is_order_stream_healthy()
+
 

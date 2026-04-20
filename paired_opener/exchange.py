@@ -80,3 +80,9 @@ class ExchangeGateway(ABC):
     @abstractmethod
     async def cancel_order(self, *, symbol: str, order_id: str) -> ExchangeOrder:
         raise NotImplementedError
+
+    def get_cached_order(self, symbol: str, order_id: str) -> ExchangeOrder | None:
+        return None
+
+    def is_order_stream_healthy(self) -> bool:
+        return False

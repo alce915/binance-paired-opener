@@ -9,6 +9,7 @@ from typing import Any
 
 from paired_opener.config import Settings
 from paired_opener.domain import (
+    ExecutionProfile,
     ExchangeStateError,
     FinalAlignmentStatus,
     OpenSession,
@@ -30,6 +31,7 @@ from paired_opener.engine import (
     SingleClosingEngine,
     SingleOpeningEngine,
 )
+from paired_opener.execution_policy import ResolvedExecutionPolicy, resolve_execution_policy
 from paired_opener.errors import ErrorStrategy, TradingError, ensure_trading_error
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.rounding import normalize_price, normalize_qty, validate_qty_and_notional
@@ -131,6 +133,18 @@ class OpenSessionService:
             order_ttl_ms=int(payload.get("order_ttl_ms") or self._settings.default_order_ttl_ms),
             max_zero_fill_retries=int(payload.get("max_zero_fill_retries") or self._settings.default_max_zero_fill_retries),
             market_fallback_attempts=int(payload.get("market_fallback_attempts") or self._settings.default_market_fallback_attempts),
+            execution_profile=self._enum_value(payload.get("execution_profile"), ExecutionProfile, ExecutionProfile.BALANCED),
+            market_fallback_max_ratio=Decimal(str(payload.get("market_fallback_max_ratio")))
+            if payload.get("market_fallback_max_ratio") is not None
+            else Decimal("1"),
+            market_fallback_min_residual_qty=Decimal(str(payload.get("market_fallback_min_residual_qty")))
+            if payload.get("market_fallback_min_residual_qty") is not None
+            else Decimal("0"),
+            max_reprice_ticks=int(payload.get("max_reprice_ticks")) if payload.get("max_reprice_ticks") is not None else None,
+            max_spread_bps=int(payload.get("max_spread_bps")) if payload.get("max_spread_bps") is not None else None,
+            max_reference_deviation_bps=int(payload.get("max_reference_deviation_bps"))
+            if payload.get("max_reference_deviation_bps") is not None
+            else None,
             round_interval_seconds=int(payload.get("round_interval_seconds")) if payload.get("round_interval_seconds") is not None else 3,
             created_by=str(payload.get("created_by") or "manual"),
             session_kind=self._enum_value(payload.get("session_kind"), SessionKind, SessionKind.PAIRED_OPEN),
@@ -206,13 +220,35 @@ class OpenSessionService:
         summary: str,
         checked_at: datetime,
         details: dict[str, Any],
+        *,
+        final_status: SessionStatus | None = None,
     ) -> dict[str, Any]:
         return {
             "recovery_status": recovery_status,
             "recovery_summary": summary,
             "recovery_checked_at": checked_at,
             "recovery_details": details,
+            "final_status": final_status,
         }
+
+    def _completed_status_for_recovery(self, session: OpenSession, progress: dict[str, Any]) -> SessionStatus:
+        return (
+            SessionStatus.COMPLETED_WITH_SKIPS
+            if progress["skipped_rounds"] > 0 or session.final_unaligned_qty > Decimal("0")
+            else SessionStatus.COMPLETED
+        )
+
+    def _completed_status_with_remaining_qty(
+        self,
+        session: OpenSession,
+        progress: dict[str, Any],
+        remaining_qty: Decimal,
+    ) -> SessionStatus:
+        return (
+            SessionStatus.COMPLETED_WITH_SKIPS
+            if remaining_qty > Decimal("0") or progress["skipped_rounds"] > 0 or session.final_unaligned_qty > Decimal("0")
+            else SessionStatus.COMPLETED
+        )
 
     async def _evaluate_recovery_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         session = self._build_session_from_payload(payload)
@@ -233,6 +269,8 @@ class OpenSessionService:
             },
             "stage2_carryover_qty": str(session.stage2_carryover_qty),
         }
+        processed_rounds = progress["completed_rounds"] + progress["skipped_rounds"]
+        details["processed_rounds"] = processed_rounds
         if progress["non_terminal_rounds"]:
             return self._recovery_result(
                 RecoveryStatus.MANUAL_CONFIRMATION,
@@ -330,6 +368,7 @@ class OpenSessionService:
                     "双向平仓剩余数量已完成，无需恢复。",
                     checked_at,
                     details,
+                    final_status=self._completed_status_for_recovery(session, progress),
                 )
             if long_qty <= Decimal("0") or short_qty <= Decimal("0"):
                 return self._recovery_result(
@@ -337,6 +376,15 @@ class OpenSessionService:
                     "当前已不存在可继续双向平仓的双边持仓。",
                     checked_at,
                     details,
+                )
+        elif session.spec.session_kind == SessionKind.PAIRED_OPEN:
+            if processed_rounds >= session.spec.round_count and session.stage2_carryover_qty <= Decimal("0"):
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "双向开仓已完成，无需恢复。",
+                    checked_at,
+                    details,
+                    final_status=self._completed_status_for_recovery(session, progress),
                 )
         elif session.spec.session_kind == SessionKind.SINGLE_CLOSE:
             remaining_close_qty = max(Decimal("0"), session.spec.target_close_qty - progress["stage1_filled_total"])
@@ -374,24 +422,44 @@ class OpenSessionService:
                     "单向平仓剩余数量已完成，无需恢复。",
                     checked_at,
                     details,
+                    final_status=self._completed_status_for_recovery(session, progress),
                 )
-        elif session.spec.session_kind == SessionKind.SINGLE_OPEN and session.spec.open_mode == SingleOpenMode.ALIGN:
-            if long_qty == short_qty:
+        elif session.spec.session_kind == SessionKind.SINGLE_OPEN:
+            remaining_open_qty = max(Decimal("0"), session.spec.target_open_qty - progress["stage1_filled_total"])
+            details["remaining_target_open_qty"] = str(remaining_open_qty)
+            if remaining_open_qty <= Decimal("0") and session.stage2_carryover_qty <= Decimal("0"):
                 return self._recovery_result(
                     RecoveryStatus.NON_RECOVERABLE,
-                    "当前对齐差值已消失，无法继续恢复。",
+                    "单向开仓剩余数量已完成，无需恢复。",
                     checked_at,
                     details,
+                    final_status=self._completed_status_for_recovery(session, progress),
                 )
-            expected_side = PositionSide.LONG if long_qty < short_qty else PositionSide.SHORT
-            details["align_expected_side"] = expected_side.value
-            if session.spec.selected_position_side and expected_side != session.spec.selected_position_side:
+            if processed_rounds >= session.spec.round_count:
                 return self._recovery_result(
                     RecoveryStatus.NON_RECOVERABLE,
-                    "当前对齐方向已变化，无法继续恢复。",
+                    "单向开仓轮次已全部完成，无需恢复。",
                     checked_at,
                     details,
+                    final_status=self._completed_status_with_remaining_qty(session, progress, remaining_open_qty),
                 )
+            if session.spec.open_mode == SingleOpenMode.ALIGN:
+                if long_qty == short_qty:
+                    return self._recovery_result(
+                        RecoveryStatus.NON_RECOVERABLE,
+                        "当前对齐差值已消失，无法继续恢复。",
+                        checked_at,
+                        details,
+                    )
+                expected_side = PositionSide.LONG if long_qty < short_qty else PositionSide.SHORT
+                details["align_expected_side"] = expected_side.value
+                if session.spec.selected_position_side and expected_side != session.spec.selected_position_side:
+                    return self._recovery_result(
+                        RecoveryStatus.NON_RECOVERABLE,
+                        "当前对齐方向已变化，无法继续恢复。",
+                        checked_at,
+                        details,
+                    )
 
         return self._recovery_result(
             RecoveryStatus.RECOVERABLE,
@@ -407,23 +475,41 @@ class OpenSessionService:
             if full_payload is None:
                 continue
             recovery = await self._evaluate_recovery_payload(full_payload)
-            self._repository.update_session_status(
+            final_status = recovery.get("final_status")
+            if isinstance(final_status, SessionStatus):
+                self._repository.update_session_status(
+                    full_payload["session_id"],
+                    final_status,
+                    clear_recovery=True,
+                )
+            else:
+                self._repository.update_session_status(
+                    full_payload["session_id"],
+                    SessionStatus.EXCEPTION,
+                    last_error="Service restarted before session completion",
+                )
+                self._repository.update_session_recovery(
+                    full_payload["session_id"],
+                    recovery["recovery_status"],
+                    recovery["recovery_summary"],
+                    recovery["recovery_checked_at"],
+                    recovery["recovery_details"],
+                )
+            self._repository.add_event(
                 full_payload["session_id"],
-                SessionStatus.EXCEPTION,
-                last_error="Service restarted before session completion",
-            )
-            self._repository.update_session_recovery(
-                full_payload["session_id"],
-                recovery["recovery_status"],
-                recovery["recovery_summary"],
-                recovery["recovery_checked_at"],
-                recovery["recovery_details"],
+                "session_reconciled_on_recovery",
+                {
+                    "status": final_status.value if isinstance(final_status, SessionStatus) else SessionStatus.EXCEPTION.value,
+                    "recovery_status": recovery["recovery_status"].value,
+                    "summary": recovery["recovery_summary"],
+                    "details": recovery["recovery_details"],
+                },
             )
             self._repository.add_event(
                 full_payload["session_id"],
                 "session_recovery_evaluated",
                 {
-                    "status": SessionStatus.EXCEPTION.value,
+                    "status": final_status.value if isinstance(final_status, SessionStatus) else SessionStatus.EXCEPTION.value,
                     "recovery_status": recovery["recovery_status"].value,
                     "summary": recovery["recovery_summary"],
                     "checked_at": recovery["recovery_checked_at"].isoformat(),
@@ -525,6 +611,51 @@ class OpenSessionService:
             return "0"
         return str(value)
 
+    def _resolved_execution_policy(
+        self,
+        *,
+        session_kind: SessionKind,
+        execution_profile: ExecutionProfile | str | None = None,
+        market_fallback_max_ratio: Decimal | str | None = None,
+        market_fallback_min_residual_qty: Decimal | str | None = None,
+        max_reprice_ticks: int | None = None,
+        max_spread_bps: int | None = None,
+        max_reference_deviation_bps: int | None = None,
+    ) -> ResolvedExecutionPolicy:
+        return resolve_execution_policy(
+            self._settings,
+            session_kind=session_kind,
+            execution_profile=execution_profile,
+            market_fallback_max_ratio=market_fallback_max_ratio,
+            market_fallback_min_residual_qty=market_fallback_min_residual_qty,
+            max_reprice_ticks=max_reprice_ticks,
+            max_spread_bps=max_spread_bps,
+            max_reference_deviation_bps=max_reference_deviation_bps,
+        )
+
+    def _resolved_execution_policy_payload(
+        self,
+        *,
+        session_kind: SessionKind,
+        execution_profile: ExecutionProfile | str | None = None,
+        market_fallback_max_ratio: Decimal | str | None = None,
+        market_fallback_min_residual_qty: Decimal | str | None = None,
+        max_reprice_ticks: int | None = None,
+        max_spread_bps: int | None = None,
+        max_reference_deviation_bps: int | None = None,
+        prefix: str = "resolved_",
+    ) -> dict[str, Any]:
+        policy = self._resolved_execution_policy(
+            session_kind=session_kind,
+            execution_profile=execution_profile,
+            market_fallback_max_ratio=market_fallback_max_ratio,
+            market_fallback_min_residual_qty=market_fallback_min_residual_qty,
+            max_reprice_ticks=max_reprice_ticks,
+            max_spread_bps=max_spread_bps,
+            max_reference_deviation_bps=max_reference_deviation_bps,
+        )
+        return policy.to_payload(prefix=prefix)
+
     def _format_money(self, value: Decimal | int | float | str | None) -> str:
         if value is None:
             return "0.00"
@@ -568,6 +699,12 @@ class OpenSessionService:
                     leverage=request.leverage,
                     round_count=request.round_count,
                     round_qty=request.round_qty,
+                    execution_profile=request.execution_profile,
+                    market_fallback_max_ratio=request.market_fallback_max_ratio,
+                    market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+                    max_reprice_ticks=request.max_reprice_ticks,
+                    max_spread_bps=request.max_spread_bps,
+                    max_reference_deviation_bps=request.max_reference_deviation_bps,
                 ),
                 strict_hedge_mode=strict_hedge_mode,
             )
@@ -580,6 +717,12 @@ class OpenSessionService:
                 open_qty=request.open_qty,
                 selected_position_side=request.selected_position_side,
                 open_mode=request.open_mode,
+                execution_profile=request.execution_profile,
+                market_fallback_max_ratio=request.market_fallback_max_ratio,
+                market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+                max_reprice_ticks=request.max_reprice_ticks,
+                max_spread_bps=request.max_spread_bps,
+                max_reference_deviation_bps=request.max_reference_deviation_bps,
             ),
             strict_hedge_mode=strict_hedge_mode,
         )
@@ -605,11 +748,11 @@ class OpenSessionService:
                 )
             )
         except Exception as exc:
-            message = str(exc)
-            auth_read_failed = overview is not None and (("401 Unauthorized" in message) or ("fapi/v1/positionSide/dual" in message) or ("Binance API 鉴权失败" in message) or (("鉴权失败" in message) and ("双向持仓" in message or "position side" in message or "hedge mode" in message)))
+            auth_read_failed = overview is not None and self._is_hedge_mode_read_auth_failure(exc)
             if auth_read_failed:
                 if strict_hedge_mode:
-                    if self._hedge_mode_fallback_confirmed:
+                    try:
+                        await self._confirm_hedge_mode_for_execution()
                         checks.append(
                             self._precheck_item(
                                 "hedge_mode",
@@ -618,27 +761,15 @@ class OpenSessionService:
                                 "无法直接读取 FAPI 双向持仓状态，已按执行链路确认 Hedge Mode 可用。",
                             )
                         )
-                    else:
-                        try:
-                            await self._gateway.ensure_hedge_mode()
-                            self._hedge_mode_fallback_confirmed = True
-                            checks.append(
-                                self._precheck_item(
-                                    "hedge_mode",
-                                    "双向持仓",
-                                    "pass",
-                                    "无法直接读取 FAPI 双向持仓状态，已按执行链路确认 Hedge Mode 可用。",
-                                )
+                    except Exception as confirm_exc:
+                        checks.append(
+                            self._precheck_item(
+                                "hedge_mode",
+                                "双向持仓",
+                                "fail",
+                                str(confirm_exc),
                             )
-                        except Exception as confirm_exc:
-                            checks.append(
-                                self._precheck_item(
-                                    "hedge_mode",
-                                    "双向持仓",
-                                    "fail",
-                                    f"当前账户无法读取 FAPI 双向持仓状态，且执行链路确认失败: {confirm_exc}",
-                                )
-                            )
+                        )
                 else:
                     checks.append(
                         self._precheck_item(
@@ -662,6 +793,53 @@ class OpenSessionService:
         except Exception as exc:
             checks.append(self._precheck_item("quote", "参考价格", "fail", f"订单簿参考价格读取失败: {exc}"))
         return checks, overview, rules, current_leverage, quote
+
+    def _is_hedge_mode_read_auth_failure(self, exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            ("401 Unauthorized" in message)
+            or ("fapi/v1/positionSide/dual" in message)
+            or ("Binance API 鉴权失败" in message)
+            or (("鉴权失败" in message) and ("双向持仓" in message or "position side" in message or "hedge mode" in message))
+        )
+
+    async def _confirm_hedge_mode_for_execution(self) -> None:
+        try:
+            hedge_enabled = await self._gateway.is_hedge_mode_enabled()
+        except Exception as exc:
+            if not self._is_hedge_mode_read_auth_failure(exc):
+                raise RuntimeError(f"双向持仓状态读取失败: {exc}") from exc
+            if self._hedge_mode_fallback_confirmed:
+                return
+            try:
+                await self._gateway.ensure_hedge_mode()
+            except Exception as confirm_exc:
+                raise RuntimeError(f"当前账户无法读取 FAPI 双向持仓状态，且执行链路确认失败: {confirm_exc}") from confirm_exc
+            self._hedge_mode_fallback_confirmed = True
+            return
+        if hedge_enabled:
+            return
+        try:
+            await self._gateway.ensure_hedge_mode()
+        except Exception as exc:
+            raise RuntimeError(f"Hedge Mode 未启用，且开启失败: {exc}") from exc
+
+    def _with_hedge_mode_failure(self, precheck: dict[str, Any], message: str) -> dict[str, Any]:
+        checks = [dict(item) for item in precheck.get("checks", [])]
+        updated = False
+        for item in checks:
+            if item.get("code") == "hedge_mode":
+                item["status"] = "fail"
+                item["message"] = message
+                updated = True
+                break
+        if not updated:
+            checks.append(self._precheck_item("hedge_mode", "双向持仓", "fail", message))
+        payload = dict(precheck)
+        payload["ok"] = False
+        payload["checks"] = checks
+        payload["summary"] = message
+        return payload
     async def _common_precheck_context(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None, Any | None, int, Any | None]:
         symbol = request.symbol.upper()
         checks, overview, rules, current_leverage, quote = await self._account_status_snapshot(symbol, strict_hedge_mode=strict_hedge_mode)
@@ -718,6 +896,17 @@ class OpenSessionService:
             "total_notional": "0",
             "implied_margin_amount": "0",
         }
+        derived.update(
+            self._resolved_execution_policy_payload(
+                session_kind=request.session_kind,
+                execution_profile=request.execution_profile,
+                market_fallback_max_ratio=request.market_fallback_max_ratio,
+                market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+                max_reprice_ticks=request.max_reprice_ticks,
+                max_spread_bps=request.max_spread_bps,
+                max_reference_deviation_bps=request.max_reference_deviation_bps,
+            )
+        )
         return checks, derived, overview, rules, current_leverage, quote
 
     async def _precheck_paired_open(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> dict[str, Any]:
@@ -928,10 +1117,16 @@ class OpenSessionService:
 
     async def create_open_session(self, request: OpenSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
+        execution_policy = self._resolved_execution_policy(
+            session_kind=SessionKind.PAIRED_OPEN,
+            execution_profile=request.execution_profile,
+            market_fallback_max_ratio=request.market_fallback_max_ratio,
+            market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+            max_reprice_ticks=request.max_reprice_ticks,
+            max_spread_bps=request.max_spread_bps,
+            max_reference_deviation_bps=request.max_reference_deviation_bps,
+        )
         async with self._session_creation_lock:
-            precheck = await self.precheck_open_request(request, strict_hedge_mode=True)
-            if not precheck['ok']:
-                raise SessionPrecheckFailed(precheck)
             if symbol not in self._settings.normalized_whitelist:
                 raise ValueError(f"Symbol {symbol} is not in whitelist")
             self._ensure_no_active_symbol_session(symbol)
@@ -956,6 +1151,13 @@ class OpenSessionService:
                 raise ValueError(
                     f"开单金额 {implied_open_amount} 超过当前可用余额 {available_balance} 的 95%，无法开单"
                 )
+            precheck = await self.precheck_open_request(request, strict_hedge_mode=False)
+            if not precheck['ok']:
+                raise SessionPrecheckFailed(precheck)
+            try:
+                await self._confirm_hedge_mode_for_execution()
+            except Exception as exc:
+                raise SessionPrecheckFailed(self._with_hedge_mode_failure(precheck, str(exc))) from exc
 
             spec = SessionSpec(
                 symbol=symbol,
@@ -967,6 +1169,12 @@ class OpenSessionService:
                 order_ttl_ms=request.order_ttl_ms or self._settings.default_order_ttl_ms,
                 max_zero_fill_retries=request.max_zero_fill_retries or self._settings.default_max_zero_fill_retries,
                 market_fallback_attempts=request.market_fallback_attempts or self._settings.default_market_fallback_attempts,
+                execution_profile=execution_policy.execution_profile,
+                market_fallback_max_ratio=execution_policy.market_fallback_max_ratio,
+                market_fallback_min_residual_qty=execution_policy.market_fallback_min_residual_qty,
+                max_reprice_ticks=execution_policy.max_reprice_ticks,
+                max_spread_bps=execution_policy.max_spread_bps,
+                max_reference_deviation_bps=execution_policy.max_reference_deviation_bps,
                 round_interval_seconds=request.round_interval_seconds if request.round_interval_seconds is not None else 3,
                 created_by=request.created_by,
                 session_kind=SessionKind.PAIRED_OPEN,
@@ -988,6 +1196,7 @@ class OpenSessionService:
                     "account_name": self._account_name,
                     "min_notional": str(rules.min_notional),
                     "stage1_price": str(stage1_price),
+                    **execution_policy.to_payload(),
                 },
             )
         try:
@@ -1007,10 +1216,16 @@ class OpenSessionService:
 
     async def create_single_open_session(self, request: SingleOpenSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
+        execution_policy = self._resolved_execution_policy(
+            session_kind=SessionKind.SINGLE_OPEN,
+            execution_profile=request.execution_profile,
+            market_fallback_max_ratio=request.market_fallback_max_ratio,
+            market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+            max_reprice_ticks=request.max_reprice_ticks,
+            max_spread_bps=request.max_spread_bps,
+            max_reference_deviation_bps=request.max_reference_deviation_bps,
+        )
         async with self._session_creation_lock:
-            precheck = await self.precheck_open_request(request, strict_hedge_mode=True)
-            if not precheck['ok']:
-                raise SessionPrecheckFailed(precheck)
             if symbol not in self._settings.normalized_whitelist:
                 raise ValueError(f"Symbol {symbol} is not in whitelist")
             self._ensure_no_active_symbol_session(symbol)
@@ -1074,6 +1289,13 @@ class OpenSessionService:
                 raise ValueError(
                     f"开单金额 {implied_open_amount} 超过当前可用余额 {available_balance} 的 95%，无法单向开仓"
                 )
+            precheck = await self.precheck_open_request(request, strict_hedge_mode=False)
+            if not precheck['ok']:
+                raise SessionPrecheckFailed(precheck)
+            try:
+                await self._confirm_hedge_mode_for_execution()
+            except Exception as exc:
+                raise SessionPrecheckFailed(self._with_hedge_mode_failure(precheck, str(exc))) from exc
 
             trend_bias = TrendBias.LONG if selected_position_side == PositionSide.LONG else TrendBias.SHORT
             spec = SessionSpec(
@@ -1086,6 +1308,12 @@ class OpenSessionService:
                 order_ttl_ms=request.order_ttl_ms or self._settings.default_order_ttl_ms,
                 max_zero_fill_retries=request.max_zero_fill_retries or self._settings.default_max_zero_fill_retries,
                 market_fallback_attempts=request.market_fallback_attempts or self._settings.default_market_fallback_attempts,
+                execution_profile=execution_policy.execution_profile,
+                market_fallback_max_ratio=execution_policy.market_fallback_max_ratio,
+                market_fallback_min_residual_qty=execution_policy.market_fallback_min_residual_qty,
+                max_reprice_ticks=execution_policy.max_reprice_ticks,
+                max_spread_bps=execution_policy.max_spread_bps,
+                max_reference_deviation_bps=execution_policy.max_reference_deviation_bps,
                 round_interval_seconds=request.round_interval_seconds if request.round_interval_seconds is not None else 3,
                 created_by=request.created_by,
                 session_kind=SessionKind.SINGLE_OPEN,
@@ -1114,6 +1342,7 @@ class OpenSessionService:
                     "min_notional": str(rules.min_notional),
                     "requested_leverage": requested_leverage,
                     "leverage": effective_leverage,
+                    **execution_policy.to_payload(),
                 },
             )
         try:
@@ -1133,19 +1362,16 @@ class OpenSessionService:
 
     async def create_close_session(self, request: CloseSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
+        execution_policy = self._resolved_execution_policy(
+            session_kind=SessionKind.PAIRED_CLOSE,
+            execution_profile=request.execution_profile,
+            market_fallback_max_ratio=request.market_fallback_max_ratio,
+            market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+            max_reprice_ticks=request.max_reprice_ticks,
+            max_spread_bps=request.max_spread_bps,
+            max_reference_deviation_bps=request.max_reference_deviation_bps,
+        )
         async with self._session_creation_lock:
-            precheck = await self.precheck_request(
-                SessionPrecheckRequest(
-                    session_kind=SessionKind.PAIRED_CLOSE,
-                    symbol=request.symbol,
-                    trend_bias=request.trend_bias,
-                    close_qty=request.close_qty,
-                    round_count=request.round_count,
-                ),
-                strict_hedge_mode=True,
-            )
-            if not precheck['ok']:
-                raise SessionPrecheckFailed(precheck)
             self._ensure_no_active_symbol_session(symbol)
             rules = await self._gateway.get_symbol_rules(symbol)
             normalized_close_qty = normalize_qty(request.close_qty, rules)
@@ -1178,6 +1404,28 @@ class OpenSessionService:
                 raise ValueError(
                     f"每轮平仓金额 {self._format_money(round_qty * stage1_price)} 低于交易所最小下单金额 {self._format_money(getattr(rules, 'min_notional', Decimal('0')))}，无法平仓。"
                 ) from exc
+            precheck = await self.precheck_request(
+                SessionPrecheckRequest(
+                    session_kind=SessionKind.PAIRED_CLOSE,
+                    symbol=request.symbol,
+                    trend_bias=request.trend_bias,
+                    close_qty=request.close_qty,
+                    round_count=request.round_count,
+                    execution_profile=request.execution_profile,
+                    market_fallback_max_ratio=request.market_fallback_max_ratio,
+                    market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+                    max_reprice_ticks=request.max_reprice_ticks,
+                    max_spread_bps=request.max_spread_bps,
+                    max_reference_deviation_bps=request.max_reference_deviation_bps,
+                ),
+                strict_hedge_mode=False,
+            )
+            if not precheck['ok']:
+                raise SessionPrecheckFailed(precheck)
+            try:
+                await self._confirm_hedge_mode_for_execution()
+            except Exception as exc:
+                raise SessionPrecheckFailed(self._with_hedge_mode_failure(precheck, str(exc))) from exc
 
             spec = SessionSpec(
                 symbol=symbol,
@@ -1189,6 +1437,12 @@ class OpenSessionService:
                 order_ttl_ms=request.order_ttl_ms or self._settings.default_order_ttl_ms,
                 max_zero_fill_retries=request.max_zero_fill_retries or self._settings.default_max_zero_fill_retries,
                 market_fallback_attempts=request.market_fallback_attempts or self._settings.default_market_fallback_attempts,
+                execution_profile=execution_policy.execution_profile,
+                market_fallback_max_ratio=execution_policy.market_fallback_max_ratio,
+                market_fallback_min_residual_qty=execution_policy.market_fallback_min_residual_qty,
+                max_reprice_ticks=execution_policy.max_reprice_ticks,
+                max_spread_bps=execution_policy.max_spread_bps,
+                max_reference_deviation_bps=execution_policy.max_reference_deviation_bps,
                 round_interval_seconds=request.round_interval_seconds if request.round_interval_seconds is not None else 3,
                 created_by=request.created_by,
                 session_kind=SessionKind.PAIRED_CLOSE,
@@ -1214,6 +1468,7 @@ class OpenSessionService:
                     "min_notional": str(rules.min_notional),
                     "stage1_price": str(stage1_price),
                     "stage2_price": str(stage2_price),
+                    **execution_policy.to_payload(),
                 },
             )
         try:
@@ -1231,20 +1486,16 @@ class OpenSessionService:
 
     async def create_single_close_session(self, request: SingleCloseSessionRequest) -> OpenSession:
         symbol = request.symbol.upper()
+        execution_policy = self._resolved_execution_policy(
+            session_kind=SessionKind.SINGLE_CLOSE,
+            execution_profile=request.execution_profile,
+            market_fallback_max_ratio=request.market_fallback_max_ratio,
+            market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+            max_reprice_ticks=request.max_reprice_ticks,
+            max_spread_bps=request.max_spread_bps,
+            max_reference_deviation_bps=request.max_reference_deviation_bps,
+        )
         async with self._session_creation_lock:
-            precheck = await self.precheck_request(
-                SessionPrecheckRequest(
-                    session_kind=SessionKind.SINGLE_CLOSE,
-                    symbol=request.symbol,
-                    close_qty=request.close_qty,
-                    round_count=request.round_count,
-                    selected_position_side=request.selected_position_side,
-                    close_mode=request.close_mode,
-                ),
-                strict_hedge_mode=True,
-            )
-            if not precheck['ok']:
-                raise SessionPrecheckFailed(precheck)
             self._ensure_no_active_symbol_session(symbol)
             rules = await self._gateway.get_symbol_rules(symbol)
             account_overview = await self._gateway.get_account_overview()
@@ -1292,6 +1543,29 @@ class OpenSessionService:
                 raise ValueError(
                     f"每轮平仓金额 {self._format_money(round_qty * single_close_price)} 低于交易所最小下单金额 {self._format_money(getattr(rules, 'min_notional', Decimal('0')))}，无法平仓。"
                 ) from exc
+            precheck = await self.precheck_request(
+                SessionPrecheckRequest(
+                    session_kind=SessionKind.SINGLE_CLOSE,
+                    symbol=request.symbol,
+                    close_qty=request.close_qty,
+                    round_count=request.round_count,
+                    selected_position_side=request.selected_position_side,
+                    close_mode=request.close_mode,
+                    execution_profile=request.execution_profile,
+                    market_fallback_max_ratio=request.market_fallback_max_ratio,
+                    market_fallback_min_residual_qty=request.market_fallback_min_residual_qty,
+                    max_reprice_ticks=request.max_reprice_ticks,
+                    max_spread_bps=request.max_spread_bps,
+                    max_reference_deviation_bps=request.max_reference_deviation_bps,
+                ),
+                strict_hedge_mode=False,
+            )
+            if not precheck['ok']:
+                raise SessionPrecheckFailed(precheck)
+            try:
+                await self._confirm_hedge_mode_for_execution()
+            except Exception as exc:
+                raise SessionPrecheckFailed(self._with_hedge_mode_failure(precheck, str(exc))) from exc
 
             trend_bias = TrendBias.LONG if selected_position_side == PositionSide.LONG else TrendBias.SHORT
             spec = SessionSpec(
@@ -1304,6 +1578,12 @@ class OpenSessionService:
                 order_ttl_ms=request.order_ttl_ms or self._settings.default_order_ttl_ms,
                 max_zero_fill_retries=request.max_zero_fill_retries or self._settings.default_max_zero_fill_retries,
                 market_fallback_attempts=request.market_fallback_attempts or self._settings.default_market_fallback_attempts,
+                execution_profile=execution_policy.execution_profile,
+                market_fallback_max_ratio=execution_policy.market_fallback_max_ratio,
+                market_fallback_min_residual_qty=execution_policy.market_fallback_min_residual_qty,
+                max_reprice_ticks=execution_policy.max_reprice_ticks,
+                max_spread_bps=execution_policy.max_spread_bps,
+                max_reference_deviation_bps=execution_policy.max_reference_deviation_bps,
                 round_interval_seconds=request.round_interval_seconds if request.round_interval_seconds is not None else 3,
                 created_by=request.created_by,
                 session_kind=SessionKind.SINGLE_CLOSE,
@@ -1330,6 +1610,7 @@ class OpenSessionService:
                     "long_qty": str(long_qty),
                     "short_qty": str(short_qty),
                     "min_notional": str(rules.min_notional),
+                    **execution_policy.to_payload(),
                 },
             )
         try:
@@ -1357,7 +1638,11 @@ class OpenSessionService:
             self._repository.update_session_status(session.session_id, SessionStatus.RUNNING)
             completed_rounds, skipped_rounds = await engine.execute_session(session, control)
             self._repository.update_session_runtime(session)
-            final_status = SessionStatus.COMPLETED_WITH_SKIPS if skipped_rounds > 0 else SessionStatus.COMPLETED
+            final_status = (
+                SessionStatus.COMPLETED_WITH_SKIPS
+                if skipped_rounds > 0 or session.final_unaligned_qty > Decimal("0")
+                else SessionStatus.COMPLETED
+            )
             self._repository.update_session_status(session.session_id, final_status)
             self._repository.add_event(
                 session.session_id,

@@ -36,6 +36,11 @@ class SessionKind(StrEnum):
     SINGLE_CLOSE = "single_close"
 
 
+class ExecutionProfile(StrEnum):
+    MAKER_FIRST = "maker_first"
+    BALANCED = "balanced"
+
+
 class SessionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -136,6 +141,12 @@ class SessionSpec:
     order_ttl_ms: int
     max_zero_fill_retries: int
     market_fallback_attempts: int
+    execution_profile: ExecutionProfile = ExecutionProfile.BALANCED
+    market_fallback_max_ratio: Decimal = Decimal("1")
+    market_fallback_min_residual_qty: Decimal = Decimal("0")
+    max_reprice_ticks: int | None = 8
+    max_spread_bps: int | None = 20
+    max_reference_deviation_bps: int | None = 40
     round_interval_seconds: int = 3
     created_by: str = "system"
     session_kind: SessionKind = SessionKind.PAIRED_OPEN

@@ -3,6 +3,7 @@
 import json
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from pydantic import Field
@@ -89,6 +90,18 @@ class Settings(BaseSettings):
     default_order_ttl_ms: int = 3_000
     default_max_zero_fill_retries: int = 10
     default_market_fallback_attempts: int = 3
+    default_open_execution_profile: str = "maker_first"
+    default_close_execution_profile: str = "balanced"
+    maker_first_market_fallback_max_ratio: Decimal = Decimal("0.25")
+    maker_first_market_fallback_min_residual_qty: Decimal = Decimal("0")
+    maker_first_max_reprice_ticks: int = 3
+    maker_first_max_spread_bps: int = 8
+    maker_first_max_reference_deviation_bps: int = 15
+    balanced_market_fallback_max_ratio: Decimal = Decimal("1")
+    balanced_market_fallback_min_residual_qty: Decimal = Decimal("0")
+    balanced_max_reprice_ticks: int = 8
+    balanced_max_spread_bps: int = 20
+    balanced_max_reference_deviation_bps: int = 40
 
     accounts: dict[str, AccountConfig] = Field(default_factory=dict)
     active_account_id: str = "default"
