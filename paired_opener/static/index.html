@@ -302,6 +302,53 @@
         background: var(--danger-soft);
         border-color: rgba(198, 81, 77, 0.24);
       }
+      .status-banner {
+        display: grid;
+        gap: 10px;
+        margin-bottom: 14px;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid rgba(216, 197, 170, 0.85);
+        background: var(--surface-soft);
+      }
+      .status-banner.hidden { display: none; }
+      .status-banner.summary {
+        background: linear-gradient(180deg, #fff8f1, #f8eee2);
+      }
+      .status-banner.warn {
+        background: var(--warn-soft);
+        border-color: rgba(208, 138, 34, 0.28);
+        color: #8f5c0c;
+      }
+      .status-banner.error {
+        background: var(--danger-soft);
+        border-color: rgba(198, 81, 77, 0.28);
+        color: #8d302d;
+      }
+      .status-banner.info {
+        background: var(--accent-soft);
+        border-color: rgba(181, 83, 47, 0.24);
+        color: #7a3d23;
+      }
+      .status-banner strong {
+        display: block;
+        font-size: 13px;
+        color: inherit;
+      }
+      .status-banner-text {
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1.5;
+      }
+      .status-banner-actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .status-banner-actions button {
+        width: auto;
+        min-width: 120px;
+      }
       select.trend-long { color: var(--success) !important; font-weight: 700; border-color: rgba(33, 152, 111, 0.55) !important; background: #f8fffb !important; }
       select.trend-short { color: var(--danger) !important; font-weight: 700; border-color: rgba(198, 81, 77, 0.55) !important; background: #fff9f9 !important; }
       select.trend-long:focus { outline: 2px solid rgba(33, 152, 111, 0.18); border-color: var(--success); }
@@ -737,6 +784,22 @@
               <span class="badge success" id="statsSymbol">BTCUSDT</span>
             </div>
             <div class="card-body">
+              <div id="executionSummaryBanner" class="status-banner summary hidden">
+                <strong>执行摘要</strong>
+                <div id="executionSummaryText" class="status-banner-text"></div>
+              </div>
+              <div id="executionRiskBanner" class="status-banner hidden">
+                <strong>风险提示</strong>
+                <div id="executionRiskText" class="status-banner-text"></div>
+              </div>
+              <div id="recoverableSessionBanner" class="status-banner info hidden">
+                <strong>恢复监控</strong>
+                <div id="recoverableSessionText" class="status-banner-text"></div>
+                <div class="status-banner-actions">
+                  <button id="recoverSessionBtn" class="success inline-btn">恢复监控</button>
+                  <button id="dismissRecoverSessionBtn" class="secondary inline-btn">暂不恢复</button>
+                </div>
+              </div>
               <div class="stat-list">
                 <div class="stat-item"><strong>连接状态</strong><span id="statConnection">未连接</span></div>
                 <div class="stat-item"><strong>当前功能</strong><span id="statMode">双向开仓</span></div>
@@ -746,8 +809,11 @@
                 <div class="stat-item"><strong>总名义金额</strong><span id="statTotalNotional" class="mono">0</span></div>
                 <div class="stat-item"><strong>每轮名义金额</strong><span id="statPerRound" class="mono">0</span></div>
                 <div class="stat-item"><strong>最小下单金额</strong><span id="statMinNotional" class="mono">0</span></div>
+                <div class="stat-item"><strong>预检有效性</strong><span id="statPrecheckFreshness">待校验</span></div>
                 <div class="stat-item"><strong>未完成数量</strong><span id="statCarryoverQty" class="mono">0</span></div>
+                <div class="stat-item"><strong>残量归属</strong><span id="statResidualSide">--</span></div>
                 <div class="stat-item"><strong>最终对齐结果</strong><span id="statFinalAlignment">未触发</span></div>
+                <div class="stat-item"><strong>终止状态</strong><span id="statAbortState">未请求</span></div>
                 <div class="stat-item"><strong>最新估算数量</strong><span id="statLastQty" class="mono">0</span></div>
               </div>
             </div>

@@ -24,17 +24,8 @@ projects.json
 git-remote.json
 repo-name-overrides.json
 # <<< codex git-sync <<<
-
-
-
-
-
-
-
-
-
 config/binance_api.local.env
-
 .codex-runtime/
+
 
 

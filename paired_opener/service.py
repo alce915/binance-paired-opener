@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
+from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME, format_copy, make_precheck_item
 from paired_opener.config import Settings
 from paired_opener.domain import (
     ExecutionProfile,
@@ -62,7 +63,10 @@ SYSTEM_ORDER_ID_RE = re.compile(
 class SessionPrecheckFailed(ValueError):
     def __init__(self, precheck: dict[str, Any]) -> None:
         self.precheck = precheck
-        super().__init__(str(precheck.get("summary") or "预检失败"))
+        summary = str(precheck.get("summary") or "")
+        if not summary:
+            summary = format_copy(str(precheck.get("summary_code") or "reasons.session_precheck_failed"), precheck.get("summary_params") or {})
+        super().__init__(summary or "预检失败")
 
 class OpenSessionService:
     def __init__(
@@ -75,7 +79,7 @@ class OpenSessionService:
         single_open_engine: SingleOpeningEngine | None = None,
         single_close_engine: SingleClosingEngine | None = None,
         account_id: str = "default",
-        account_name: str = "默认账户",
+        account_name: str = DEFAULT_ACCOUNT_NAME,
     ) -> None:
         self._settings = settings
         self._repository = repository
@@ -167,6 +171,9 @@ class OpenSessionService:
             last_error_strategy=payload.get("last_error_strategy"),
             last_error_code=payload.get("last_error_code"),
             last_error_operator_action=payload.get("last_error_operator_action"),
+            last_error_params=dict(payload.get("last_error_params") or {}),
+            last_error_raw_message=payload.get("last_error_raw_message"),
+            last_error_contract_version=payload.get("last_error_contract_version"),
             recovery_status=self._enum_value(payload.get("recovery_status"), RecoveryStatus),
             recovery_summary=payload.get("recovery_summary"),
             recovery_checked_at=self._parse_datetime(payload.get("recovery_checked_at")) if payload.get("recovery_checked_at") else None,
@@ -564,6 +571,9 @@ class OpenSessionService:
             last_error_strategy=error.strategy.value,
             last_error_code=error.code,
             last_error_operator_action=error.operator_action,
+            last_error_params=error.params,
+            last_error_raw_message=error.raw_message,
+            last_error_contract_version=CONTRACT_VERSION,
         )
 
     def _error_event_payload(self, error: TradingError, **extra: Any) -> dict[str, Any]:
@@ -580,27 +590,40 @@ class OpenSessionService:
         message: str,
         details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        item: dict[str, Any] = {
-            "code": code,
-            "label": label,
-            "status": status,
-            "message": message,
-        }
-        if details:
-            item["details"] = details
-        return item
+        label_key = f"precheck.labels.{code}"
+        message_key = "runtime.precheck_legacy_message"
+        message_params: dict[str, Any] = {"message": message}
+        if code == "system_open_orders" and status == "fail" and "读取失败" in message:
+            message_key = "precheck.system_open_orders.fail_read_error"
+            suffix = message.split(":", 1)[1].strip() if ":" in message else message
+            message_params = {"error": suffix}
+        return make_precheck_item(
+            code=code,
+            status=status,
+            label_key=label_key,
+            message_key=message_key,
+            message_params=message_params,
+            details=details,
+            legacy_message=message,
+            legacy_label=label,
+        )
 
     def _finalize_precheck(self, checks: list[dict[str, Any]], derived: dict[str, Any], *, default_summary: str) -> dict[str, Any]:
         failures = [item for item in checks if item["status"] == "fail"]
         warnings = [item for item in checks if item["status"] == "warn"]
+        summary_item: dict[str, Any] | None = None
         if failures:
-            summary = failures[0]["message"]
+            summary_item = failures[0]
         elif warnings:
-            summary = warnings[0]["message"]
-        else:
-            summary = default_summary
+            summary_item = warnings[0]
+        summary_code = str(summary_item.get("message_key")) if summary_item else "runtime.precheck_legacy_message"
+        summary_params = dict(summary_item.get("message_params") or {}) if summary_item else {"message": default_summary}
+        summary = str(summary_item.get("message")) if summary_item else default_summary
         return {
+            "contract_version": CONTRACT_VERSION,
             "ok": not failures,
+            "summary_code": summary_code,
+            "summary_params": summary_params,
             "summary": summary,
             "checks": checks,
             "derived": derived,
@@ -829,8 +852,9 @@ class OpenSessionService:
         updated = False
         for item in checks:
             if item.get("code") == "hedge_mode":
-                item["status"] = "fail"
-                item["message"] = message
+                replacement = self._precheck_item("hedge_mode", "双向持仓", "fail", message, item.get("details"))
+                item.clear()
+                item.update(replacement)
                 updated = True
                 break
         if not updated:
@@ -838,7 +862,9 @@ class OpenSessionService:
         payload = dict(precheck)
         payload["ok"] = False
         payload["checks"] = checks
-        payload["summary"] = message
+        payload["summary_code"] = "runtime.precheck_legacy_message"
+        payload["summary_params"] = {"message": message}
+        payload["summary"] = format_copy("runtime.precheck_legacy_message", {"message": message})
         return payload
     async def _common_precheck_context(self, request: SessionPrecheckRequest, *, strict_hedge_mode: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None, Any | None, int, Any | None]:
         symbol = request.symbol.upper()
@@ -1782,7 +1808,7 @@ class OpenSessionService:
             normalized.append(candidate)
             seen.add(candidate)
         if not normalized:
-            raise ValueError("Whitelist cannot be empty")
+            raise ValueError(format_copy("reasons.whitelist_empty"))
         return self._settings.persist_whitelist(normalized)
 
     def has_active_sessions(self) -> bool:

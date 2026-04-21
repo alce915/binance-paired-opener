@@ -9,6 +9,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app_i18n.runtime import DEFAULT_ACCOUNT_NAME, format_copy
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -135,7 +137,7 @@ class Settings(BaseSettings):
     def persist_whitelist(self, symbols: list[str]) -> list[str]:
         normalized = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols if symbol.strip()))
         if not normalized:
-            raise ValueError("Whitelist cannot be empty")
+            raise ValueError(format_copy("reasons.whitelist_empty"))
         self.symbol_whitelist = normalized
         self.symbol_whitelist_file.parent.mkdir(parents=True, exist_ok=True)
         self.symbol_whitelist_file.write_text(
@@ -229,7 +231,7 @@ class Settings(BaseSettings):
             accounts = [
                 AccountConfig(
                     account_id="default",
-                    name=env_values.get("BINANCE_ACCOUNT_NAME", "默认账户"),
+                    name=env_values.get("BINANCE_ACCOUNT_NAME", DEFAULT_ACCOUNT_NAME),
                     api_key=self.binance_api_key,
                     api_secret=self.binance_api_secret,
                     use_testnet=self.binance_use_testnet,

@@ -7,11 +7,13 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from app_i18n.runtime import CATALOG_VERSION, CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME, format_copy
 from paired_opener.config import Settings
 from paired_opener.domain import FinalAlignmentStatus, OrderSide, PositionSide, Quote, SessionKind, SingleCloseMode, SingleOpenMode, SymbolRules, TrendBias
+from paired_opener.errors import ExchangeStateError
 from paired_opener.execution_policy import compute_market_fallback_qty, evaluate_price_guard, resolve_execution_policy
 from paired_opener.exchange import ExchangeGateway
-from paired_opener.rounding import normalize_price, normalize_qty, validate_qty_and_notional
+from paired_opener.rounding import min_qty_for_notional, normalize_price, normalize_qty, validate_qty_and_notional
 
 SYSTEM_ORDER_ID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-', re.IGNORECASE)
 
@@ -22,7 +24,7 @@ class MarketStreamController:
         gateway: ExchangeGateway,
         settings: Settings | None = None,
         account_id: str = "default",
-        account_name: str = "default",
+        account_name: str = DEFAULT_ACCOUNT_NAME,
     ) -> None:
         self._gateway = gateway
         self._settings = settings or Settings()
@@ -31,6 +33,8 @@ class MarketStreamController:
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._lock = asyncio.Lock()
         self._simulation_lock = asyncio.Lock()
+        self._simulation_abort_event = asyncio.Event()
+        self._simulation_abort_requested = False
         self._market_task: asyncio.Task[None] | None = None
         self._account_task: asyncio.Task[None] | None = None
         self._disconnect_task: asyncio.Task[dict[str, Any]] | None = None
@@ -39,21 +43,29 @@ class MarketStreamController:
         self._orderbook_interval_seconds = 0.25
         self._account_refresh_interval_seconds = max(self._settings.market_account_refresh_interval_ms / 1000, 1.0)
         self._state = {
+            "contract_version": CONTRACT_VERSION,
+            "catalog_version": CATALOG_VERSION,
             "connected": False,
             "status": "disconnected",
             "symbol": "BTCUSDT",
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": "idle",
+            "message_code": "runtime.connection_disconnected",
+            "message_params": {},
+            "message": format_copy("runtime.connection_disconnected"),
         }
         self._account_overview = {
+            "contract_version": CONTRACT_VERSION,
+            "catalog_version": CATALOG_VERSION,
             "status": "idle",
             "symbol": "BTCUSDT",
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": "idle",
+            "message_code": "runtime.connection_disconnected",
+            "message_params": {},
+            "message": format_copy("runtime.connection_disconnected"),
             "system_open_order_count": 0,
             "manual_open_order_count": 0,
             "totals": {
@@ -65,6 +77,8 @@ class MarketStreamController:
             "positions": [],
         }
         self._execution_stats = {
+            "contract_version": CONTRACT_VERSION,
+            "catalog_version": CATALOG_VERSION,
             "status": "idle",
             "session_kind": SessionKind.PAIRED_OPEN.value,
             "mode": None,
@@ -84,7 +98,9 @@ class MarketStreamController:
             "resolved_max_reprice_ticks": 8,
             "resolved_max_spread_bps": 20,
             "resolved_max_reference_deviation_bps": 40,
-            "message": "idle",
+            "message_code": "runtime.connection_idle",
+            "message_params": {},
+            "message": format_copy("runtime.connection_idle"),
             "updated_at": self._utc_now(),
         }
         self._resolved_simulation_policy = resolve_execution_policy(
@@ -105,6 +121,48 @@ class MarketStreamController:
             return {key: self._normalize(value) for key, value in payload.items()}
         if isinstance(payload, list):
             return [self._normalize(value) for value in payload]
+        return payload
+
+    def _message_fields(
+        self,
+        *,
+        message_code: str | None = None,
+        message_params: dict[str, Any] | None = None,
+        message: str | None = None,
+        legacy_key: str = "runtime.execution_legacy_message",
+    ) -> dict[str, Any]:
+        params = dict(message_params or {})
+        resolved_key = message_code
+        if resolved_key is None and message:
+            resolved_key = legacy_key
+            params = {"message": message}
+        rendered = format_copy(resolved_key, params) if resolved_key else str(message or "")
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "catalog_version": CATALOG_VERSION,
+            "message_code": resolved_key,
+            "message_params": params,
+            "message": rendered,
+        }
+
+    def _execution_log_payload(
+        self,
+        *,
+        level: str,
+        message_code: str | None = None,
+        message_params: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "level": level,
+            "created_at": self._utc_now(),
+        }
+        payload.update(
+            self._message_fields(
+                message_code=message_code or "runtime.execution_message_unavailable",
+                message_params=message_params,
+            )
+        )
         return payload
 
     async def publish(self, event: str, payload: dict[str, Any]) -> None:
@@ -156,25 +214,29 @@ class MarketStreamController:
                 "account_id": self._account_id,
                 "account_name": self._account_name,
                 "updated_at": self._utc_now(),
-                "message": f"正在连接 {symbol}",
+                "message_code": "runtime.connection_connecting",
+                "message_params": {},
+                "message": format_copy("runtime.connection_connecting"),
             }
             self._account_overview = {
                 **self._account_overview,
                 "status": "loading",
                 "symbol": symbol,
                 "updated_at": self._utc_now(),
-                "message": f"正在加载 {symbol} 账户概览",
+                "message_code": "runtime.monitor_waiting_connection",
+                "message_params": {},
+                "message": format_copy("runtime.monitor_waiting_connection"),
             }
         await self._cancel_tasks(old_market_task, old_account_task)
         await self.publish("connection_status", self._state)
         await self.publish("account_overview", self._account_overview)
         await self.publish(
             "execution_log",
-            {
-                "level": "info",
-                "message": f"开始连接行情流：{symbol}",
-                "created_at": self._utc_now(),
-            },
+            self._execution_log_payload(
+                level="info",
+                message_code="log.market_stream.connect_started",
+                message_params={"symbol": symbol},
+            ),
         )
         async with self._lock:
             self._market_task = asyncio.create_task(self._market_loop(symbol))
@@ -210,24 +272,27 @@ class MarketStreamController:
             "account_id": self._account_id,
             "account_name": self._account_name,
             "updated_at": self._utc_now(),
-            "message": "已断开",
+            "message_code": "runtime.connection_disconnected",
+            "message_params": {},
+            "message": format_copy("runtime.connection_disconnected"),
         }
         self._account_overview = {
             **self._account_overview,
             "symbol": symbol,
             "status": "idle",
             "updated_at": self._utc_now(),
-            "message": "已断开",
+            "message_code": "runtime.connection_disconnected",
+            "message_params": {},
+            "message": format_copy("runtime.connection_disconnected"),
         }
         await self.publish("connection_status", self._state)
         await self.publish("account_overview", self._account_overview)
         await self.publish(
             "execution_log",
-            {
-                "level": "warn",
-                "message": "已停止行情连接",
-                "created_at": self._utc_now(),
-            },
+            self._execution_log_payload(
+                level="warn",
+                message_code="log.market_stream.connect_stopped",
+            ),
         )
         return self._normalize(self._state)
 
@@ -261,18 +326,19 @@ class MarketStreamController:
                 "system_open_order_count": system_open_order_count,
                 "manual_open_order_count": manual_open_order_count,
                 "updated_at": self._utc_now(),
-                "message": "账户概览已同步",
+                "message_code": "runtime.account_snapshot_updated",
+                "message_params": {},
+                "message": format_copy("runtime.account_snapshot_updated"),
             }
             self._account_overview = overview
             await self.publish("account_overview", self._account_overview)
             if self._last_account_error is not None:
                 await self.publish(
                     "execution_log",
-                    {
-                        "level": "success",
-                        "message": "账户概览已恢复",
-                        "created_at": self._utc_now(),
-                    },
+                    self._execution_log_payload(
+                        level="success",
+                        message_code="log.account_overview.recovered",
+                    ),
                 )
             self._last_account_error = None
         except Exception as exc:
@@ -282,17 +348,18 @@ class MarketStreamController:
                 "status": "error",
                 "symbol": symbol,
                 "updated_at": self._utc_now(),
-                "message": error_message,
+                "message_code": "runtime.monitor_account_refresh_failed",
+                "message_params": {},
+                "message": format_copy("runtime.monitor_account_refresh_failed"),
             }
             await self.publish("account_overview", self._account_overview)
             if error_message != self._last_account_error:
                 await self.publish(
                     "execution_log",
-                    {
-                        "level": "warn",
-                        "message": f"账户概览刷新失败：{error_message}",
-                        "created_at": self._utc_now(),
-                    },
+                    self._execution_log_payload(
+                        level="warn",
+                        message_code="log.account_overview.refresh_failed",
+                    ),
                 )
             self._last_account_error = error_message
 
@@ -360,16 +427,18 @@ class MarketStreamController:
                 "account_id": self._account_id,
                 "account_name": self._account_name,
                 "updated_at": self._utc_now(),
-                "message": str(exc),
+                "message_code": "runtime.connection_error",
+                "message_params": {},
+                "message": format_copy("runtime.connection_error"),
             }
             await self.publish("connection_status", self._state)
             await self.publish(
                 "execution_log",
-                {
-                    "level": "error",
-                    "message": f"订单簿获取失败：{exc}",
-                    "created_at": self._utc_now(),
-                },
+                self._execution_log_payload(
+                    level="error",
+                    message_code="log.market_stream.orderbook_refresh_failed",
+                    message_params={"symbol": symbol},
+                ),
             )
             async with self._lock:
                 self._market_task = None
@@ -384,11 +453,10 @@ class MarketStreamController:
         except Exception as exc:
             await self.publish(
                 "execution_log",
-                {
-                    "level": "warn",
-                    "message": f"账户概览轮询失败：{exc}",
-                    "created_at": self._utc_now(),
-                },
+                self._execution_log_payload(
+                    level="warn",
+                    message_code="log.account_overview.polling_failed",
+                ),
             )
             async with self._lock:
                 self._account_task = None
@@ -418,7 +486,12 @@ class MarketStreamController:
                     symbol=symbol,
                     round_count=round_count,
                     min_notional=rules.min_notional,
-                    message=f"模拟执行已阻止：开单金额 {open_amount} 超过可用余额 {available_balance} 的 95% 上限 {max_open_amount}",
+                    message_code="log.simulation.paired_open.balance_limit_exceeded",
+                    message_params={
+                        "open_amount": self._stringify_decimal(open_amount),
+                        "available_balance": self._stringify_decimal(available_balance),
+                        "max_open_amount": self._stringify_decimal(max_open_amount),
+                    },
                     mode=trend_bias.value,
                 )
 
@@ -431,6 +504,12 @@ class MarketStreamController:
                 round_count=round_count,
                 min_notional=rules.min_notional,
                 message=f"模拟执行已阻止：每轮开单金额 {notional_per_round} 低于交易所最小下单金额 {rules.min_notional}",
+                message_code="log.simulation.blocked_min_notional",
+                message_params={
+                    "per_round_notional": self._stringify_decimal(notional_per_round),
+                    "min_notional": self._stringify_decimal(rules.min_notional),
+                    "symbol": symbol,
+                },
                 total_notional=total_notional,
                 notional_per_round=notional_per_round,
                 mode=trend_bias.value,
@@ -491,22 +570,58 @@ class MarketStreamController:
             notional_per_round=notional_per_round,
             min_notional=rules.min_notional,
             mode=trend_bias.value,
-            message="模拟执行进行中",
+            message_code="log.simulation.paired_open_running",
         )
         await self.publish(
             "execution_log",
-            {
-                "level": "info",
-                "message": f"开始模拟执行：{symbol} | 趋势={trend_bias.value} | 开单金额={open_amount} | 杠杆={leverage}x | 轮次={round_count}",
-                "created_at": self._utc_now(),
-            },
+            self._execution_log_payload(
+                level="info",
+                message_code="log.simulation.paired_open_started",
+                message_params={
+                    "symbol": symbol,
+                    "mode": trend_bias.value,
+                    "open_amount": self._stringify_decimal(open_amount),
+                    "leverage": leverage,
+                    "round_count": round_count,
+                },
+            ),
         )
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.PAIRED_OPEN,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            mode=trend_bias.value,
+        )
+        if aborted is not None:
+            return aborted
 
         last_qty = Decimal("0")
         carryover_qty = Decimal("0")
         rounds_completed = 0
         skipped_rounds = 0
+        session_long_qty = Decimal("0")
+        session_short_qty = Decimal("0")
         for round_index in range(1, round_count + 1):
+            aborted = await self._abort_simulation_if_requested(
+                session_kind=SessionKind.PAIRED_OPEN,
+                symbol=symbol,
+                round_count=round_count,
+                min_notional=rules.min_notional,
+                total_notional=total_notional,
+                notional_per_round=notional_per_round,
+                last_qty=last_qty,
+                mode=trend_bias.value,
+                rounds_completed=rounds_completed,
+                carryover_qty=carryover_qty,
+                final_alignment_status=(
+                    FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+                ),
+            )
+            if aborted is not None:
+                return aborted
             snapshot = await self._gateway.get_order_book(symbol, limit=10)
             ask1 = normalize_price(Decimal(str(snapshot["asks"][0]["price"])), rules)
             bid1 = normalize_price(Decimal(str(snapshot["bids"][0]["price"])), rules)
@@ -561,11 +676,15 @@ class MarketStreamController:
                 skipped_rounds += 1
                 await self.publish(
                     "execution_log",
-                    {
-                        "level": "warn",
-                        "message": f"第 {round_index} 轮：Stage1 {stage1_side} @ {stage1_price} 未形成可继续执行的成交，跳过 Stage2",
-                        "created_at": self._utc_now(),
-                    },
+                    self._execution_log_payload(
+                        level="warn",
+                        message_code="log.simulation.paired_open_stage1_skipped",
+                        message_params={
+                            "round_index": round_index,
+                            "stage1_side": stage1_side,
+                            "stage1_price": self._stringify_decimal(stage1_price),
+                        },
+                    ),
                 )
                 await self._set_execution_stats(
                     status="running",
@@ -582,18 +701,28 @@ class MarketStreamController:
                     final_alignment_status=(
                         FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
                     ),
-                    message=f"第 {round_index} 轮 Stage1 未成交，已跳过",
+                    message_code="log.simulation.paired_open_stage1_skipped_running",
+                    message_params={"round_index": round_index},
                 )
                 if round_index < round_count and round_interval_seconds > 0:
-                    await self.publish(
-                        "execution_log",
-                        {
-                            "level": "info",
-                            "message": f"第 {round_index} 轮结束，等待 {round_interval_seconds} 秒进入下一轮",
-                            "created_at": self._utc_now(),
-                        },
+                    aborted = await self._wait_or_abort(
+                        round_interval_seconds,
+                        session_kind=SessionKind.PAIRED_OPEN,
+                        symbol=symbol,
+                        round_count=round_count,
+                        min_notional=rules.min_notional,
+                        total_notional=total_notional,
+                        notional_per_round=notional_per_round,
+                        last_qty=last_qty,
+                        mode=trend_bias.value,
+                        rounds_completed=rounds_completed,
+                        carryover_qty=carryover_qty,
+                        final_alignment_status=(
+                            FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+                        ),
                     )
-                    await asyncio.sleep(round_interval_seconds)
+                    if aborted is not None:
+                        return aborted
                 continue
             stage2_quote = await self._gateway.get_quote(symbol)
             stage2_bid = Decimal(stage2_quote.bid_price)
@@ -626,23 +755,47 @@ class MarketStreamController:
             )
             if blocked is not None:
                 return blocked
-            _, carryover_qty = self._simulate_leg_fill(
+            stage2_filled_qty, carryover_qty = self._simulate_leg_fill(
                 requested_qty=stage2_target_qty,
                 rules=rules,
                 allow_market_fallback=True,
             )
             rounds_completed += 1
+            if stage1_position_side == PositionSide.LONG:
+                session_long_qty = normalize_qty(session_long_qty + stage1_filled_qty, rules)
+            else:
+                session_short_qty = normalize_qty(session_short_qty + stage1_filled_qty, rules)
+            if stage2_position_side == PositionSide.LONG:
+                session_long_qty = normalize_qty(session_long_qty + stage2_filled_qty, rules)
+            else:
+                session_short_qty = normalize_qty(session_short_qty + stage2_filled_qty, rules)
+
+            round_residual_qty = normalize_qty(abs(stage1_filled_qty - stage2_filled_qty), rules)
+            if stage1_filled_qty >= stage2_filled_qty:
+                residual_side_label = self._position_side_log_label(stage1_position_side)
+            else:
+                residual_side_label = self._position_side_log_label(stage2_position_side)
+            wait_seconds = round_interval_seconds if round_index < round_count and round_interval_seconds > 0 else None
+            round_message_code, round_message_params = self._paired_open_round_summary_contract(
+                round_index=round_index,
+                stage1_side=stage1_side,
+                stage1_price=stage1_price,
+                stage1_filled_qty=stage1_filled_qty,
+                stage2_side=stage2_side,
+                stage2_price=stage2_price,
+                stage2_filled_qty=stage2_filled_qty,
+                round_residual_qty=round_residual_qty,
+                residual_side_label=residual_side_label,
+                carryover_qty=carryover_qty,
+                wait_seconds=wait_seconds,
+            )
             await self.publish(
                 "execution_log",
-                {
-                    "level": "info",
-                    "message": (
-                        f"第 {round_index} 轮：Stage1 {stage1_side} @ {stage1_price} | "
-                        f"Stage2 {stage2_side} @ {stage2_price} | 预计数量 {last_qty:.8f}"
-                        + (f" | 预计残量 {carryover_qty:.8f}" if carryover_qty > Decimal("0") else "")
-                    ),
-                    "created_at": self._utc_now(),
-                },
+                self._execution_log_payload(
+                    level="info",
+                    message_code=round_message_code,
+                    message_params=round_message_params,
+                ),
             )
             await self._set_execution_stats(
                 status="running",
@@ -659,19 +812,86 @@ class MarketStreamController:
                 final_alignment_status=(
                     FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
                 ),
-                message=f"第 {round_index} 轮模拟执行中",
+                message_code="log.simulation.paired_open_round_running",
+                message_params={"round_index": round_index},
             )
             if round_index < round_count and round_interval_seconds > 0:
-                await self.publish(
-                    "execution_log",
-                    {
-                        "level": "info",
-                        "message": f"第 {round_index} 轮结束，等待 {round_interval_seconds} 秒进入下一轮",
-                        "created_at": self._utc_now(),
-                    },
+                aborted = await self._wait_or_abort(
+                    round_interval_seconds,
+                    session_kind=SessionKind.PAIRED_OPEN,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    total_notional=total_notional,
+                    notional_per_round=notional_per_round,
+                    last_qty=last_qty,
+                    mode=trend_bias.value,
+                    rounds_completed=rounds_completed,
+                    carryover_qty=carryover_qty,
+                    final_alignment_status=(
+                        FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+                    ),
                 )
-                await asyncio.sleep(round_interval_seconds)
+                if aborted is not None:
+                    return aborted
 
+        final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.PAIRED_OPEN,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            last_qty=last_qty,
+            mode=trend_bias.value,
+            rounds_completed=rounds_completed,
+            carryover_qty=carryover_qty,
+            final_alignment_status=(
+                FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+            ),
+        )
+        if aborted is not None:
+            return aborted
+        if carryover_qty > Decimal("0"):
+            session_long_qty, session_short_qty, carryover_qty, final_alignment_status = await self._simulate_paired_open_final_alignment(
+                symbol=symbol,
+                rules=rules,
+                session_long_qty=session_long_qty,
+                session_short_qty=session_short_qty,
+                carryover_qty=carryover_qty,
+            )
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.PAIRED_OPEN,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            last_qty=last_qty,
+            mode=trend_bias.value,
+            rounds_completed=rounds_completed,
+            carryover_qty=carryover_qty,
+            final_alignment_status=(
+                final_alignment_status
+                if final_alignment_status != FinalAlignmentStatus.NOT_NEEDED or carryover_qty <= Decimal("0")
+                else FinalAlignmentStatus.CARRYOVER_PENDING
+            ),
+        )
+        if aborted is not None:
+            return aborted
+
+        completion_message_code = (
+            "log.simulation.paired_open_completed"
+            if carryover_qty <= Decimal("0")
+            else "log.simulation.paired_open_completed_with_residual"
+        )
+        completion_message_params = {
+            "symbol": symbol,
+            "completed_rounds": rounds_completed,
+        }
+        if completion_message_code == "log.simulation.paired_open_completed_with_residual":
+            completion_message_params["carryover_qty"] = self._stringify_decimal(carryover_qty)
         payload = await self._set_execution_stats(
             status=("completed_with_skips" if carryover_qty > Decimal("0") or skipped_rounds > 0 else "completed"),
             session_kind=SessionKind.PAIRED_OPEN,
@@ -685,25 +905,20 @@ class MarketStreamController:
             mode=trend_bias.value,
             carryover_qty=carryover_qty,
             final_alignment_status=(
-                FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+                final_alignment_status
+                if final_alignment_status != FinalAlignmentStatus.NOT_NEEDED or carryover_qty <= Decimal("0")
+                else FinalAlignmentStatus.CARRYOVER_PENDING
             ),
-            message=(
-                f"模拟执行完成：{symbol} 共完成 {rounds_completed} 轮"
-                if carryover_qty <= Decimal("0") and skipped_rounds <= 0
-                else f"模拟执行完成：{symbol} 共完成 {rounds_completed} 轮，保留残量 {carryover_qty}"
-            ),
+            message_code=completion_message_code,
+            message_params=completion_message_params,
         )
         await self.publish(
             "execution_log",
-            {
-                "level": ("success" if carryover_qty <= Decimal("0") and skipped_rounds <= 0 else "warn"),
-                "message": (
-                    f"模拟执行完成：{symbol} 共完成 {rounds_completed} 轮"
-                    if carryover_qty <= Decimal("0") and skipped_rounds <= 0
-                    else f"模拟执行完成：{symbol} 共完成 {rounds_completed} 轮，保留残量 {carryover_qty}"
-                ),
-                "created_at": self._utc_now(),
-            },
+            self._execution_log_payload(
+                level=("success" if carryover_qty <= Decimal("0") and skipped_rounds <= 0 else "warn"),
+                message_code=completion_message_code,
+                message_params=completion_message_params,
+            ),
         )
         return payload
 
@@ -755,8 +970,12 @@ class MarketStreamController:
         carryover_qty: Decimal = Decimal("0"),
         final_alignment_status: FinalAlignmentStatus | str = FinalAlignmentStatus.NOT_NEEDED,
         message: str = "",
+        message_code: str | None = None,
+        message_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
+            "contract_version": CONTRACT_VERSION,
+            "catalog_version": CATALOG_VERSION,
             "status": status,
             "session_kind": session_kind.value,
             "mode": mode,
@@ -773,23 +992,134 @@ class MarketStreamController:
                 final_alignment_status.value if isinstance(final_alignment_status, FinalAlignmentStatus) else str(final_alignment_status)
             ),
             **self._resolved_simulation_policy_payload,
-            "message": message,
             "updated_at": self._utc_now(),
         }
+        payload.update(
+            self._message_fields(
+                message_code=message_code,
+                message_params=message_params,
+                message=message,
+                legacy_key="runtime.execution_legacy_message",
+            )
+        )
+        return payload
 
     async def _set_execution_stats(self, **kwargs: Any) -> dict[str, Any]:
         self._execution_stats = self._simulation_payload(**kwargs)
         await self.publish("execution_stats", self._execution_stats)
         return self._normalize(self._execution_stats)
 
-    async def _block_simulation(
+    def _current_simulation_context(self) -> dict[str, Any]:
+        current = self._execution_stats or {}
+        session_kind = SessionKind(str(current.get("session_kind") or SessionKind.PAIRED_OPEN.value))
+        selected_position_side_raw = current.get("selected_position_side")
+        selected_position_side = (
+            PositionSide(str(selected_position_side_raw))
+            if selected_position_side_raw
+            else None
+        )
+        return {
+            "session_kind": session_kind,
+            "symbol": str(current.get("symbol") or "BTCUSDT"),
+            "round_count": int(current.get("rounds_total") or 0),
+            "rounds_completed": int(current.get("rounds_completed") or 0),
+            "total_notional": Decimal(str(current.get("total_notional") or "0")),
+            "notional_per_round": Decimal(str(current.get("notional_per_round") or "0")),
+            "last_qty": Decimal(str(current.get("last_qty") or "0")),
+            "min_notional": Decimal(str(current.get("min_notional") or "0")),
+            "mode": current.get("mode"),
+            "selected_position_side": selected_position_side,
+            "carryover_qty": Decimal(str(current.get("carryover_qty") or "0")),
+            "final_alignment_status": str(current.get("final_alignment_status") or FinalAlignmentStatus.NOT_NEEDED.value),
+        }
+
+    async def _set_current_simulation_stats(
+        self,
+        *,
+        status: str,
+        message_code: str,
+        message_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = self._current_simulation_context()
+        return await self._set_execution_stats(
+            status=status,
+            session_kind=context["session_kind"],
+            symbol=context["symbol"],
+            round_count=context["round_count"],
+            rounds_completed=context["rounds_completed"],
+            total_notional=context["total_notional"],
+            notional_per_round=context["notional_per_round"],
+            last_qty=context["last_qty"],
+            min_notional=context["min_notional"],
+            mode=context["mode"],
+            selected_position_side=context["selected_position_side"],
+            carryover_qty=context["carryover_qty"],
+            final_alignment_status=context["final_alignment_status"],
+            message_code=message_code,
+            message_params=message_params,
+        )
+
+    def _simulation_is_active(self) -> bool:
+        status = str(self._execution_stats.get("status") or "idle")
+        return self._simulation_lock.locked() and status not in {"idle", "blocked", "completed", "completed_with_skips", "aborted", "exception"}
+
+    async def abort_simulation(self) -> dict[str, Any]:
+        if not self._simulation_is_active():
+            return self._normalize(
+                {
+                    "contract_version": CONTRACT_VERSION,
+                    "status": str(self._execution_stats.get("status") or "idle"),
+                    "requested": False,
+                    "requested_action": "abort",
+                    "message_code": "runtime.simulation_abort_not_running",
+                    "message_params": {},
+                    "message": format_copy("runtime.simulation_abort_not_running"),
+                }
+            )
+        if self._simulation_abort_requested:
+            return self._normalize(
+                {
+                    "contract_version": CONTRACT_VERSION,
+                    "status": "aborting",
+                    "requested": False,
+                    "requested_action": "abort",
+                    "message_code": "runtime.simulation_abort_requested",
+                    "message_params": {},
+                    "message": format_copy("runtime.simulation_abort_requested"),
+                }
+            )
+        self._simulation_abort_requested = True
+        self._simulation_abort_event.set()
+        await self._set_current_simulation_stats(
+            status="aborting",
+            message_code="runtime.simulation_abort_requested",
+        )
+        await self.publish(
+            "execution_log",
+            self._execution_log_payload(
+                level="warn",
+                message_code="runtime.simulation_abort_requested",
+            ),
+        )
+        return self._normalize(
+            {
+                "contract_version": CONTRACT_VERSION,
+                "status": "aborting",
+                "requested": True,
+                "requested_action": "abort",
+                "message_code": "runtime.simulation_abort_requested",
+                "message_params": {},
+                "message": format_copy("runtime.simulation_abort_requested"),
+            }
+        )
+
+    async def _abort_simulation_if_requested(
         self,
         *,
         session_kind: SessionKind,
         symbol: str,
         round_count: int,
         min_notional: Decimal,
-        message: str,
         total_notional: Decimal = Decimal("0"),
         notional_per_round: Decimal = Decimal("0"),
         last_qty: Decimal = Decimal("0"),
@@ -798,6 +1128,69 @@ class MarketStreamController:
         rounds_completed: int = 0,
         carryover_qty: Decimal = Decimal("0"),
         final_alignment_status: FinalAlignmentStatus | str = FinalAlignmentStatus.NOT_NEEDED,
+    ) -> dict[str, Any] | None:
+        if not self._simulation_abort_requested:
+            return None
+        payload = await self._set_execution_stats(
+            status="aborted",
+            session_kind=session_kind,
+            symbol=symbol,
+            round_count=round_count,
+            rounds_completed=rounds_completed,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            last_qty=last_qty,
+            min_notional=min_notional,
+            mode=mode,
+            selected_position_side=selected_position_side,
+            carryover_qty=carryover_qty,
+            final_alignment_status=final_alignment_status,
+            message_code="runtime.simulation_aborted",
+        )
+        await self.publish(
+            "execution_log",
+            self._execution_log_payload(
+                level="warn",
+                message_code="runtime.simulation_aborted",
+                message_params={
+                    "symbol": symbol,
+                    "rounds_completed": rounds_completed,
+                },
+            ),
+        )
+        return payload
+
+    async def _wait_or_abort(
+        self,
+        seconds: int,
+        **abort_kwargs: Any,
+    ) -> dict[str, Any] | None:
+        if seconds <= 0:
+            return await self._abort_simulation_if_requested(**abort_kwargs)
+        try:
+            await asyncio.wait_for(self._simulation_abort_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return await self._abort_simulation_if_requested(**abort_kwargs)
+        return await self._abort_simulation_if_requested(**abort_kwargs)
+
+    async def _block_simulation(
+        self,
+        *,
+        session_kind: SessionKind,
+        symbol: str,
+        round_count: int,
+        min_notional: Decimal,
+        message: str = "",
+        total_notional: Decimal = Decimal("0"),
+        notional_per_round: Decimal = Decimal("0"),
+        last_qty: Decimal = Decimal("0"),
+        mode: str | None = None,
+        selected_position_side: PositionSide | None = None,
+        rounds_completed: int = 0,
+        carryover_qty: Decimal = Decimal("0"),
+        final_alignment_status: FinalAlignmentStatus | str = FinalAlignmentStatus.NOT_NEEDED,
+        message_code: str | None = None,
+        message_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = await self._set_execution_stats(
             status="blocked",
@@ -814,8 +1207,18 @@ class MarketStreamController:
             carryover_qty=carryover_qty,
             final_alignment_status=final_alignment_status,
             message=message,
+            message_code=message_code,
+            message_params=message_params,
         )
-        await self.publish("execution_log", {"level": "warn", "message": message, "created_at": self._utc_now()})
+        await self.publish(
+            "execution_log",
+            self._execution_log_payload(
+                level="warn",
+                message_code=message_code,
+                message_params=message_params,
+                message=message,
+            ),
+        )
         return payload
 
     async def _complete_simulation_with_skips(
@@ -834,6 +1237,8 @@ class MarketStreamController:
         rounds_completed: int = 0,
         carryover_qty: Decimal = Decimal("0"),
         final_alignment_status: FinalAlignmentStatus | str = FinalAlignmentStatus.NOT_NEEDED,
+        message_code: str | None = None,
+        message_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = await self._set_execution_stats(
             status="completed_with_skips",
@@ -850,8 +1255,18 @@ class MarketStreamController:
             carryover_qty=carryover_qty,
             final_alignment_status=final_alignment_status,
             message=message,
+            message_code=message_code,
+            message_params=message_params,
         )
-        await self.publish("execution_log", {"level": "warn", "message": message, "created_at": self._utc_now()})
+        await self.publish(
+            "execution_log",
+            self._execution_log_payload(
+                level="warn",
+                message_code=message_code,
+                message_params=message_params,
+                message=message,
+            ),
+        )
         return payload
 
     def _single_side_price(self, position_side: PositionSide, bid_price: Decimal, ask_price: Decimal) -> Decimal:
@@ -861,6 +1276,167 @@ class MarketStreamController:
         if trend_bias == TrendBias.LONG:
             return ask_price, bid_price, "平空", "平多"
         return bid_price, ask_price, "平多", "平空"
+
+    def _position_side_log_label(self, position_side: PositionSide) -> str:
+        return "多" if position_side == PositionSide.LONG else "空"
+
+    def _paired_open_round_summary_contract(
+        self,
+        *,
+        round_index: int,
+        stage1_side: str,
+        stage1_price: Decimal,
+        stage1_filled_qty: Decimal,
+        stage2_side: str,
+        stage2_price: Decimal,
+        stage2_filled_qty: Decimal,
+        round_residual_qty: Decimal,
+        residual_side_label: str,
+        carryover_qty: Decimal,
+        wait_seconds: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        has_residual = round_residual_qty > Decimal("0")
+        has_wait = wait_seconds is not None and wait_seconds > 0
+        if has_residual and has_wait:
+            message_code = "log.simulation.paired_open_round_summary_with_residual_wait"
+        elif has_residual:
+            message_code = "log.simulation.paired_open_round_summary_with_residual"
+        elif has_wait:
+            message_code = "log.simulation.paired_open_round_summary_aligned_wait"
+        else:
+            message_code = "log.simulation.paired_open_round_summary_aligned"
+        message_params = {
+            "round_index": round_index,
+            "stage1_side": stage1_side,
+            "stage1_price": self._stringify_decimal(stage1_price),
+            "stage1_qty": self._stringify_decimal(stage1_filled_qty),
+            "stage2_side": stage2_side,
+            "stage2_price": self._stringify_decimal(stage2_price),
+            "stage2_qty": self._stringify_decimal(stage2_filled_qty),
+            "round_residual_qty": self._stringify_decimal(round_residual_qty),
+            "residual_side": residual_side_label,
+            "carryover_qty": self._stringify_decimal(carryover_qty),
+        }
+        if has_wait:
+            message_params["wait_seconds"] = wait_seconds
+        return message_code, message_params
+
+    async def _simulate_paired_open_final_alignment(
+        self,
+        *,
+        symbol: str,
+        rules: SymbolRules,
+        session_long_qty: Decimal,
+        session_short_qty: Decimal,
+        carryover_qty: Decimal,
+    ) -> tuple[Decimal, Decimal, Decimal, FinalAlignmentStatus]:
+        normalized_carryover = normalize_qty(carryover_qty, rules)
+        if normalized_carryover <= Decimal("0"):
+            return session_long_qty, session_short_qty, Decimal("0"), FinalAlignmentStatus.NOT_NEEDED
+
+        await self.publish(
+            "execution_log",
+            self._execution_log_payload(
+                level="info",
+                message_code="log.simulation.paired_open_final_alignment_started",
+                message_params={
+                    "symbol": symbol,
+                    "carryover_qty": self._stringify_decimal(normalized_carryover),
+                    "session_long_qty": self._stringify_decimal(session_long_qty),
+                    "session_short_qty": self._stringify_decimal(session_short_qty),
+                },
+            ),
+        )
+
+        try:
+            quote = await self._gateway.get_quote(symbol)
+            long_price = normalize_price(Decimal(quote.bid_price), rules)
+            short_price = normalize_price(Decimal(quote.ask_price), rules)
+
+            if session_long_qty == session_short_qty:
+                await self.publish(
+                    "execution_log",
+                    self._execution_log_payload(
+                        level="success",
+                        message_code="log.simulation.paired_open_final_alignment_completed_market_aligned",
+                        message_params={
+                            "symbol": symbol,
+                            "aligned_qty": self._stringify_decimal(session_long_qty),
+                        },
+                    ),
+                )
+                return session_long_qty, session_short_qty, Decimal("0"), FinalAlignmentStatus.MARKET_ALIGNED
+
+            if session_long_qty <= session_short_qty:
+                small_side = PositionSide.LONG
+                small_qty = session_long_qty
+                large_qty = session_short_qty
+                small_price = long_price
+            else:
+                small_side = PositionSide.SHORT
+                small_qty = session_short_qty
+                large_qty = session_long_qty
+                small_price = short_price
+
+            small_min_qty = min_qty_for_notional(small_price, rules)
+            if small_qty < small_min_qty:
+                await self.publish(
+                    "execution_log",
+                    self._execution_log_payload(
+                        level="warn",
+                        message_code="log.simulation.paired_open_final_alignment_completed_flattened",
+                        message_params={
+                            "symbol": symbol,
+                            "session_long_qty": self._stringify_decimal(session_long_qty),
+                            "session_short_qty": self._stringify_decimal(session_short_qty),
+                        },
+                    ),
+                )
+                return Decimal("0"), Decimal("0"), Decimal("0"), FinalAlignmentStatus.FLATTENED_BOTH_SIDES
+
+            gap_qty = normalize_qty(large_qty - small_qty, rules)
+            small_reduce_qty = small_min_qty
+            large_reduce_qty = normalize_qty(small_min_qty + gap_qty, rules)
+            residual_small_qty = normalize_qty(small_qty - small_reduce_qty, rules)
+            residual_large_qty = normalize_qty(large_qty - large_reduce_qty, rules)
+            if residual_small_qty != residual_large_qty:
+                raise RuntimeError(
+                    f"simulated final alignment did not converge: residual_small={residual_small_qty}, residual_large={residual_large_qty}"
+                )
+
+            if small_side == PositionSide.LONG:
+                session_long_qty = residual_small_qty
+                session_short_qty = residual_large_qty
+            else:
+                session_long_qty = residual_large_qty
+                session_short_qty = residual_small_qty
+
+            await self.publish(
+                "execution_log",
+                self._execution_log_payload(
+                    level="success",
+                    message_code="log.simulation.paired_open_final_alignment_completed_market_aligned",
+                    message_params={
+                        "symbol": symbol,
+                        "aligned_qty": self._stringify_decimal(residual_small_qty),
+                    },
+                ),
+            )
+            return session_long_qty, session_short_qty, Decimal("0"), FinalAlignmentStatus.MARKET_ALIGNED
+        except Exception as exc:
+            await self.publish(
+                "execution_log",
+                self._execution_log_payload(
+                    level="warn",
+                    message_code="log.simulation.paired_open_final_alignment_failed",
+                    message_params={
+                        "symbol": symbol,
+                        "carryover_qty": self._stringify_decimal(normalized_carryover),
+                        "error": str(exc),
+                    },
+                ),
+            )
+            return session_long_qty, session_short_qty, normalized_carryover, FinalAlignmentStatus.FAILED
 
     def _open_order_side(self, position_side: PositionSide) -> OrderSide:
         return OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL
@@ -885,6 +1461,17 @@ class MarketStreamController:
 
     def _format_partial_price_guard_message(self, code: str, details: dict[str, Any]) -> str:
         return self._format_price_guard_message(code, details).replace("模拟执行已阻止：", "模拟执行提前结束：", 1)
+
+    def _price_guard_message_contract(self, code: str, details: dict[str, Any], *, partial: bool) -> tuple[str, dict[str, Any]]:
+        suffix_map = {
+            "max_spread_bps": "max_spread_bps",
+            "max_reprice_ticks": "max_reprice_ticks",
+            "max_reference_deviation_bps": "max_reference_deviation_bps",
+        }
+        key_suffix = suffix_map.get(code, "generic")
+        message_code = f"log.simulation.price_guard.{ 'partial' if partial else 'blocked' }.{key_suffix}"
+        message_params = {key: self._normalize(value) for key, value in details.items()}
+        return message_code, message_params
 
     def _remaining_single_round_qty(
         self,
@@ -935,6 +1522,7 @@ class MarketStreamController:
         if guard is None:
             return None
         if rounds_completed > 0 or carryover_qty > Decimal("0") or has_partial_progress:
+            message_code, message_params = self._price_guard_message_contract(guard.code, guard.details, partial=True)
             residual_qty = normalize_qty(
                 remaining_qty_on_guard if remaining_qty_on_guard > Decimal("0") else (carryover_qty + last_qty),
                 rules,
@@ -944,7 +1532,9 @@ class MarketStreamController:
                 symbol=symbol,
                 round_count=round_count,
                 min_notional=min_notional,
-                message=self._format_partial_price_guard_message(guard.code, guard.details),
+                message="",
+                message_code=message_code,
+                message_params=message_params,
                 total_notional=total_notional,
                 notional_per_round=notional_per_round,
                 last_qty=last_qty,
@@ -954,12 +1544,14 @@ class MarketStreamController:
                 carryover_qty=residual_qty,
                 final_alignment_status=final_alignment_status,
             )
+        message_code, message_params = self._price_guard_message_contract(guard.code, guard.details, partial=False)
         return await self._block_simulation(
             session_kind=session_kind,
             symbol=symbol,
             round_count=round_count,
             min_notional=min_notional,
-            message=self._format_price_guard_message(guard.code, guard.details),
+            message_code=message_code,
+            message_params=message_params,
             total_notional=total_notional,
             notional_per_round=notional_per_round,
             last_qty=last_qty,
@@ -1011,7 +1603,7 @@ class MarketStreamController:
                 symbol=symbol,
                 round_count=round_count,
                 min_notional=rules.min_notional,
-                message="当前账户不存在可双向平仓的双边持仓",
+                message_code="log.simulation.paired_close.no_position",
                 mode=trend_bias.value,
             )
         normalized_close_qty = normalize_qty(close_qty, rules)
@@ -1021,7 +1613,7 @@ class MarketStreamController:
                 symbol=symbol,
                 round_count=round_count,
                 min_notional=rules.min_notional,
-                message="平仓数量归一化后为 0，无法平仓",
+                message_code="log.simulation.paired_close.zero_qty",
                 mode=trend_bias.value,
             )
         if normalized_close_qty > max_closeable_qty:
@@ -1030,7 +1622,11 @@ class MarketStreamController:
                 symbol=symbol,
                 round_count=round_count,
                 min_notional=rules.min_notional,
-                message=f"模拟执行已阻止：平仓数量 {normalized_close_qty} 超过当前可双向平仓数量 {max_closeable_qty}",
+                message_code="log.simulation.paired_close.qty_exceeds_position",
+                message_params={
+                    "normalized_close_qty": self._stringify_decimal(normalized_close_qty),
+                    "available_qty": self._stringify_decimal(max_closeable_qty),
+                },
                 mode=trend_bias.value,
             )
         round_qty = normalize_qty(normalized_close_qty / Decimal(round_count), rules)
@@ -1041,7 +1637,7 @@ class MarketStreamController:
                 symbol=symbol,
                 round_count=round_count,
                 min_notional=rules.min_notional,
-                message="每轮数量归一化后为 0，无法平仓",
+                message_code="log.simulation.paired_close.round_qty_zero",
                 mode=trend_bias.value,
             )
         quote = await self._gateway.get_quote(symbol)
@@ -1065,6 +1661,12 @@ class MarketStreamController:
                 round_count=round_count,
                 min_notional=rules.min_notional,
                 message=f"每轮平仓金额 {per_round_notional} 低于交易所最小下单金额 {rules.min_notional}，无法平仓。",
+                message_code="log.simulation.blocked_min_notional_close",
+                message_params={
+                    "per_round_notional": self._stringify_decimal(per_round_notional),
+                    "min_notional": self._stringify_decimal(rules.min_notional),
+                    "symbol": symbol,
+                },
                 total_notional=normalized_close_qty * stage1_price,
                 notional_per_round=per_round_notional,
                 last_qty=round_qty,
@@ -1115,19 +1717,52 @@ class MarketStreamController:
             notional_per_round=notional_per_round,
             min_notional=rules.min_notional,
             mode=trend_bias.value,
-            message="双向平仓模拟执行中",
+            message_code="log.simulation.paired_close.running",
         )
         await self.publish(
             "execution_log",
-            {
-                "level": "info",
-                "message": f"开始模拟双向平仓：{symbol} | 趋势={trend_bias.value} | 平仓数量={normalized_close_qty} | 轮次={round_count}",
-                "created_at": self._utc_now(),
-            },
+            self._execution_log_payload(
+                level="info",
+                message_code="log.simulation.paired_close.started",
+                message_params={
+                    "symbol": symbol,
+                    "mode": trend_bias.value,
+                    "qty": self._stringify_decimal(normalized_close_qty),
+                    "round_count": round_count,
+                },
+            ),
         )
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.PAIRED_CLOSE,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            mode=trend_bias.value,
+        )
+        if aborted is not None:
+            return aborted
         last_qty = Decimal("0")
         carryover_qty = Decimal("0")
         for round_index in range(1, round_count + 1):
+            aborted = await self._abort_simulation_if_requested(
+                session_kind=SessionKind.PAIRED_CLOSE,
+                symbol=symbol,
+                round_count=round_count,
+                min_notional=rules.min_notional,
+                total_notional=total_notional,
+                notional_per_round=notional_per_round,
+                last_qty=last_qty,
+                mode=trend_bias.value,
+                rounds_completed=max(round_index - 1, 0),
+                carryover_qty=carryover_qty,
+                final_alignment_status=(
+                    FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+                ),
+            )
+            if aborted is not None:
+                return aborted
             snapshot = await self._gateway.get_order_book(symbol, limit=10)
             ask1 = normalize_price(Decimal(str(snapshot["asks"][0]["price"])), rules)
             bid1 = normalize_price(Decimal(str(snapshot["bids"][0]["price"])), rules)
@@ -1195,17 +1830,28 @@ class MarketStreamController:
                 rules=rules,
                 allow_market_fallback=True,
             )
+            round_message_code = (
+                "log.simulation.paired_close.round_with_residual"
+                if carryover_qty > Decimal("0")
+                else "log.simulation.paired_close.round"
+            )
+            round_message_params = {
+                "round_index": round_index,
+                "stage1_label": stage1_label,
+                "stage1_price": self._stringify_decimal(live_stage1_price),
+                "stage2_label": stage2_label,
+                "stage2_price": self._stringify_decimal(live_stage2_price),
+                "qty": self._stringify_decimal(last_qty),
+            }
+            if carryover_qty > Decimal("0"):
+                round_message_params["residual_qty"] = self._stringify_decimal(carryover_qty)
             await self.publish(
                 "execution_log",
-                {
-                    "level": "info",
-                    "message": (
-                        f"第 {round_index} 轮：{stage1_label} @ {live_stage1_price} | "
-                        f"{stage2_label} @ {live_stage2_price} | 预计数量 {last_qty:.8f}"
-                        + (f" | 预计残量 {carryover_qty:.8f}" if carryover_qty > Decimal("0") else "")
-                    ),
-                    "created_at": self._utc_now(),
-                },
+                self._execution_log_payload(
+                    level="info",
+                    message_code=round_message_code,
+                    message_params=round_message_params,
+                ),
             )
             await self._set_execution_stats(
                 status="running",
@@ -1222,18 +1868,56 @@ class MarketStreamController:
                 final_alignment_status=(
                     FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
                 ),
-                message=f"第 {round_index} 轮双向平仓模拟中",
+                message_code="log.simulation.paired_close.round_running",
+                message_params={"round_index": round_index},
             )
             if round_index < round_count and round_interval_seconds > 0:
-                await self.publish(
-                    "execution_log",
-                    {
-                        "level": "info",
-                        "message": f"第 {round_index} 轮结束，等待 {round_interval_seconds} 秒进入下一轮双向平仓",
-                        "created_at": self._utc_now(),
-                    },
+                aborted = await self._wait_or_abort(
+                    round_interval_seconds,
+                    session_kind=SessionKind.PAIRED_CLOSE,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    total_notional=total_notional,
+                    notional_per_round=notional_per_round,
+                    last_qty=last_qty,
+                    mode=trend_bias.value,
+                    rounds_completed=round_index,
+                    carryover_qty=carryover_qty,
+                    final_alignment_status=(
+                        FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+                    ),
                 )
-                await asyncio.sleep(round_interval_seconds)
+                if aborted is not None:
+                    return aborted
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.PAIRED_CLOSE,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            last_qty=last_qty,
+            mode=trend_bias.value,
+            rounds_completed=round_count,
+            carryover_qty=carryover_qty,
+            final_alignment_status=(
+                FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
+            ),
+        )
+        if aborted is not None:
+            return aborted
+        completion_message_code = (
+            "log.simulation.paired_close.completed"
+            if carryover_qty <= Decimal("0")
+            else "log.simulation.paired_close.completed_with_residual"
+        )
+        completion_message_params = {
+            "symbol": symbol,
+            "round_count": round_count,
+        }
+        if carryover_qty > Decimal("0"):
+            completion_message_params["carryover_qty"] = self._stringify_decimal(carryover_qty)
         payload = await self._set_execution_stats(
             status=("completed_with_skips" if carryover_qty > Decimal("0") else "completed"),
             session_kind=SessionKind.PAIRED_CLOSE,
@@ -1249,23 +1933,16 @@ class MarketStreamController:
             final_alignment_status=(
                 FinalAlignmentStatus.CARRYOVER_PENDING if carryover_qty > Decimal("0") else FinalAlignmentStatus.NOT_NEEDED
             ),
-            message=(
-                f"模拟双向平仓完成：{symbol} 共 {round_count} 轮"
-                if carryover_qty <= Decimal("0")
-                else f"模拟双向平仓完成：{symbol} 共 {round_count} 轮，保留残量 {carryover_qty}"
-            ),
+            message_code=completion_message_code,
+            message_params=completion_message_params,
         )
         await self.publish(
             "execution_log",
-            {
-                "level": ("success" if carryover_qty <= Decimal("0") else "warn"),
-                "message": (
-                    f"模拟双向平仓完成：{symbol} 共 {round_count} 轮"
-                    if carryover_qty <= Decimal("0")
-                    else f"模拟双向平仓完成：{symbol} 共 {round_count} 轮，保留残量 {carryover_qty}"
-                ),
-                "created_at": self._utc_now(),
-            },
+            self._execution_log_payload(
+                level=("success" if carryover_qty <= Decimal("0") else "warn"),
+                message_code=completion_message_code,
+                message_params=completion_message_params,
+            ),
         )
         return payload
 
@@ -1292,7 +1969,7 @@ class MarketStreamController:
                     symbol=symbol,
                     round_count=round_count,
                     min_notional=rules.min_notional,
-                    message="当前双边持仓数量已对齐，无需单向开仓",
+                    message_code="log.simulation.single_open.align_not_needed",
                     mode=open_mode.value,
                 )
             selected_position_side = PositionSide.LONG if long_qty < short_qty else PositionSide.SHORT
@@ -1304,7 +1981,7 @@ class MarketStreamController:
                     symbol=symbol,
                     round_count=round_count,
                     min_notional=rules.min_notional,
-                    message="常规开仓需要先选择开仓订单",
+                    message_code="log.simulation.single_open.selection_required",
                     mode=open_mode.value,
                 )
             normalized_open_qty = normalize_qty(open_qty, rules)
@@ -1314,7 +1991,7 @@ class MarketStreamController:
                 symbol=symbol,
                 round_count=round_count,
                 min_notional=rules.min_notional,
-                message="开仓数量归一化后为 0，无法单向开仓",
+                message_code="log.simulation.single_open.zero_qty",
                 mode=open_mode.value,
                 selected_position_side=selected_position_side,
             )
@@ -1326,7 +2003,7 @@ class MarketStreamController:
                 symbol=symbol,
                 round_count=round_count,
                 min_notional=rules.min_notional,
-                message="每轮数量归一化后为 0，无法单向开仓",
+                message_code="log.simulation.single_open.round_qty_zero",
                 mode=open_mode.value,
                 selected_position_side=selected_position_side,
             )
@@ -1341,7 +2018,8 @@ class MarketStreamController:
                     symbol=symbol,
                     round_count=round_count,
                     min_notional=rules.min_notional,
-                    message=f"当前交易对已有持仓，杠杆必须与现有持仓一致：{effective_leverage}x",
+                    message_code="log.simulation.single_open.leverage_mismatch",
+                    message_params={"effective_leverage": effective_leverage},
                     mode=open_mode.value,
                     selected_position_side=selected_position_side,
                 )
@@ -1353,7 +2031,11 @@ class MarketStreamController:
                     symbol=symbol,
                     round_count=round_count,
                     min_notional=rules.min_notional,
-                    message=f"杠杆 {effective_leverage}x 超过交易对最大杠杆 {rules.max_leverage}x",
+                    message_code="log.simulation.single_open.leverage_exceeds_max",
+                    message_params={
+                        "effective_leverage": effective_leverage,
+                        "max_leverage": rules.max_leverage,
+                    },
                     mode=open_mode.value,
                     selected_position_side=selected_position_side,
                 )
@@ -1370,6 +2052,12 @@ class MarketStreamController:
                 round_count=round_count,
                 min_notional=rules.min_notional,
                 message=f"每轮开单金额 {per_round_notional} 低于交易所最小下单金额 {rules.min_notional}，无法开单。",
+                message_code="log.simulation.blocked_min_notional",
+                message_params={
+                    "per_round_notional": self._stringify_decimal(per_round_notional),
+                    "min_notional": self._stringify_decimal(rules.min_notional),
+                    "symbol": symbol,
+                },
                 total_notional=normalized_open_qty * side_price,
                 notional_per_round=per_round_notional,
                 last_qty=round_qty,
@@ -1404,18 +2092,75 @@ class MarketStreamController:
                     symbol=symbol,
                     round_count=round_count,
                     min_notional=rules.min_notional,
-                    message=f"模拟执行已阻止：开单金额 {implied_open_amount} 超过可用余额 {available_balance} 的 95% 上限 {max_open_amount}",
+                    message_code="log.simulation.single_open.balance_limit_exceeded",
+                    message_params={
+                        "implied_open_amount": self._stringify_decimal(implied_open_amount),
+                        "available_balance": self._stringify_decimal(available_balance),
+                        "max_open_amount": self._stringify_decimal(max_open_amount),
+                    },
                     total_notional=total_notional,
                     notional_per_round=notional_per_round,
                     last_qty=round_qty,
                     mode=open_mode.value,
                     selected_position_side=selected_position_side,
                 )
-        await self._set_execution_stats(status="running", session_kind=SessionKind.SINGLE_OPEN, symbol=symbol, round_count=round_count, total_notional=total_notional, notional_per_round=notional_per_round, min_notional=rules.min_notional, mode=open_mode.value, selected_position_side=selected_position_side, message="单向开仓模拟执行中")
-        await self.publish("execution_log", {"level": "info", "message": f"开始模拟单向开仓：{symbol} | 模式={open_mode.value} | 方向={selected_position_side.value} | 数量={normalized_open_qty} | 杠杆={effective_leverage}x | 轮次={round_count}", "created_at": self._utc_now()})
+        await self._set_execution_stats(
+            status="running",
+            session_kind=SessionKind.SINGLE_OPEN,
+            symbol=symbol,
+            round_count=round_count,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            min_notional=rules.min_notional,
+            mode=open_mode.value,
+            selected_position_side=selected_position_side,
+            message_code="log.simulation.single_open_running",
+        )
+        await self.publish(
+            "execution_log",
+            self._execution_log_payload(
+                level="info",
+                message_code="log.simulation.single_open_started",
+                message_params={
+                    "symbol": symbol,
+                    "mode": open_mode.value,
+                    "selected_position_side": selected_position_side.value,
+                    "qty": self._stringify_decimal(normalized_open_qty),
+                    "leverage": effective_leverage,
+                    "round_count": round_count,
+                },
+            ),
+        )
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.SINGLE_OPEN,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            mode=open_mode.value,
+            selected_position_side=selected_position_side,
+        )
+        if aborted is not None:
+            return aborted
         last_qty = Decimal("0")
         total_residual_qty = Decimal("0")
         for round_index in range(1, round_count + 1):
+            aborted = await self._abort_simulation_if_requested(
+                session_kind=SessionKind.SINGLE_OPEN,
+                symbol=symbol,
+                round_count=round_count,
+                min_notional=rules.min_notional,
+                total_notional=total_notional,
+                notional_per_round=notional_per_round,
+                last_qty=last_qty,
+                mode=open_mode.value,
+                selected_position_side=selected_position_side,
+                rounds_completed=max(round_index - 1, 0),
+                carryover_qty=total_residual_qty,
+            )
+            if aborted is not None:
+                return aborted
             snapshot = await self._gateway.get_order_book(symbol, limit=10)
             ask1 = normalize_price(Decimal(str(snapshot["asks"][0]["price"])), rules)
             bid1 = normalize_price(Decimal(str(snapshot["bids"][0]["price"])), rules)
@@ -1458,14 +2203,21 @@ class MarketStreamController:
             total_residual_qty = normalize_qty(total_residual_qty + round_residual_qty, rules)
             await self.publish(
                 "execution_log",
-                {
-                    "level": "info",
-                    "message": (
-                        f"第 {round_index} 轮：{selected_position_side.value} @ {live_price} | 预计数量 {last_qty:.8f}"
-                        + (f" | 本轮残量 {round_residual_qty:.8f}" if round_residual_qty > Decimal("0") else "")
+                self._execution_log_payload(
+                    level="info",
+                    message_code=(
+                        "log.simulation.single_open_round_with_residual"
+                        if round_residual_qty > Decimal("0")
+                        else "log.simulation.single_open_round"
                     ),
-                    "created_at": self._utc_now(),
-                },
+                    message_params={
+                        "round_index": round_index,
+                        "selected_position_side": selected_position_side.value,
+                        "price": self._stringify_decimal(live_price),
+                        "qty": self._stringify_decimal(last_qty),
+                        "residual_qty": self._stringify_decimal(round_residual_qty),
+                    },
+                ),
             )
             await self._set_execution_stats(
                 status="running",
@@ -1480,11 +2232,41 @@ class MarketStreamController:
                 mode=open_mode.value,
                 selected_position_side=selected_position_side,
                 carryover_qty=total_residual_qty,
-                message=f"第 {round_index} 轮单向开仓模拟中",
+                message_code="log.simulation.single_open_round_running",
+                message_params={"round_index": round_index},
             )
             if round_index < round_count and round_interval_seconds > 0:
-                await self.publish("execution_log", {"level": "info", "message": f"第 {round_index} 轮结束，等待 {round_interval_seconds} 秒进入下一轮单向开仓", "created_at": self._utc_now()})
-                await asyncio.sleep(round_interval_seconds)
+                aborted = await self._wait_or_abort(
+                    round_interval_seconds,
+                    session_kind=SessionKind.SINGLE_OPEN,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    total_notional=total_notional,
+                    notional_per_round=notional_per_round,
+                    last_qty=last_qty,
+                    mode=open_mode.value,
+                    selected_position_side=selected_position_side,
+                    rounds_completed=round_index,
+                    carryover_qty=total_residual_qty,
+                )
+                if aborted is not None:
+                    return aborted
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.SINGLE_OPEN,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            last_qty=last_qty,
+            mode=open_mode.value,
+            selected_position_side=selected_position_side,
+            rounds_completed=round_count,
+            carryover_qty=total_residual_qty,
+        )
+        if aborted is not None:
+            return aborted
         payload = await self._set_execution_stats(
             status=("completed_with_skips" if total_residual_qty > Decimal("0") else "completed"),
             session_kind=SessionKind.SINGLE_OPEN,
@@ -1498,23 +2280,32 @@ class MarketStreamController:
             mode=open_mode.value,
             selected_position_side=selected_position_side,
             carryover_qty=total_residual_qty,
-            message=(
-                f"模拟单向开仓完成：{symbol} 共 {round_count} 轮"
+            message_code=(
+                "log.simulation.single_open_completed"
                 if total_residual_qty <= Decimal("0")
-                else f"模拟单向开仓完成：{symbol} 共 {round_count} 轮，保留残量 {total_residual_qty}"
+                else "log.simulation.single_open_completed_with_residual"
             ),
+            message_params={
+                "symbol": symbol,
+                "round_count": round_count,
+                "carryover_qty": self._stringify_decimal(total_residual_qty),
+            },
         )
         await self.publish(
             "execution_log",
-            {
-                "level": ("success" if total_residual_qty <= Decimal("0") else "warn"),
-                "message": (
-                    f"模拟单向开仓完成：{symbol} 共 {round_count} 轮"
+            self._execution_log_payload(
+                level=("success" if total_residual_qty <= Decimal("0") else "warn"),
+                message_code=(
+                    "log.simulation.single_open_completed"
                     if total_residual_qty <= Decimal("0")
-                    else f"模拟单向开仓完成：{symbol} 共 {round_count} 轮，保留残量 {total_residual_qty}"
+                    else "log.simulation.single_open_completed_with_residual"
                 ),
-                "created_at": self._utc_now(),
-            },
+                message_params={
+                    "symbol": symbol,
+                    "round_count": round_count,
+                    "carryover_qty": self._stringify_decimal(total_residual_qty),
+                },
+            ),
         )
         return payload
 
@@ -1535,24 +2326,78 @@ class MarketStreamController:
         short_qty = normalize_qty(self._position_qty(overview, symbol, PositionSide.SHORT), rules)
         if close_mode == SingleCloseMode.ALIGN:
             if long_qty == short_qty:
-                return await self._block_simulation(session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, min_notional=rules.min_notional, message=("当前交易对不存在持仓" if long_qty <= Decimal("0") else "当前双边持仓数量已对齐，无需单向平仓"), mode=close_mode.value)
+                return await self._block_simulation(
+                    session_kind=SessionKind.SINGLE_CLOSE,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    message_code=(
+                        "log.simulation.single_close.no_position"
+                        if long_qty <= Decimal("0")
+                        else "log.simulation.single_close.align_not_needed"
+                    ),
+                    mode=close_mode.value,
+                )
             selected_position_side = PositionSide.LONG if long_qty > short_qty else PositionSide.SHORT
             normalized_close_qty = normalize_qty(abs(long_qty - short_qty), rules)
         else:
             if selected_position_side is None:
-                return await self._block_simulation(session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, min_notional=rules.min_notional, message="常规平仓需要先选择平仓订单", mode=close_mode.value)
+                return await self._block_simulation(
+                    session_kind=SessionKind.SINGLE_CLOSE,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    message_code="log.simulation.single_close.selection_required",
+                    mode=close_mode.value,
+                )
             available_qty = long_qty if selected_position_side == PositionSide.LONG else short_qty
             if available_qty <= Decimal("0"):
-                return await self._block_simulation(session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, min_notional=rules.min_notional, message="当前交易对不存在持仓", mode=close_mode.value, selected_position_side=selected_position_side)
+                return await self._block_simulation(
+                    session_kind=SessionKind.SINGLE_CLOSE,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    message_code="log.simulation.single_close.no_position",
+                    mode=close_mode.value,
+                    selected_position_side=selected_position_side,
+                )
             normalized_close_qty = normalize_qty(close_qty, rules)
             if normalized_close_qty > available_qty:
-                return await self._block_simulation(session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, min_notional=rules.min_notional, message=f"模拟执行已阻止：平仓数量 {normalized_close_qty} 超过所选持仓数量 {available_qty}", mode=close_mode.value, selected_position_side=selected_position_side)
+                return await self._block_simulation(
+                    session_kind=SessionKind.SINGLE_CLOSE,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    message_code="log.simulation.single_close.qty_exceeds_position",
+                    message_params={
+                        "normalized_close_qty": self._stringify_decimal(normalized_close_qty),
+                        "available_qty": self._stringify_decimal(available_qty),
+                    },
+                    mode=close_mode.value,
+                    selected_position_side=selected_position_side,
+                )
         if normalized_close_qty <= Decimal("0"):
-            return await self._block_simulation(session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, min_notional=rules.min_notional, message="平仓数量归一化后为 0，无法单向平仓", mode=close_mode.value, selected_position_side=selected_position_side)
+            return await self._block_simulation(
+                session_kind=SessionKind.SINGLE_CLOSE,
+                symbol=symbol,
+                round_count=round_count,
+                min_notional=rules.min_notional,
+                message_code="log.simulation.single_close.zero_qty",
+                mode=close_mode.value,
+                selected_position_side=selected_position_side,
+            )
         round_qty = normalize_qty(normalized_close_qty / Decimal(round_count), rules)
         final_round_qty = normalize_qty(normalized_close_qty - (round_qty * Decimal(max(round_count - 1, 0))), rules)
         if round_qty <= Decimal("0") or final_round_qty <= Decimal("0"):
-            return await self._block_simulation(session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, min_notional=rules.min_notional, message="每轮数量归一化后为 0，无法单向平仓", mode=close_mode.value, selected_position_side=selected_position_side)
+            return await self._block_simulation(
+                session_kind=SessionKind.SINGLE_CLOSE,
+                symbol=symbol,
+                round_count=round_count,
+                min_notional=rules.min_notional,
+                message_code="log.simulation.single_close.round_qty_zero",
+                mode=close_mode.value,
+                selected_position_side=selected_position_side,
+            )
         quote = await self._gateway.get_quote(symbol)
         side_price = normalize_price(self._single_side_price(selected_position_side, quote.bid_price, quote.ask_price), rules)
         try:
@@ -1560,7 +2405,24 @@ class MarketStreamController:
             validate_qty_and_notional(final_round_qty, side_price, rules)
         except ValueError:
             per_round_notional = round_qty * side_price
-            return await self._block_simulation(session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, min_notional=rules.min_notional, message=f"每轮平仓金额 {per_round_notional} 低于交易所最小下单金额 {rules.min_notional}，无法平仓。", total_notional=normalized_close_qty * side_price, notional_per_round=per_round_notional, last_qty=round_qty, mode=close_mode.value, selected_position_side=selected_position_side)
+            return await self._block_simulation(
+                session_kind=SessionKind.SINGLE_CLOSE,
+                symbol=symbol,
+                round_count=round_count,
+                min_notional=rules.min_notional,
+                message=f"每轮平仓金额 {per_round_notional} 低于交易所最小下单金额 {rules.min_notional}，无法平仓。",
+                message_code="log.simulation.blocked_min_notional_close",
+                message_params={
+                    "per_round_notional": self._stringify_decimal(per_round_notional),
+                    "min_notional": self._stringify_decimal(rules.min_notional),
+                    "symbol": symbol,
+                },
+                total_notional=normalized_close_qty * side_price,
+                notional_per_round=per_round_notional,
+                last_qty=round_qty,
+                mode=close_mode.value,
+                selected_position_side=selected_position_side,
+            )
         total_notional = normalized_close_qty * side_price
         notional_per_round = round_qty * side_price
         blocked = await self._maybe_block_for_price_guard(
@@ -1580,11 +2442,62 @@ class MarketStreamController:
         )
         if blocked is not None:
             return blocked
-        await self._set_execution_stats(status="running", session_kind=SessionKind.SINGLE_CLOSE, symbol=symbol, round_count=round_count, total_notional=total_notional, notional_per_round=notional_per_round, min_notional=rules.min_notional, mode=close_mode.value, selected_position_side=selected_position_side, message="单向平仓模拟执行中")
-        await self.publish("execution_log", {"level": "info", "message": f"开始模拟单向平仓：{symbol} | 模式={close_mode.value} | 方向={selected_position_side.value} | 数量={normalized_close_qty} | 轮次={round_count}", "created_at": self._utc_now()})
+        await self._set_execution_stats(
+            status="running",
+            session_kind=SessionKind.SINGLE_CLOSE,
+            symbol=symbol,
+            round_count=round_count,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            min_notional=rules.min_notional,
+            mode=close_mode.value,
+            selected_position_side=selected_position_side,
+            message_code="log.simulation.single_close_running",
+        )
+        await self.publish(
+            "execution_log",
+            self._execution_log_payload(
+                level="info",
+                message_code="log.simulation.single_close_started",
+                message_params={
+                    "symbol": symbol,
+                    "mode": close_mode.value,
+                    "selected_position_side": selected_position_side.value,
+                    "qty": self._stringify_decimal(normalized_close_qty),
+                    "round_count": round_count,
+                },
+            ),
+        )
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.SINGLE_CLOSE,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            mode=close_mode.value,
+            selected_position_side=selected_position_side,
+        )
+        if aborted is not None:
+            return aborted
         last_qty = Decimal("0")
         total_residual_qty = Decimal("0")
         for round_index in range(1, round_count + 1):
+            aborted = await self._abort_simulation_if_requested(
+                session_kind=SessionKind.SINGLE_CLOSE,
+                symbol=symbol,
+                round_count=round_count,
+                min_notional=rules.min_notional,
+                total_notional=total_notional,
+                notional_per_round=notional_per_round,
+                last_qty=last_qty,
+                mode=close_mode.value,
+                selected_position_side=selected_position_side,
+                rounds_completed=max(round_index - 1, 0),
+                carryover_qty=total_residual_qty,
+            )
+            if aborted is not None:
+                return aborted
             snapshot = await self._gateway.get_order_book(symbol, limit=10)
             ask1 = normalize_price(Decimal(str(snapshot["asks"][0]["price"])), rules)
             bid1 = normalize_price(Decimal(str(snapshot["bids"][0]["price"])), rules)
@@ -1627,14 +2540,21 @@ class MarketStreamController:
             total_residual_qty = normalize_qty(total_residual_qty + round_residual_qty, rules)
             await self.publish(
                 "execution_log",
-                {
-                    "level": "info",
-                    "message": (
-                        f"第 {round_index} 轮：{selected_position_side.value} @ {live_price} | 预计数量 {last_qty:.8f}"
-                        + (f" | 本轮残量 {round_residual_qty:.8f}" if round_residual_qty > Decimal("0") else "")
+                self._execution_log_payload(
+                    level="info",
+                    message_code=(
+                        "log.simulation.single_close_round_with_residual"
+                        if round_residual_qty > Decimal("0")
+                        else "log.simulation.single_close_round"
                     ),
-                    "created_at": self._utc_now(),
-                },
+                    message_params={
+                        "round_index": round_index,
+                        "selected_position_side": selected_position_side.value,
+                        "price": self._stringify_decimal(live_price),
+                        "qty": self._stringify_decimal(last_qty),
+                        "residual_qty": self._stringify_decimal(round_residual_qty),
+                    },
+                ),
             )
             await self._set_execution_stats(
                 status="running",
@@ -1649,11 +2569,41 @@ class MarketStreamController:
                 mode=close_mode.value,
                 selected_position_side=selected_position_side,
                 carryover_qty=total_residual_qty,
-                message=f"第 {round_index} 轮单向平仓模拟中",
+                message_code="log.simulation.single_close_round_running",
+                message_params={"round_index": round_index},
             )
             if round_index < round_count and round_interval_seconds > 0:
-                await self.publish("execution_log", {"level": "info", "message": f"第 {round_index} 轮结束，等待 {round_interval_seconds} 秒进入下一轮单向平仓", "created_at": self._utc_now()})
-                await asyncio.sleep(round_interval_seconds)
+                aborted = await self._wait_or_abort(
+                    round_interval_seconds,
+                    session_kind=SessionKind.SINGLE_CLOSE,
+                    symbol=symbol,
+                    round_count=round_count,
+                    min_notional=rules.min_notional,
+                    total_notional=total_notional,
+                    notional_per_round=notional_per_round,
+                    last_qty=last_qty,
+                    mode=close_mode.value,
+                    selected_position_side=selected_position_side,
+                    rounds_completed=round_index,
+                    carryover_qty=total_residual_qty,
+                )
+                if aborted is not None:
+                    return aborted
+        aborted = await self._abort_simulation_if_requested(
+            session_kind=SessionKind.SINGLE_CLOSE,
+            symbol=symbol,
+            round_count=round_count,
+            min_notional=rules.min_notional,
+            total_notional=total_notional,
+            notional_per_round=notional_per_round,
+            last_qty=last_qty,
+            mode=close_mode.value,
+            selected_position_side=selected_position_side,
+            rounds_completed=round_count,
+            carryover_qty=total_residual_qty,
+        )
+        if aborted is not None:
+            return aborted
         payload = await self._set_execution_stats(
             status=("completed_with_skips" if total_residual_qty > Decimal("0") else "completed"),
             session_kind=SessionKind.SINGLE_CLOSE,
@@ -1667,23 +2617,32 @@ class MarketStreamController:
             mode=close_mode.value,
             selected_position_side=selected_position_side,
             carryover_qty=total_residual_qty,
-            message=(
-                f"模拟单向平仓完成：{symbol} 共 {round_count} 轮"
+            message_code=(
+                "log.simulation.single_close_completed"
                 if total_residual_qty <= Decimal("0")
-                else f"模拟单向平仓完成：{symbol} 共 {round_count} 轮，保留残量 {total_residual_qty}"
+                else "log.simulation.single_close_completed_with_residual"
             ),
+            message_params={
+                "symbol": symbol,
+                "round_count": round_count,
+                "carryover_qty": self._stringify_decimal(total_residual_qty),
+            },
         )
         await self.publish(
             "execution_log",
-            {
-                "level": ("success" if total_residual_qty <= Decimal("0") else "warn"),
-                "message": (
-                    f"模拟单向平仓完成：{symbol} 共 {round_count} 轮"
+            self._execution_log_payload(
+                level=("success" if total_residual_qty <= Decimal("0") else "warn"),
+                message_code=(
+                    "log.simulation.single_close_completed"
                     if total_residual_qty <= Decimal("0")
-                    else f"模拟单向平仓完成：{symbol} 共 {round_count} 轮，保留残量 {total_residual_qty}"
+                    else "log.simulation.single_close_completed_with_residual"
                 ),
-                "created_at": self._utc_now(),
-            },
+                message_params={
+                    "symbol": symbol,
+                    "round_count": round_count,
+                    "carryover_qty": self._stringify_decimal(total_residual_qty),
+                },
+            ),
         )
         return payload
 
@@ -1713,47 +2672,53 @@ class MarketStreamController:
             session_kind = SessionKind(str(session_kind))
         wait_seconds = 3 if round_interval_seconds is None else round_interval_seconds
         if self._simulation_lock.locked():
-            raise RuntimeError("已有模拟执行正在进行，请等待当前任务完成")
+            raise ExchangeStateError("已有模拟执行正在进行，请等待当前任务完成", code="simulation_already_running")
         async with self._simulation_lock:
-            resolved_policy = resolve_execution_policy(
-                self._settings,
-                session_kind=session_kind,
-                execution_profile=execution_profile,
-                market_fallback_max_ratio=market_fallback_max_ratio,
-                market_fallback_min_residual_qty=market_fallback_min_residual_qty,
-                max_reprice_ticks=max_reprice_ticks,
-                max_spread_bps=max_spread_bps,
-                max_reference_deviation_bps=max_reference_deviation_bps,
-            )
-            self._resolved_simulation_policy = resolved_policy
-            self._resolved_simulation_policy_payload = resolved_policy.to_payload(prefix="resolved_")
-            if session_kind == SessionKind.PAIRED_OPEN:
-                if trend_bias is None:
-                    raise ValueError("双向开仓模拟需要趋势方向")
-                if open_amount is None:
-                    raise ValueError("双向开仓模拟需要开单金额")
-                if leverage is None:
-                    raise ValueError("双向开仓模拟需要杠杆倍数")
-                return await self._run_paired_open_simulation(symbol=symbol, trend_bias=trend_bias, open_amount=open_amount, leverage=leverage, round_count=round_count, round_interval_seconds=wait_seconds)
-            if session_kind == SessionKind.PAIRED_CLOSE:
-                if trend_bias is None:
-                    raise ValueError("双向平仓模拟需要趋势方向")
-                if close_qty is None:
-                    raise ValueError("双向平仓模拟需要平仓数量")
-                return await self._run_paired_close_simulation(symbol=symbol, trend_bias=trend_bias, close_qty=close_qty, round_count=round_count, round_interval_seconds=wait_seconds)
-            if session_kind == SessionKind.SINGLE_OPEN:
-                if open_mode is None:
-                    raise ValueError("单向开仓模拟需要开仓模式")
-                if open_qty is None:
-                    raise ValueError("单向开仓模拟需要开仓数量")
-                return await self._run_single_open_simulation(symbol=symbol, open_mode=open_mode, selected_position_side=selected_position_side, open_qty=open_qty, leverage=leverage, round_count=round_count, round_interval_seconds=wait_seconds)
-            if session_kind == SessionKind.SINGLE_CLOSE:
-                if close_mode is None:
-                    raise ValueError("单向平仓模拟需要平仓模式")
-                if close_qty is None:
-                    raise ValueError("单向平仓模拟需要平仓数量")
-                return await self._run_single_close_simulation(symbol=symbol, close_mode=close_mode, selected_position_side=selected_position_side, close_qty=close_qty, round_count=round_count, round_interval_seconds=wait_seconds)
-            raise ValueError(f"不支持的模拟模式：{session_kind}")
+            self._simulation_abort_requested = False
+            self._simulation_abort_event.clear()
+            try:
+                resolved_policy = resolve_execution_policy(
+                    self._settings,
+                    session_kind=session_kind,
+                    execution_profile=execution_profile,
+                    market_fallback_max_ratio=market_fallback_max_ratio,
+                    market_fallback_min_residual_qty=market_fallback_min_residual_qty,
+                    max_reprice_ticks=max_reprice_ticks,
+                    max_spread_bps=max_spread_bps,
+                    max_reference_deviation_bps=max_reference_deviation_bps,
+                )
+                self._resolved_simulation_policy = resolved_policy
+                self._resolved_simulation_policy_payload = resolved_policy.to_payload(prefix="resolved_")
+                if session_kind == SessionKind.PAIRED_OPEN:
+                    if trend_bias is None:
+                        raise ValueError("双向开仓模拟需要趋势方向")
+                    if open_amount is None:
+                        raise ValueError("双向开仓模拟需要开单金额")
+                    if leverage is None:
+                        raise ValueError("双向开仓模拟需要杠杆倍数")
+                    return await self._run_paired_open_simulation(symbol=symbol, trend_bias=trend_bias, open_amount=open_amount, leverage=leverage, round_count=round_count, round_interval_seconds=wait_seconds)
+                if session_kind == SessionKind.PAIRED_CLOSE:
+                    if trend_bias is None:
+                        raise ValueError("双向平仓模拟需要趋势方向")
+                    if close_qty is None:
+                        raise ValueError("双向平仓模拟需要平仓数量")
+                    return await self._run_paired_close_simulation(symbol=symbol, trend_bias=trend_bias, close_qty=close_qty, round_count=round_count, round_interval_seconds=wait_seconds)
+                if session_kind == SessionKind.SINGLE_OPEN:
+                    if open_mode is None:
+                        raise ValueError("单向开仓模拟需要开仓模式")
+                    if open_qty is None:
+                        raise ValueError("单向开仓模拟需要开仓数量")
+                    return await self._run_single_open_simulation(symbol=symbol, open_mode=open_mode, selected_position_side=selected_position_side, open_qty=open_qty, leverage=leverage, round_count=round_count, round_interval_seconds=wait_seconds)
+                if session_kind == SessionKind.SINGLE_CLOSE:
+                    if close_mode is None:
+                        raise ValueError("单向平仓模拟需要平仓模式")
+                    if close_qty is None:
+                        raise ValueError("单向平仓模拟需要平仓数量")
+                    return await self._run_single_close_simulation(symbol=symbol, close_mode=close_mode, selected_position_side=selected_position_side, close_qty=close_qty, round_count=round_count, round_interval_seconds=wait_seconds)
+                raise ValueError(f"不支持的模拟模式：{session_kind}")
+            finally:
+                self._simulation_abort_requested = False
+                self._simulation_abort_event.clear()
 
 
 def format_sse(event: str, payload: dict[str, Any]) -> str:

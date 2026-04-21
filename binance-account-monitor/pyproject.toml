@@ -31,7 +31,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.setuptools.packages.find]
-include = ["monitor_app*"]
+include = ["monitor_app*", "app_i18n*"]
 
 [tool.setuptools.package-data]
 monitor_app = ["static/*.html"]

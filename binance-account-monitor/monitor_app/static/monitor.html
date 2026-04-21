@@ -171,26 +171,52 @@
   </main>
 
   <script>
+    const APP_CONFIG = window.__APP_CONFIG__ || {};
+    const APP_I18N = window.__APP_I18N__ || {};
+    const I18N_MESSAGES = APP_I18N.messages || {};
     const summaryCards = document.getElementById('summaryCards');
     const groupsContainer = document.getElementById('groupsContainer');
     const connectionBadge = document.getElementById('connectionBadge');
     const messageText = document.getElementById('messageText');
     const updatedAt = document.getElementById('updatedAt');
+    const locale = APP_CONFIG.locale || APP_I18N.default_locale || 'zh-CN';
+    const timezone = APP_CONFIG.timezone || APP_I18N.default_timezone || 'Asia/Shanghai';
     const query = new URLSearchParams(window.location.search);
     const accountIds = query.get('account_ids');
     const groupsUrl = accountIds ? `/api/monitor/groups?account_ids=${encodeURIComponent(accountIds)}` : '/api/monitor/groups';
     const streamUrl = accountIds ? `/stream/monitor?account_ids=${encodeURIComponent(accountIds)}` : '/stream/monitor';
 
+    function formatCopy(key, params = {}) {
+      const template = I18N_MESSAGES[key];
+      if (typeof template !== 'string') return key;
+      return template.replace(/\{(\w+)\}/g, (_, name) => {
+        const value = params[name];
+        return value === undefined || value === null ? `{${name}}` : String(value);
+      });
+    }
+
+    function resolveStructuredMessage(payload, fallback = '-') {
+      if (payload && typeof payload === 'object') {
+        if (payload.message_code) {
+          const rendered = formatCopy(payload.message_code, payload.message_params || {});
+          if (rendered !== payload.message_code) {
+            return rendered;
+          }
+        }
+      }
+      return fallback;
+    }
+
     function fmt(value) {
       const number = Number(value || 0);
-      return Number.isFinite(number) ? number.toLocaleString('en-US', { maximumFractionDigits: 8 }) : String(value ?? '-');
+      return Number.isFinite(number) ? number.toLocaleString(locale, { maximumFractionDigits: 8 }) : String(value ?? '-');
     }
 
     function fmtTime(value) {
       if (!value) return '-';
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString('en-US', { hour12: false });
+      return date.toLocaleString(locale, { hour12: false, timeZone: timezone });
     }
 
     function renderSummary(summary = {}) {
@@ -337,7 +363,7 @@
       const status = payload.status || 'idle';
       connectionBadge.textContent = status;
       connectionBadge.className = `badge ${status === 'ok' ? 'status-ok' : status === 'partial' ? 'status-partial' : status === 'error' ? 'status-error' : ''}`;
-      messageText.textContent = payload.message || '-';
+      messageText.textContent = resolveStructuredMessage(payload, '-');
       updatedAt.textContent = `Updated ${fmtTime(payload.updated_at)}`;
       renderSummary(payload.summary || {});
       const groups = payload.groups || [];

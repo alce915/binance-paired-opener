@@ -1,0 +1,42 @@
+{
+  "session_not_found": {
+    "key": "reasons.session_not_found",
+    "params": ["session_id"]
+  },
+  "whitelist_empty": {
+    "key": "reasons.whitelist_empty",
+    "params": []
+  },
+  "invalid_parameter": {
+    "key": "reasons.invalid_parameter",
+    "params": []
+  },
+  "trading_request_failed": {
+    "key": "reasons.trading_request_failed",
+    "params": []
+  },
+  "session_precheck_failed": {
+    "key": "reasons.session_precheck_failed",
+    "params": []
+  },
+  "simulation_already_running": {
+    "key": "reasons.simulation_already_running",
+    "params": []
+  },
+  "simulation_not_running": {
+    "key": "reasons.simulation_not_running",
+    "params": []
+  },
+  "session_resume_invalid_status": {
+    "key": "reasons.session_resume_invalid_status",
+    "params": []
+  },
+  "session_resume_manual_confirmation": {
+    "key": "reasons.session_resume_manual_confirmation",
+    "params": []
+  },
+  "session_resume_non_recoverable": {
+    "key": "reasons.session_resume_non_recoverable",
+    "params": []
+  }
+}

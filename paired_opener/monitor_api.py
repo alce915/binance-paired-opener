@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
+from app_i18n.runtime import DEFAULT_LOCALE, DEFAULT_TIMEZONE, frontend_bootstrap_payload
 from paired_opener.account_monitor import AccountMonitorController
 from paired_opener.config import settings
 from paired_opener.market_stream import format_sse
@@ -32,9 +34,30 @@ app = FastAPI(title=settings.monitor_app_name, lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
+def _inject_bootstrap_before_scripts(html: str, bootstrap: str) -> str:
+    first_script_index = html.find("<script")
+    if first_script_index != -1:
+        line_start = html.rfind("\n", 0, first_script_index)
+        insert_at = 0 if line_start == -1 else line_start + 1
+        indent = html[insert_at:first_script_index]
+        return f"{html[:insert_at]}{indent}{bootstrap}\n{html[insert_at:]}"
+    if "</body>" in html:
+        return html.replace("</body>", f"{bootstrap}\n</body>", 1)
+    return f"{html}\n{bootstrap}"
+
+
+def _render_monitor_html() -> str:
+    html = STATIC_DIR.joinpath("monitor.html").read_text(encoding="utf-8")
+    bootstrap = (
+        f'<script>window.__APP_CONFIG__ = {json.dumps({"locale": DEFAULT_LOCALE, "timezone": DEFAULT_TIMEZONE}, ensure_ascii=False)};'
+        f'window.__APP_I18N__ = {json.dumps(frontend_bootstrap_payload(namespaces=("common", "runtime", "events", "reasons")), ensure_ascii=False)};</script>'
+    )
+    return _inject_bootstrap_before_scripts(html, bootstrap)
+
+
 @app.get("/", include_in_schema=False)
-async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR.joinpath("monitor.html"), headers=HTML_CACHE_HEADERS)
+async def index() -> HTMLResponse:
+    return HTMLResponse(_render_monitor_html(), headers=HTML_CACHE_HEADERS)
 
 
 @app.get("/healthz")

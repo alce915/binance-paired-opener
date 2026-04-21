@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 import httpx
 import websockets
 
+from app_i18n.runtime import DEFAULT_ACCOUNT_NAME
 from paired_opener.config import AccountConfig, Settings
 from paired_opener.domain import (
     ExchangeOrder,
@@ -36,7 +37,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         else:
             self._account = AccountConfig(
                 account_id="default",
-                name="默认账户",
+                name=DEFAULT_ACCOUNT_NAME,
                 api_key=settings.binance_api_key,
                 api_secret=settings.binance_api_secret,
                 use_testnet=settings.binance_use_testnet,

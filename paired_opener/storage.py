@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME, redact_debug_text
 from paired_opener.domain import OpenSession, RecoveryStatus, RoundExecution, SessionStatus
 
 
@@ -48,14 +49,15 @@ class SqliteRepository:
         self._initialize()
 
     def _initialize(self) -> None:
+        account_name_default = DEFAULT_ACCOUNT_NAME.replace("'", "''")
         with self._connection:
             self._connection.executescript(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     session_kind TEXT NOT NULL DEFAULT 'paired_open',
                     account_id TEXT NOT NULL DEFAULT 'default',
-                    account_name TEXT NOT NULL DEFAULT '默认账户',
+                    account_name TEXT NOT NULL DEFAULT '{account_name_default}',
                     symbol TEXT NOT NULL,
                     trend_bias TEXT NOT NULL,
                     leverage INTEGER NOT NULL,
@@ -86,6 +88,9 @@ class SqliteRepository:
                     last_error_strategy TEXT,
                     last_error_code TEXT,
                     last_error_operator_action TEXT,
+                    last_error_params_json TEXT,
+                    last_error_raw_message TEXT,
+                    last_error_contract_version TEXT,
                     recovery_status TEXT,
                     recovery_summary TEXT,
                     recovery_checked_at TEXT,
@@ -121,7 +126,7 @@ class SqliteRepository:
             )
             self._ensure_column("sessions", "session_kind", "TEXT NOT NULL DEFAULT 'paired_open'")
             self._ensure_column("sessions", "account_id", "TEXT NOT NULL DEFAULT 'default'")
-            self._ensure_column("sessions", "account_name", "TEXT NOT NULL DEFAULT '默认账户'")
+            self._ensure_column("sessions", "account_name", f"TEXT NOT NULL DEFAULT '{account_name_default}'")
             self._ensure_column("sessions", "round_interval_seconds", "INTEGER NOT NULL DEFAULT 3")
             self._ensure_column("sessions", "execution_profile", "TEXT NOT NULL DEFAULT 'balanced'")
             self._ensure_column("sessions", "market_fallback_max_ratio", "TEXT NOT NULL DEFAULT '1'")
@@ -142,6 +147,9 @@ class SqliteRepository:
             self._ensure_column("sessions", "last_error_strategy", "TEXT")
             self._ensure_column("sessions", "last_error_code", "TEXT")
             self._ensure_column("sessions", "last_error_operator_action", "TEXT")
+            self._ensure_column("sessions", "last_error_params_json", "TEXT")
+            self._ensure_column("sessions", "last_error_raw_message", "TEXT")
+            self._ensure_column("sessions", "last_error_contract_version", f"TEXT NOT NULL DEFAULT '{CONTRACT_VERSION}'")
             self._ensure_column("sessions", "recovery_status", "TEXT")
             self._ensure_column("sessions", "recovery_summary", "TEXT")
             self._ensure_column("sessions", "recovery_checked_at", "TEXT")
@@ -152,6 +160,10 @@ class SqliteRepository:
         if column in columns:
             return
         self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
 
     def create_session(self, session: OpenSession) -> None:
         with self._lock, self._connection:
@@ -164,8 +176,9 @@ class SqliteRepository:
                     max_reprice_ticks, max_spread_bps, max_reference_deviation_bps,
                     round_interval_seconds, open_mode, close_mode, selected_position_side, target_open_qty, target_close_qty, created_by, status, created_at, updated_at, last_error,
                     last_error_category, last_error_strategy, last_error_code, last_error_operator_action,
+                    last_error_params_json, last_error_raw_message, last_error_contract_version,
                     stage2_carryover_qty, final_alignment_status, final_unaligned_qty, completed_with_final_alignment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.session_id,
@@ -202,6 +215,9 @@ class SqliteRepository:
                     session.last_error_strategy,
                     session.last_error_code,
                     session.last_error_operator_action,
+                    _json_dumps(session.last_error_params),
+                    redact_debug_text(session.last_error_raw_message),
+                    session.last_error_contract_version or CONTRACT_VERSION,
                     str(session.stage2_carryover_qty),
                     session.final_alignment_status.value,
                     str(session.final_unaligned_qty),
@@ -219,8 +235,14 @@ class SqliteRepository:
         last_error_strategy: str | None = None,
         last_error_code: str | None = None,
         last_error_operator_action: str | None = None,
+        last_error_params: dict[str, Any] | None = None,
+        last_error_raw_message: str | None = None,
+        last_error_contract_version: str | None = None,
         clear_recovery: bool = False,
     ) -> None:
+        encoded_error_params = _json_dumps(last_error_params or {})
+        redacted_raw_message = redact_debug_text(last_error_raw_message)
+        error_contract_version = last_error_contract_version or CONTRACT_VERSION
         with self._lock, self._connection:
             if clear_recovery:
                 self._connection.execute(
@@ -233,6 +255,9 @@ class SqliteRepository:
                         last_error_strategy = ?,
                         last_error_code = ?,
                         last_error_operator_action = ?,
+                        last_error_params_json = ?,
+                        last_error_raw_message = ?,
+                        last_error_contract_version = ?,
                         recovery_status = NULL,
                         recovery_summary = NULL,
                         recovery_checked_at = NULL,
@@ -247,6 +272,9 @@ class SqliteRepository:
                         last_error_strategy,
                         last_error_code,
                         last_error_operator_action,
+                        encoded_error_params,
+                        redacted_raw_message,
+                        error_contract_version,
                         session_id,
                     ),
                 )
@@ -260,7 +288,10 @@ class SqliteRepository:
                         last_error_category = ?,
                         last_error_strategy = ?,
                         last_error_code = ?,
-                        last_error_operator_action = ?
+                        last_error_operator_action = ?,
+                        last_error_params_json = ?,
+                        last_error_raw_message = ?,
+                        last_error_contract_version = ?
                     WHERE session_id = ?
                     """,
                     (
@@ -271,6 +302,9 @@ class SqliteRepository:
                         last_error_strategy,
                         last_error_code,
                         last_error_operator_action,
+                        encoded_error_params,
+                        redacted_raw_message,
+                        error_contract_version,
                         session_id,
                     ),
                 )
@@ -486,10 +520,13 @@ class SqliteRepository:
                     last_error_category = NULL,
                     last_error_strategy = NULL,
                     last_error_code = NULL,
-                    last_error_operator_action = NULL
+                    last_error_operator_action = NULL,
+                    last_error_params_json = '{}',
+                    last_error_raw_message = NULL,
+                    last_error_contract_version = ?
                 WHERE session_id = ?
                 """,
-                [(SessionStatus.EXCEPTION.value, now, reason, session_id) for session_id in session_ids],
+                [(SessionStatus.EXCEPTION.value, now, reason, CONTRACT_VERSION, session_id) for session_id in session_ids],
             )
             return session_ids
 
@@ -601,6 +638,7 @@ class SqliteRepository:
     def _deserialize_session_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["completed_with_final_alignment"] = bool(payload.get("completed_with_final_alignment"))
+        payload["last_error_params"] = _json_loads(payload.pop("last_error_params_json", "{}"))
         recovery_status = payload.get("recovery_status")
         if recovery_status:
             payload["recovery_status"] = RecoveryStatus(recovery_status)

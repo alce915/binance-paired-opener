@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
@@ -49,7 +48,7 @@ class FakeMonitorGateway:
 
 
 @pytest.mark.asyncio
-async def test_account_monitor_controller_groups_and_filters_accounts(tmp_path: Path) -> None:
+async def test_account_monitor_controller_groups_and_filters_accounts() -> None:
     settings = Settings(_env_file=None, monitor_refresh_interval_ms=50, monitor_history_window_days=3)
     account1 = MonitorAccountConfig(account_id="group_a.sub1", child_account_id="sub1", child_account_name="Sub One", main_account_id="group_a", main_account_name="Group A", api_key="k1", api_secret="s1")
     account2 = MonitorAccountConfig(account_id="group_a.sub2", child_account_id="sub2", child_account_name="Sub Two", main_account_id="group_a", main_account_name="Group A", api_key="k2", api_secret="s2")
@@ -65,6 +64,9 @@ async def test_account_monitor_controller_groups_and_filters_accounts(tmp_path: 
     try:
         initial = await asyncio.wait_for(queue.get(), timeout=1)
         refreshed = await asyncio.wait_for(queue.get(), timeout=1)
+        current_summary = controller.current_summary(["group_a.sub1", "group_b.sub1"])
+        current_groups = controller.current_groups(["group_a.sub1", "group_b.sub1"])
+        current_accounts = controller.current_accounts(["group_a.sub1", "group_b.sub1"])
     finally:
         controller.unsubscribe(queue)
         await controller.close()
@@ -74,3 +76,39 @@ async def test_account_monitor_controller_groups_and_filters_accounts(tmp_path: 
     assert len(refreshed["data"]["groups"]) == 2
     assert refreshed["data"]["groups"][0]["main_account_id"] == "group_a"
     assert refreshed["data"]["summary"]["equity"] == "2400"
+    assert refreshed["data"]["message_code"] == "runtime.monitor_all_healthy"
+    assert refreshed["data"]["message_params"] == {}
+    assert current_summary["message_code"] == "runtime.monitor_all_healthy"
+    assert current_summary["message_params"] == {}
+    assert current_groups["message_code"] == "runtime.monitor_all_healthy"
+    assert current_groups["message_params"] == {}
+    assert current_accounts["message_code"] == "runtime.monitor_all_healthy"
+    assert current_accounts["message_params"] == {}
+
+
+@pytest.mark.asyncio
+async def test_account_monitor_controller_uses_safe_message_for_failed_account_snapshot() -> None:
+    settings = Settings(_env_file=None, monitor_refresh_interval_ms=50, monitor_history_window_days=3)
+    account1 = MonitorAccountConfig(account_id="group_a.sub1", child_account_id="sub1", child_account_name="Sub One", main_account_id="group_a", main_account_name="Group A", api_key="k1", api_secret="s1")
+    account2 = MonitorAccountConfig(account_id="group_a.sub2", child_account_id="sub2", child_account_name="Sub Two", main_account_id="group_a", main_account_name="Group A", api_key="k2", api_secret="s2")
+    settings.monitor_accounts = {account.account_id: account for account in (account1, account2)}
+    settings.monitor_main_accounts = {
+        "group_a": MainAccountConfig(main_id="group_a", name="Group A", children=(account1, account2)),
+    }
+    controller = AccountMonitorController(settings, gateway_factory=lambda account: FakeMonitorGateway(account))
+
+    queue = await controller.subscribe()
+    try:
+        await asyncio.wait_for(queue.get(), timeout=1)
+        refreshed = await asyncio.wait_for(queue.get(), timeout=1)
+    finally:
+        controller.unsubscribe(queue)
+        await controller.close()
+
+    failed_account = next(item for item in refreshed["data"]["accounts"] if item["account_id"] == "group_a.sub2")
+
+    assert refreshed["data"]["status"] == "partial"
+    assert refreshed["data"]["message_code"] == "runtime.monitor_partial_failed"
+    assert failed_account["status"] == "error"
+    assert failed_account["message_code"] == "runtime.monitor_account_refresh_failed"
+    assert "sub2 unavailable" not in failed_account["message"]

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from app_i18n.runtime import CONTRACT_VERSION
 from paired_opener.config import Settings
 from paired_opener.domain import (
     ExecutionProfile,
@@ -1127,8 +1128,13 @@ async def test_precheck_fails_when_system_open_orders_cannot_be_loaded(tmp_path:
     )
 
     assert precheck["ok"] is False
+    assert precheck["contract_version"] == CONTRACT_VERSION
+    assert precheck["summary_code"] == "precheck.system_open_orders.fail_read_error"
     failure = next(item for item in precheck["checks"] if item["code"] == "system_open_orders")
     assert failure["status"] == "fail"
+    assert failure["contract_version"] == CONTRACT_VERSION
+    assert failure["label_key"] == "precheck.labels.system_open_orders"
+    assert failure["message_key"] == "precheck.system_open_orders.fail_read_error"
     assert "系统挂单状态读取失败" in failure["message"]
 
 

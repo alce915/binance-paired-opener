@@ -16,6 +16,14 @@ const createCloseBtn = document.getElementById("createCloseBtn");
 const createSingleOpenBtn = document.getElementById("createSingleOpenBtn");
 const createSingleCloseBtn = document.getElementById("createSingleCloseBtn");
 const simulateBtn = document.getElementById("simulateBtn");
+const executionSummaryBanner = document.getElementById("executionSummaryBanner");
+const executionSummaryText = document.getElementById("executionSummaryText");
+const executionRiskBanner = document.getElementById("executionRiskBanner");
+const executionRiskText = document.getElementById("executionRiskText");
+const recoverableSessionBanner = document.getElementById("recoverableSessionBanner");
+const recoverableSessionText = document.getElementById("recoverableSessionText");
+const recoverSessionBtn = document.getElementById("recoverSessionBtn");
+const dismissRecoverSessionBtn = document.getElementById("dismissRecoverSessionBtn");
 const minNotionalHint = document.getElementById("minNotionalHint");
 const closeValidationHint = document.getElementById("closeValidationHint");
 const singleOpenValidationHint = document.getElementById("singleOpenValidationHint");
@@ -36,7 +44,14 @@ const modePanels = {
 let eventSource = null;
 let executionMode = "paired_open";
 let activeSymbol = executionSymbol.value || "BTCUSDT";
-let currentAccount = { id: "default", name: "默认账户" };
+const APP_CONFIG = window.__APP_CONFIG__ || {};
+const APP_I18N = window.__APP_I18N__ || {};
+const I18N_MESSAGES = APP_I18N.messages || {};
+const I18N_REGISTRIES = APP_I18N.registries || {};
+const APP_LOCALE = APP_CONFIG.locale || APP_I18N.default_locale || "zh-CN";
+const APP_TIMEZONE = APP_CONFIG.timezone || APP_I18N.default_timezone || "Asia/Shanghai";
+const DEFAULT_ACCOUNT_NAME = I18N_MESSAGES["common.default_account_name"] || "默认账户";
+let currentAccount = { id: "default", name: DEFAULT_ACCOUNT_NAME };
 let availableAccounts = [];
 let whitelistSymbols = [];
 let temporaryCustomSymbol = null;
@@ -62,10 +77,46 @@ let activeSessionPoller = null;
 let activeSessionState = null;
 let latestSessionEventId = 0;
 const seenSessionEventIds = new Set();
-const APP_CONFIG = window.__APP_CONFIG__ || {};
+let executionActionInFlightCount = 0;
+let simulationRunInFlight = false;
+let simulationAbortInFlight = false;
+let sessionAbortInFlight = false;
+let latestExecutionStatsState = null;
+let activeExecutionSummary = null;
+let topRiskBanner = null;
+let recoverableSessionState = null;
+let recoverableSessionDismissed = false;
+let latestResidualSideLabel = "--";
+const modeHintStateByMode = new Map();
+const precheckFreshnessStateByMode = new Map();
+["paired_open", "paired_close", "single_open", "single_close"].forEach((mode) => {
+  modeHintStateByMode.set(mode, { canCreate: false, canSimulate: false });
+  precheckFreshnessStateByMode.set(mode, { fresh: false, reason: "pending" });
+});
 const MAX_LOG_LINES = Number(APP_CONFIG.frontend_execution_log_lines || 200);
-const LOG_LEVEL_LABELS = { info: '提示', success: '成功', warn: '警告', error: '错误' };
-const CONNECTION_STATUS_LABELS = { connected: '已连接', connecting: '连接中', disconnected: '已断开', error: '异常', idle: '空闲' };
+const DEFAULT_REAL_ACTION_LABELS = {
+  paired_open: "创建真实开单会话",
+  paired_close: "创建真实平仓会话",
+  single_open: "创建真实单向开仓会话",
+  single_close: "创建真实单向平仓会话",
+};
+const DEFAULT_SIMULATE_LABEL = copyOrDefault("runtime.simulation_run", "模拟执行");
+const EXECUTION_TERMINATE_LABEL = copyOrDefault("runtime.execution_running_click_abort", "执行中...点击终止");
+const SIMULATION_TERMINATE_LABEL = copyOrDefault("runtime.simulation_running_click_abort", "模拟中...点击终止");
+const EXECUTION_ABORTING_LABEL = copyOrDefault("runtime.execution_aborting", "终止中...");
+const LOG_LEVEL_LABELS = {
+  info: copyOrDefault("console.log_levels.info", "提示"),
+  success: copyOrDefault("console.log_levels.success", "成功"),
+  warn: copyOrDefault("console.log_levels.warn", "警告"),
+  error: copyOrDefault("console.log_levels.error", "错误"),
+};
+const CONNECTION_STATUS_LABELS = {
+  connected: I18N_MESSAGES["runtime.connection_connected"] || "已连接",
+  connecting: I18N_MESSAGES["runtime.connection_connecting"] || "连接中",
+  disconnected: I18N_MESSAGES["runtime.connection_disconnected"] || "已断开",
+  error: I18N_MESSAGES["runtime.connection_error"] || "异常",
+  idle: I18N_MESSAGES["runtime.connection_idle"] || "空闲",
+};
 const orderBookRowCache = { sell: [], buy: [] };
 const positionRowCache = new Map();
 let pendingOrderbookPayload = null;
@@ -73,33 +124,403 @@ let pendingAccountOverviewPayload = null;
 const pendingLogEntries = [];
 let renderFramePending = false;
 
+function resolveActionAvailability(hintState = {}, runtimeState = {}) {
+  const locked = Boolean(runtimeState.requestInFlight || runtimeState.hasActiveSession);
+  return {
+    canCreate: Boolean(hintState.canCreate) && !locked,
+    canSimulate: Boolean(hintState.canSimulate) && !locked,
+    locked,
+  };
+}
+
+function normalizeSessionKind(kind) {
+  return ["paired_close", "single_open", "single_close"].includes(String(kind || ""))
+    ? String(kind)
+    : "paired_open";
+}
+
+function isTerminalSimulationStatus(status) {
+  return ["idle", "completed", "completed_with_skips", "blocked", "aborted", "exception"].includes(String(status || "idle"));
+}
+
+function hasActiveSimulationRun() {
+  if (simulationRunInFlight || simulationAbortInFlight) return true;
+  return Boolean(latestExecutionStatsState && !isTerminalSimulationStatus(latestExecutionStatsState.status));
+}
+
+function activeSessionKind() {
+  if (!hasActiveExecutionSession()) return null;
+  const sessionKind = activeSessionState?.session_kind;
+  return sessionKind ? normalizeSessionKind(sessionKind) : "paired_open";
+}
+
+function currentExecutionLockState() {
+  return {
+    requestInFlight: executionActionInFlightCount > 0,
+    hasActiveSession: hasActiveExecutionSession(),
+    hasActiveSimulation: hasActiveSimulationRun(),
+  };
+}
+
+function executionButtonForMode(mode) {
+  switch (normalizeSessionKind(mode)) {
+    case "paired_close":
+      return createCloseBtn;
+    case "single_open":
+      return createSingleOpenBtn;
+    case "single_close":
+      return createSingleCloseBtn;
+    default:
+      return createBtn;
+  }
+}
+
+function eachExecutionInput(callback) {
+  const controls = new Set([
+    connectionToggle,
+    orderBookInput,
+    confirmSymbolBtn,
+    editWhitelistBtn,
+    accountSelect,
+    executionSymbol,
+    closeExecutionSymbol,
+    singleOpenExecutionSymbol,
+    document.getElementById("singleCloseExecutionSymbol"),
+    ...Object.values(modeButtons),
+    ...document.querySelectorAll(".mode-panel input, .mode-panel select"),
+  ]);
+  controls.forEach((element) => {
+    if (element) callback(element);
+  });
+}
+
+function setExecutionInputLock(locked) {
+  eachExecutionInput((element) => {
+    if (locked) {
+      if (element.dataset.executionLocked !== "true") {
+        element.dataset.executionLocked = "true";
+        element.dataset.executionLockedPrev = element.disabled ? "1" : "0";
+      }
+      element.disabled = true;
+      return;
+    }
+    if (element.dataset.executionLocked === "true") {
+      element.disabled = element.dataset.executionLockedPrev === "1";
+      delete element.dataset.executionLocked;
+      delete element.dataset.executionLockedPrev;
+    }
+  });
+}
+
+function setBannerState(element, textElement, config = null) {
+  if (!element || !textElement) return;
+  element.classList.remove("summary", "info", "warn", "error", "hidden");
+  if (!config || !config.message) {
+    element.classList.add("hidden");
+    textElement.textContent = "";
+    return;
+  }
+  element.classList.add(config.tone || "info");
+  textElement.textContent = config.message;
+}
+
+function updateTopRiskBanner(level, message) {
+  if (!message) return;
+  const tone = level === "error" ? "error" : level === "warn" ? "warn" : "info";
+  topRiskBanner = { tone, message };
+}
+
+function clearTopRiskBanner() {
+  topRiskBanner = null;
+}
+
+function renderRiskBanner() {
+  setBannerState(executionRiskBanner, executionRiskText, topRiskBanner);
+}
+
+function formatExecutionStatus(status) {
+  switch (String(status || "idle")) {
+    case "running":
+      return copyOrDefault("runtime.execution_status_running", "执行中");
+    case "aborting":
+      return copyOrDefault("runtime.execution_status_aborting", "终止中");
+    case "aborted":
+      return copyOrDefault("runtime.execution_status_aborted", "已终止");
+    case "completed":
+      return copyOrDefault("runtime.execution_status_completed", "已完成");
+    case "completed_with_skips":
+      return copyOrDefault("runtime.execution_status_completed_with_skips", "已完成（含跳过）");
+    case "blocked":
+      return copyOrDefault("runtime.execution_status_blocked", "已阻断");
+    case "paused":
+      return copyOrDefault("runtime.execution_status_paused", "已暂停");
+    case "pending":
+      return copyOrDefault("runtime.execution_status_pending", "待执行");
+    case "exception":
+      return copyOrDefault("runtime.execution_status_exception", "执行异常");
+    default:
+      return copyOrDefault("runtime.execution_status_idle", "空闲");
+  }
+}
+
+function summarizeExecutionSummary(summary) {
+  if (!summary) return "";
+  const segments = [
+    `${copyOrDefault("console.summary.mode", "模式")}：${formatModeLabel(summary.mode || executionMode)}`,
+    `${copyOrDefault("console.summary.rounds", "轮次")}：${summary.roundsCompleted || 0} / ${summary.roundsTotal || 0}`,
+    `${copyOrDefault("console.summary.status", "状态")}：${formatExecutionStatus(summary.status)}`,
+    `${copyOrDefault("console.summary.carryover", "累计残量")}：${formatNumber(summary.carryoverQty || 0, 6)}`,
+    `${copyOrDefault("console.summary.residual_side", "残量归属")}：${summary.residualSide || "--"}`,
+    `${copyOrDefault("console.summary.alignment", "最终对齐")}：${formatAlignmentStatus(summary.finalAlignmentStatus)}`,
+  ];
+  if (summary.abortRequested) {
+    segments.push(copyOrDefault("console.summary.abort_requested", "已请求终止"));
+  }
+  return segments.join(" | ");
+}
+
+function renderExecutionSummaryBanner() {
+  setBannerState(
+    executionSummaryBanner,
+    executionSummaryText,
+    activeExecutionSummary ? { tone: "summary", message: summarizeExecutionSummary(activeExecutionSummary) } : null,
+  );
+}
+
+function updateAbortStateLabel(status = "idle", abortRequested = false) {
+  const statAbortState = document.getElementById("statAbortState");
+  if (!statAbortState) return;
+  if (abortRequested || status === "aborting") {
+    statAbortState.textContent = copyOrDefault("runtime.execution_abort_requested", "已请求终止");
+    return;
+  }
+  if (status === "aborted") {
+    statAbortState.textContent = copyOrDefault("runtime.execution_status_aborted", "已终止");
+    return;
+  }
+  statAbortState.textContent = copyOrDefault("runtime.execution_abort_not_requested", "未请求");
+}
+
+function buildExecutionSummary(source = {}, overrides = {}) {
+  return {
+    mode: normalizeSessionKind(overrides.mode || source.session_kind || source.mode || executionMode),
+    status: String(overrides.status || source.status || "idle"),
+    roundsCompleted: Number(overrides.roundsCompleted ?? source.rounds_completed ?? 0),
+    roundsTotal: Number(overrides.roundsTotal ?? source.rounds_total ?? source.round_count ?? 0),
+    carryoverQty: Number(overrides.carryoverQty ?? resolveResidualQty(source) ?? 0),
+    residualSide: overrides.residualSide || latestResidualSideLabel || "--",
+    finalAlignmentStatus: String(overrides.finalAlignmentStatus || source.final_alignment_status || "not_needed"),
+    abortRequested: Boolean(overrides.abortRequested),
+  };
+}
+
+function updateExecutionSummary(summary = null) {
+  activeExecutionSummary = summary;
+  renderExecutionSummaryBanner();
+}
+
+function describePrecheckFreshness(decision) {
+  if (!decision || !decision.runnable || decision.reason === "not_runnable" || decision.reason === "no_snapshot") {
+    return {
+      fresh: false,
+      reason: "pending",
+      label: copyOrDefault("runtime.precheck_status_pending", "待校验"),
+      message: copyOrDefault("runtime.precheck_status_pending", "待校验"),
+    };
+  }
+  if (decision.reason === "fresh") {
+    return {
+      fresh: true,
+      reason: "fresh",
+      label: copyOrDefault("runtime.precheck_status_fresh", "已校验"),
+      message: copyOrDefault("runtime.precheck_status_fresh", "已校验"),
+    };
+  }
+  const staleMessageKey = (() => {
+    switch (decision.reason) {
+      case "params_changed":
+        return "runtime.precheck_stale_params_changed";
+      case "context_stale":
+      case "context_interval":
+        return "runtime.precheck_stale_context_changed";
+      case "price_drift":
+      case "no_price_baseline":
+        return "runtime.precheck_stale_price_drift";
+      default:
+        return "runtime.precheck_stale_interval";
+    }
+  })();
+  return {
+    fresh: false,
+    reason: decision.reason,
+    label: copyOrDefault("runtime.precheck_status_stale", "需重新确认"),
+    message: copyOrDefault(staleMessageKey, "预检已过期，请重新确认。"),
+  };
+}
+
+function syncPrecheckFreshnessState(mode = executionMode) {
+  const freshness = describePrecheckFreshness(getModeValidationDecision(mode));
+  precheckFreshnessStateByMode.set(mode, freshness);
+  if (mode === executionMode) {
+    const statPrecheckFreshness = document.getElementById("statPrecheckFreshness");
+    if (statPrecheckFreshness) {
+      statPrecheckFreshness.textContent = freshness.label;
+    }
+  }
+  return freshness;
+}
+
+function selectRecoverableSession(sessions = []) {
+  const candidates = Array.isArray(sessions) ? sessions : [];
+  const active = candidates
+    .filter((session) => !isTerminalSession(session.status))
+    .sort((left, right) => new Date(right.updated_at || 0) - new Date(left.updated_at || 0));
+  if (active.length) return active[0];
+  const recoverable = candidates
+    .filter((session) => String(session.status) === "exception" && String(session.recovery_status || "") === "recoverable")
+    .sort((left, right) => new Date(right.updated_at || 0) - new Date(left.updated_at || 0));
+  return recoverable[0] || null;
+}
+
+function renderRecoverableSessionBanner() {
+  if (recoverableSessionDismissed || !recoverableSessionState) {
+    setBannerState(recoverableSessionBanner, recoverableSessionText, null);
+    return;
+  }
+  const session = recoverableSessionState;
+  const promptKey = String(session.status) === "exception"
+    ? "runtime.recover_session_resume_prompt"
+    : "runtime.recover_session_monitor_prompt";
+  const prompt = copyOrDefault(promptKey, "检测到未完成执行，是否恢复监控？", {
+    session_id: session.session_id,
+    symbol: session.symbol,
+  });
+  setBannerState(recoverableSessionBanner, recoverableSessionText, { tone: "info", message: prompt });
+}
+
+function copyOrDefault(key, fallback, params = {}) {
+  const rendered = formatCopy(key, params);
+  return rendered === key ? fallback : rendered;
+}
+
+function statusLabel(status) {
+  return CONNECTION_STATUS_LABELS[String(status || "idle")] || String(status || "idle");
+}
+
+function formatCopy(key, params = {}) {
+  const template = I18N_MESSAGES[key];
+  if (typeof template !== "string") return key;
+  return template.replace(/\{(\w+)\}/g, (_, name) => {
+    const value = params[name];
+    return value === undefined || value === null ? `{${name}}` : String(value);
+  });
+}
+
+function unknownErrorMessage() {
+  return I18N_MESSAGES["common.unknown_error"] || "未知错误";
+}
+
+function formatReason(code, params = {}, fallback = "") {
+  const reasonEntry = I18N_REGISTRIES.reasons?.[code];
+  if (reasonEntry?.key) {
+    const rendered = formatCopy(reasonEntry.key, params);
+    if (rendered !== reasonEntry.key) {
+      return rendered;
+    }
+  }
+  return fallback || unknownErrorMessage();
+}
+
+function resolveStructuredMessage(source = {}, fallback = "") {
+  const safeFallback = fallback || unknownErrorMessage();
+  if (source && typeof source === "object") {
+    if (source.message_code) {
+      const rendered = formatCopy(source.message_code, source.message_params || {});
+      if (rendered !== source.message_code) {
+        return rendered;
+      }
+    }
+    if (source.message_key) {
+      const rendered = formatCopy(source.message_key, source.message_params || {});
+      if (rendered !== source.message_key) {
+        return rendered;
+      }
+    }
+    if (source.code) {
+      return formatReason(source.code, source.params || {}, safeFallback);
+    }
+  }
+  return safeFallback;
+}
+
+function userVisibleErrorMessage(error, fallback = "") {
+  const safeFallback = fallback || unknownErrorMessage();
+  if (error && typeof error === "object") {
+    if (error.precheck) {
+      return summarizePrecheckMessage(error.precheck, safeFallback) || safeFallback;
+    }
+    if (error.detail && typeof error.detail === "object") {
+      return resolveStructuredMessage(error.detail, safeFallback);
+    }
+    if (error.code) {
+      return formatReason(error.code, error.params || {}, safeFallback);
+    }
+  }
+  return safeFallback;
+}
+
+function resolveLogMessage(source = {}, fallback = "") {
+  const safeFallback = fallback || copyOrDefault("runtime.execution_message_unavailable", "日志信息暂不可用");
+  if (source && typeof source === "object") {
+    if (source.messageCode) {
+      const rendered = formatCopy(source.messageCode, source.messageParams || {});
+      if (rendered !== source.messageCode) {
+        return rendered;
+      }
+    }
+    if (source.trustedMessage === true && source.message) {
+      return String(source.message);
+    }
+  }
+  return safeFallback;
+}
+
 function nowTime() {
-  return new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  return new Date().toLocaleTimeString(APP_LOCALE, { hour12: false, timeZone: APP_TIMEZONE });
 }
 
 function request(path, options = {}) {
   return fetch(path, options).then(async (response) => {
     const text = await response.text();
     if (!response.ok) {
-      let message = text;
+      const safeFallback = unknownErrorMessage();
+      let message = safeFallback;
       let precheck = null;
       let validationDetail = null;
+      let errorDetail = null;
       try {
         const payload = JSON.parse(text);
         if (payload && typeof payload === "object") {
           if (Array.isArray(payload.detail)) {
             validationDetail = payload.detail;
-            message = payload.message || text;
+            message = formatReason("invalid_parameter", {}, safeFallback);
           } else if (payload.detail && typeof payload.detail === "object") {
-            message = payload.detail.message || payload.message || text;
+            errorDetail = payload.detail;
+            message = resolveStructuredMessage(payload.detail, safeFallback);
             precheck = payload.detail.precheck || null;
           } else {
-            message = payload.detail || payload.message || text;
+            message = resolveStructuredMessage(payload, safeFallback);
             precheck = payload.precheck || null;
           }
         }
       } catch {}
       const error = new Error(message);
+      error.rawResponseText = text;
+      if (errorDetail) {
+        error.detail = errorDetail;
+        error.code = errorDetail.code || null;
+        error.params = errorDetail.params || {};
+      }
       if (precheck) error.precheck = precheck;
       if (validationDetail) error.validationDetail = validationDetail;
       throw error;
@@ -115,7 +536,7 @@ function request(path, options = {}) {
 function formatNumber(value, digits = 8) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "0";
-  return numeric.toLocaleString("zh-CN", {
+  return numeric.toLocaleString(APP_LOCALE, {
     minimumFractionDigits: 0,
     maximumFractionDigits: digits,
   });
@@ -124,7 +545,7 @@ function formatNumber(value, digits = 8) {
 function formatMoney(value, digits = 2) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "0.00";
-  return numeric.toLocaleString("zh-CN", {
+  return numeric.toLocaleString(APP_LOCALE, {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
@@ -214,13 +635,13 @@ function syncPositionSideTone(selectElement) {
 function formatModeLabel(mode) {
   switch (String(mode || "paired_open")) {
     case "paired_close":
-      return "双向平仓";
+      return copyOrDefault("console.mode_labels.paired_close", "双向平仓");
     case "single_open":
-      return "单向开仓";
+      return copyOrDefault("console.mode_labels.single_open", "单向开仓");
     case "single_close":
-      return "单向平仓";
+      return copyOrDefault("console.mode_labels.single_close", "单向平仓");
     default:
-      return "双向开仓";
+      return copyOrDefault("console.mode_labels.paired_open", "双向开仓");
   }
 }
 
@@ -242,11 +663,12 @@ function optionalPositiveValue(value) {
 
 function summarizePrecheckMessage(precheck, fallbackMessage) {
   if (!precheck) return fallbackMessage;
-  const summary = String(precheck.summary || fallbackMessage || "").trim();
+  const summary = String(resolveStructuredMessage(precheck, fallbackMessage || unknownErrorMessage()) || "").trim();
   const checks = Array.isArray(precheck.checks) ? precheck.checks : [];
   const warning = checks.find((item) => String(item.status) === "warn");
-  if (warning && warning.message && warning.message !== summary) {
-    return `${summary} ${warning.message}`;
+  const warningMessage = warning ? resolveStructuredMessage(warning, "") : "";
+  if (warningMessage && warningMessage !== summary) {
+    return `${summary} ${warningMessage}`;
   }
   return summary || fallbackMessage;
 }
@@ -342,22 +764,22 @@ function isTerminalSession(status) {
 function formatAlignmentStatus(status) {
   switch (String(status || "not_needed")) {
     case "carryover_pending":
-      return "待最终对齐";
+      return copyOrDefault("console.alignment.carryover_pending", "待最终对齐");
     case "market_aligned":
-      return "市价对齐完成";
+      return copyOrDefault("console.alignment.market_aligned", "市价对齐完成");
     case "flattened_both_sides":
-      return "双边清仓对齐";
+      return copyOrDefault("console.alignment.flattened_both_sides", "双边清仓对齐");
     case "failed":
-      return "最终对齐失败";
+      return copyOrDefault("console.alignment.failed", "最终对齐失败");
     default:
-      return "未触发";
+      return copyOrDefault("console.alignment.not_needed", "未触发");
   }
 }
 
 function setCurrentAccount(accountId, accountName, syncSelect = true) {
   currentAccount = {
     id: String(accountId || currentAccount.id || "default").trim().toLowerCase(),
-    name: String(accountName || currentAccount.name || "默认账户").trim() || "默认账户",
+    name: String(accountName || currentAccount.name || DEFAULT_ACCOUNT_NAME).trim() || DEFAULT_ACCOUNT_NAME,
   };
   accountBadge.textContent = currentAccount.name;
   if (syncSelect && availableAccounts.length > 0) {
@@ -404,7 +826,7 @@ function rebuildSymbolOptions(selectedSymbol = activeSymbol) {
     const option = document.createElement("option");
     option.value = symbol;
     option.textContent = symbol === temporaryCustomSymbol && !whitelistSymbols.includes(symbol)
-      ? `${symbol} (自定义)` : symbol;
+      ? `${symbol} ${copyOrDefault("console.symbol_custom_suffix", "(自定义)")}` : symbol;
     orderBookInput.appendChild(option);
   });
   if (options.includes(normalizedSelected)) {
@@ -431,7 +853,9 @@ function renderLevels(container, levels, side) {
     if (!emptyState) {
       const placeholder = document.createElement("div");
       placeholder.className = "empty-state orderbook-empty";
-      placeholder.textContent = side === "sell" ? "开启连接后加载卖盘" : "开启连接后加载买盘";
+      placeholder.textContent = side === "sell"
+        ? copyOrDefault("console.orderbook.load_asks", "开启连接后加载卖盘")
+        : copyOrDefault("console.orderbook.load_bids", "开启连接后加载买盘");
       container.appendChild(placeholder);
     }
     cache.forEach((row) => {
@@ -464,7 +888,10 @@ function renderLevels(container, levels, side) {
     }
     row.style.display = "";
     const depthRatio = Math.max(0, Math.min(1, Number(level.depth_ratio || 0)));
-    const priceText = `${side === "sell" ? "卖" : "买"}${index + 1} ${formatNumber(level.price, 2)}`;
+    const sideLabel = side === "sell"
+      ? copyOrDefault("console.orderbook.side_sell", "卖")
+      : copyOrDefault("console.orderbook.side_buy", "买");
+    const priceText = `${sideLabel}${index + 1} ${formatNumber(level.price, 2)}`;
     const qtyText = formatNumber(level.qty, 6);
     const ratioText = `${Math.round(depthRatio * 100)}%`;
     row.style.setProperty("--depth", depthRatio);
@@ -477,18 +904,53 @@ function renderLevels(container, levels, side) {
   }
 }
 
-function appendLog(level, message, createdAt) {
+function setEmptyState(container, className, text) {
+  const empty = document.createElement("div");
+  empty.className = className;
+  empty.textContent = text;
+  container.replaceChildren(empty);
+}
+
+function appendLog(level, message, createdAt, options = {}) {
   const line = document.createElement("div");
   line.className = "log-line";
-  const time = createdAt ? new Date(createdAt).toLocaleTimeString("zh-CN", { hour12: false }) : nowTime();
-  line.innerHTML = `
-    <div class="log-time mono">${time}</div>
-    <div class="log-badge ${level}">${level}</div>
-    <div class="log-message">${message}</div>
-  `;
+  const time = createdAt ? new Date(createdAt).toLocaleTimeString(APP_LOCALE, { hour12: false, timeZone: APP_TIMEZONE }) : nowTime();
+  const renderedMessage = resolveLogMessage({
+    message,
+    messageCode: options.messageCode,
+    messageParams: options.messageParams,
+    trustedMessage: options.trustedMessage === true,
+  });
+  const timeNode = document.createElement("div");
+  timeNode.className = "log-time mono";
+  timeNode.textContent = time;
+  const badgeNode = document.createElement("div");
+  badgeNode.className = `log-badge ${level}`;
+  badgeNode.textContent = LOG_LEVEL_LABELS[level] || level;
+  const messageNode = document.createElement("div");
+  messageNode.className = "log-message";
+  messageNode.textContent = renderedMessage;
+  line.appendChild(timeNode);
+  line.appendChild(badgeNode);
+  line.appendChild(messageNode);
   logsBody.prepend(line);
   while (logsBody.children.length > MAX_LOG_LINES) {
     logsBody.removeChild(logsBody.lastElementChild);
+  }
+  if (options?.messageParams?.residual_side) {
+    latestResidualSideLabel = String(options.messageParams.residual_side);
+    if (activeExecutionSummary) {
+      activeExecutionSummary = { ...activeExecutionSummary, residualSide: latestResidualSideLabel };
+      renderExecutionSummaryBanner();
+    }
+    const statResidualSide = document.getElementById("statResidualSide");
+    if (statResidualSide) {
+      statResidualSide.textContent = latestResidualSideLabel;
+    }
+  }
+  if (level === "warn" || level === "error") {
+    updateTopRiskBanner(level, renderedMessage);
+    renderRiskBanner();
   }
 }
 
@@ -505,29 +967,29 @@ function setConnectionState(state) {
   if (connected) {
     badge.className = "badge success";
     switchLabel.className = "badge success";
-    badge.textContent = "已连接";
-    switchLabel.textContent = "已开启";
+    badge.textContent = statusLabel("connected");
+    switchLabel.textContent = copyOrDefault("console.switch.on", "已开启");
     footerDot.classList.add("live");
   } else if (status === "connecting") {
     badge.className = "badge warn";
     switchLabel.className = "badge warn";
-    badge.textContent = "连接中";
-    switchLabel.textContent = "连接中";
+    badge.textContent = statusLabel("connecting");
+    switchLabel.textContent = statusLabel("connecting");
     footerDot.classList.remove("live");
   } else if (status === "error") {
     badge.className = "badge error";
     switchLabel.className = "badge error";
-    badge.textContent = "异常";
-    switchLabel.textContent = "异常";
+    badge.textContent = statusLabel("error");
+    switchLabel.textContent = statusLabel("error");
     footerDot.classList.remove("live");
   } else {
     badge.className = "badge warn";
     switchLabel.className = "badge warn";
-    badge.textContent = "未连接";
-    switchLabel.textContent = "已断开";
+    badge.textContent = copyOrDefault("console.connection.not_connected", "未连接");
+    switchLabel.textContent = statusLabel("disconnected");
     footerDot.classList.remove("live");
   }
-  footerStatus.textContent = `${connected ? "已连接" : status === "connecting" ? "连接中" : status === "error" ? "异常" : "已断开"} ${state.symbol || activeSymbol}`;
+  footerStatus.textContent = `${connected ? statusLabel("connected") : statusLabel(status)} ${state.symbol || activeSymbol}`;
   statConnection.textContent = CONNECTION_STATUS_LABELS[status] || status;
   connectionToggle.checked = connected;
 }
@@ -577,6 +1039,11 @@ function syncSingleOpenDerivedPanel(derived = {}) {
 }
 
 function updateExecutionStats(stats) {
+  latestExecutionStatsState = stats;
+  if (isTerminalSimulationStatus(stats.status)) {
+    simulationRunInFlight = false;
+    simulationAbortInFlight = false;
+  }
   document.getElementById("statSimStatus").textContent = stats.status || "idle";
   document.getElementById("statRounds").textContent = `${stats.rounds_completed || 0} / ${stats.rounds_total || 0}`;
   document.getElementById("statTotalNotional").textContent = formatNumber(stats.total_notional || 0, 4);
@@ -596,6 +1063,13 @@ function updateExecutionStats(stats) {
   if (stats.final_alignment_status !== undefined) {
     document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(stats.final_alignment_status);
   }
+  updateAbortStateLabel(stats.status, simulationAbortInFlight);
+  if (stats.status === "running" || stats.status === "aborting" || !isTerminalSimulationStatus(stats.status)) {
+    updateExecutionSummary(buildExecutionSummary(stats, { abortRequested: simulationAbortInFlight || stats.status === "aborting" }));
+  } else if (!hasActiveExecutionSession()) {
+    updateExecutionSummary(buildExecutionSummary(stats, { abortRequested: false }));
+  }
+  refreshExecutionActionButtons();
 }
 
 function positionQty(symbol, positionSide) {
@@ -654,13 +1128,29 @@ function renderAccountOverview(payload) {
   if (!currentPositions.length) {
     positionRowCache.forEach((row) => row.remove());
     positionRowCache.clear();
-    const message = payload.status === "loading" ? "\u6b63\u5728\u52a0\u8f7d\u6301\u4ed3" : "\u6682\u65e0\u6301\u4ed3";
-    const detail = payload.message || "\u8fde\u63a5\u884c\u60c5\u6d41\u540e\u4f1a\u5728\u8fd9\u91cc\u663e\u793a\u6301\u4ed3\u3002";
+    const message = payload.status === "loading"
+      ? (I18N_MESSAGES["runtime.positions_loading"] || "正在加载持仓")
+      : (I18N_MESSAGES["runtime.positions_empty"] || "暂无持仓");
+    const detail = resolveStructuredMessage(payload, I18N_MESSAGES["runtime.positions_empty_detail"] || "连接行情流后会在这里显示持仓。");
     const placeholder = document.createElement("div");
     placeholder.className = "empty-state";
     placeholder.style.minHeight = "220px";
     placeholder.style.marginTop = "0";
-    placeholder.innerHTML = `<div><div style="font-size: 36px; margin-bottom: 10px;">\u6301\u4ed3</div><div>${message}</div><div style="margin-top: 6px; font-size: 13px;">${detail}</div></div>`;
+    const wrapper = document.createElement("div");
+    const title = document.createElement("div");
+    title.style.fontSize = "36px";
+    title.style.marginBottom = "10px";
+    title.textContent = copyOrDefault("console.positions_title", "持仓");
+    const body = document.createElement("div");
+    body.textContent = message;
+    const detailNode = document.createElement("div");
+    detailNode.style.marginTop = "6px";
+    detailNode.style.fontSize = "13px";
+    detailNode.textContent = detail;
+    wrapper.appendChild(title);
+    wrapper.appendChild(body);
+    wrapper.appendChild(detailNode);
+    placeholder.replaceChildren(wrapper);
     positionsList.replaceChildren(placeholder);
     refreshSingleOpenOrderOptions();
     refreshSingleClosePositionOptions();
@@ -709,15 +1199,15 @@ function renderAccountOverview(payload) {
       row.innerHTML = `
         <div class="position-row-head">
           <div class="position-symbol">${position.symbol}<span class="position-leverage-inline">${leverageText}</span></div>
-          <span class="position-side ${sideClass}">${position.position_side === "SHORT" ? "空" : "多"}</span>
+          <span class="position-side ${sideClass}">${position.position_side === "SHORT" ? copyOrDefault("console.position_side.short", "空") : copyOrDefault("console.position_side.long", "多")}</span>
         </div>
         <div class="position-meta">
-          <div>数量<strong class="mono">${formatNumber(position.qty || 0, 6)}</strong></div>
-          <div>名义价值<strong class="mono">${formatNumber(notional, 2)}</strong></div>
-          <div>开仓均价<strong class="mono">${formatNumber(position.entry_price || 0, 2)}</strong></div>
-          <div>标记价格<strong class="mono">${markPriceText}</strong></div>
-          <div>未实现盈亏<strong class="mono ${pnlClass}">${formatNumber(position.unrealized_pnl || 0, 4)}</strong></div>
-          <div>爆仓价格<strong class="mono">${liquidationPriceText}</strong></div>
+          <div>${copyOrDefault("console.position_fields.qty", "数量")}<strong class="mono">${formatNumber(position.qty || 0, 6)}</strong></div>
+          <div>${copyOrDefault("console.position_fields.notional", "名义价值")}<strong class="mono">${formatNumber(notional, 2)}</strong></div>
+          <div>${copyOrDefault("console.position_fields.entry_price", "开仓均价")}<strong class="mono">${formatNumber(position.entry_price || 0, 2)}</strong></div>
+          <div>${copyOrDefault("console.position_fields.mark_price", "标记价格")}<strong class="mono">${markPriceText}</strong></div>
+          <div>${copyOrDefault("console.position_fields.unrealized_pnl", "未实现盈亏")}<strong class="mono ${pnlClass}">${formatNumber(position.unrealized_pnl || 0, 4)}</strong></div>
+          <div>${copyOrDefault("console.position_fields.liquidation_price", "爆仓价格")}<strong class="mono">${liquidationPriceText}</strong></div>
         </div>
       `;
     }
@@ -738,26 +1228,105 @@ function renderAccountOverview(payload) {
 function updateOpenValidationHint({ canCreate, canSimulate = true, message, tone }) {
   minNotionalHint.className = `validation-hint ${tone || ""}`;
   minNotionalHint.textContent = message;
-  createBtn.disabled = !canCreate;
-  simulateBtn.disabled = !canSimulate;
+  modeHintStateByMode.set("paired_open", { canCreate, canSimulate });
+  refreshExecutionActionButtons();
 }
 
 function updateCloseValidationHint({ canCreate, message, tone }) {
   closeValidationHint.className = `validation-hint ${tone || ""}`;
   closeValidationHint.textContent = message;
-  createCloseBtn.disabled = !canCreate;
+  modeHintStateByMode.set("paired_close", { canCreate, canSimulate: false });
+  refreshExecutionActionButtons();
 }
 
 function updateSingleOpenValidationHint({ canCreate, message, tone }) {
   singleOpenValidationHint.className = `validation-hint ${tone || ""}`;
   singleOpenValidationHint.textContent = message;
-  createSingleOpenBtn.disabled = !canCreate;
+  modeHintStateByMode.set("single_open", { canCreate, canSimulate: false });
+  refreshExecutionActionButtons();
 }
 
 function updateSingleCloseValidationHint({ canCreate, message, tone }) {
   singleCloseValidationHint.className = `validation-hint ${tone || ""}`;
   singleCloseValidationHint.textContent = message;
-  createSingleCloseBtn.disabled = !canCreate;
+  modeHintStateByMode.set("single_close", { canCreate, canSimulate: false });
+  refreshExecutionActionButtons();
+}
+
+function hasActiveExecutionSession() {
+  if (activeSessionId) return true;
+  if (activeSessionState && !isTerminalSession(activeSessionState.status)) return true;
+  return false;
+}
+
+function refreshExecutionActionButtons() {
+  const runtimeState = currentExecutionLockState();
+  const activeSessionOwner = activeSessionKind();
+  const locked = runtimeState.requestInFlight || runtimeState.hasActiveSession || runtimeState.hasActiveSimulation;
+  setExecutionInputLock(locked);
+  syncPrecheckFreshnessState("paired_open");
+  syncPrecheckFreshnessState("paired_close");
+  syncPrecheckFreshnessState("single_open");
+  syncPrecheckFreshnessState("single_close");
+
+  createBtn.textContent = DEFAULT_REAL_ACTION_LABELS.paired_open;
+  createCloseBtn.textContent = DEFAULT_REAL_ACTION_LABELS.paired_close;
+  createSingleOpenBtn.textContent = DEFAULT_REAL_ACTION_LABELS.single_open;
+  createSingleCloseBtn.textContent = DEFAULT_REAL_ACTION_LABELS.single_close;
+  simulateBtn.textContent = DEFAULT_SIMULATE_LABEL;
+
+  const assignRealButtonState = (mode) => {
+    const button = executionButtonForMode(mode);
+    const hintState = modeHintStateByMode.get(mode) || { canCreate: false, canSimulate: false };
+    const freshness = precheckFreshnessStateByMode.get(mode) || { fresh: false };
+    const baseState = resolveActionAvailability(hintState, { requestInFlight: runtimeState.requestInFlight, hasActiveSession: false });
+    if (runtimeState.hasActiveSession) {
+      const owner = activeSessionOwner === mode;
+      button.textContent = owner ? (sessionAbortInFlight ? EXECUTION_ABORTING_LABEL : EXECUTION_TERMINATE_LABEL) : DEFAULT_REAL_ACTION_LABELS[mode];
+      button.disabled = owner ? sessionAbortInFlight : true;
+      return;
+    }
+    if (runtimeState.hasActiveSimulation) {
+      button.disabled = true;
+      return;
+    }
+    button.disabled = !(baseState.canCreate && freshness.fresh);
+  };
+
+  assignRealButtonState("paired_open");
+  assignRealButtonState("paired_close");
+  assignRealButtonState("single_open");
+  assignRealButtonState("single_close");
+
+  const pairedOpenHint = modeHintStateByMode.get("paired_open") || { canCreate: false, canSimulate: false };
+  const pairedOpenFreshness = precheckFreshnessStateByMode.get("paired_open") || { fresh: false };
+  const pairedOpenAvailability = resolveActionAvailability(pairedOpenHint, {
+    requestInFlight: runtimeState.requestInFlight && !runtimeState.hasActiveSimulation,
+    hasActiveSession: false,
+  });
+  if (runtimeState.hasActiveSimulation) {
+    simulateBtn.textContent = simulationAbortInFlight ? EXECUTION_ABORTING_LABEL : SIMULATION_TERMINATE_LABEL;
+    simulateBtn.disabled = simulationAbortInFlight;
+  } else if (runtimeState.hasActiveSession) {
+    simulateBtn.disabled = true;
+  } else {
+    simulateBtn.disabled = !(pairedOpenAvailability.canSimulate && pairedOpenFreshness.fresh);
+  }
+
+  renderExecutionSummaryBanner();
+  renderRiskBanner();
+  renderRecoverableSessionBanner();
+}
+
+async function withExecutionActionLock(action) {
+  executionActionInFlightCount += 1;
+  refreshExecutionActionButtons();
+  try {
+    return await action();
+  } finally {
+    executionActionInFlightCount = Math.max(0, executionActionInFlightCount - 1);
+    refreshExecutionActionButtons();
+  }
 }
 
 function setHintStateForMode(mode, { canCreate = false, canSimulate = false, message = "", tone = "" } = {}) {
@@ -788,7 +1357,11 @@ function clearHintStateForMode(mode) {
 
 function firstFailingPrecheckItem(precheck) {
   const checks = Array.isArray(precheck?.checks) ? precheck.checks : [];
-  return checks.find((item) => String(item.status) === "fail") || null;
+  const failure = checks.find((item) => String(item.status) === "fail") || null;
+  if (failure) {
+    failure.message = resolveStructuredMessage(failure, unknownErrorMessage());
+  }
+  return failure;
 }
 
 function buildModeSuccessHint(mode, precheck) {
@@ -1133,6 +1706,17 @@ function recalculateCloseAmount() {
 }
 function summarizeSessionEvent(event) {
   const payload = event.payload || {};
+  const registryEntry = I18N_REGISTRIES.events?.[event.event_type];
+  if (registryEntry?.key) {
+    const params = {
+      ...payload,
+      final_alignment_status: payload.final_alignment_status ? formatAlignmentStatus(payload.final_alignment_status) : payload.final_alignment_status,
+    };
+    return {
+      level: registryEntry.level || "info",
+      message: formatCopy(registryEntry.key, params),
+    };
+  }
   switch (event.event_type) {
     case "session_created":
       return { level: "info", message: `\u771f\u5b9e\u5f00\u4ed3\u4f1a\u8bdd\u5df2\u521b\u5efa\uff1a ${payload.symbol} | ${payload.trend_bias} | ${payload.round_count} 轮` };
@@ -1250,11 +1834,15 @@ function renderSessionEvents(events) {
     seenSessionEventIds.add(event.event_id);
     const summary = summarizeSessionEvent(event);
     if (!summary) return;
-    appendLog(summary.level, summary.message, event.created_at);
+    appendLog(summary.level, summary.message, event.created_at, { trustedMessage: true });
   });
 }
 
 function updateRealSessionStats(session) {
+  activeSessionState = session;
+  if (isTerminalSession(session.status)) {
+    sessionAbortInFlight = false;
+  }
   const terminalRounds = Array.isArray(session.rounds)
     ? session.rounds.filter((round) => ["round_completed", "stage1_skipped"].includes(String(round.status || ""))).length
     : 0;
@@ -1264,7 +1852,14 @@ function updateRealSessionStats(session) {
   document.getElementById("statCarryoverQty").textContent = formatNumber(resolveResidualQty(session), 6);
   document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(session.final_alignment_status);
   document.getElementById("statLastQty").textContent = formatNumber(session.round_qty || 0, 8);
-  accountSelect.disabled = !isTerminalSession(session.status);
+  document.getElementById("statResidualSide").textContent = latestResidualSideLabel || "--";
+  updateAbortStateLabel(session.status, sessionAbortInFlight);
+  updateExecutionSummary(buildExecutionSummary(session, {
+    roundsCompleted: terminalRounds,
+    roundsTotal: session.round_count || 0,
+    abortRequested: sessionAbortInFlight || session.status === "aborting",
+  }));
+  refreshExecutionActionButtons();
 }
 
 function stopSessionPolling(clearSessionId = true) {
@@ -1276,8 +1871,14 @@ function stopSessionPolling(clearSessionId = true) {
     activeSessionId = null;
     activeSessionState = null;
     latestSessionEventId = 0;
-    accountSelect.disabled = availableAccounts.length <= 1;
+    sessionAbortInFlight = false;
+    if (!hasActiveSimulationRun()) {
+      updateExecutionSummary(latestExecutionStatsState && !isTerminalSimulationStatus(latestExecutionStatsState.status)
+        ? buildExecutionSummary(latestExecutionStatsState, { abortRequested: simulationAbortInFlight || latestExecutionStatsState.status === "aborting" })
+        : null);
+    }
   }
+  refreshExecutionActionButtons();
 }
 
 function mergeChangedRounds(existingRounds, changedRounds) {
@@ -1328,7 +1929,10 @@ async function pollActiveSession() {
     try {
       await loadActiveSessionSnapshot();
     } catch (fallbackError) {
-      appendLog("error", `Session refresh 失败： ${String(fallbackError || error)}`);
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.session_refresh_failed",
+        messageParams: { error: userVisibleErrorMessage(fallbackError || error) },
+      });
       stopSessionPolling();
     }
   }
@@ -1340,12 +1944,164 @@ function startSessionPolling(sessionId) {
   activeSessionState = null;
   latestSessionEventId = 0;
   seenSessionEventIds.clear();
-  accountSelect.disabled = true;
+  recoverableSessionState = null;
+  renderRecoverableSessionBanner();
+  refreshExecutionActionButtons();
   loadActiveSessionSnapshot().catch((error) => {
-    appendLog("error", `Session refresh 失败： ${String(error)}`);
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.session_refresh_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
     stopSessionPolling();
   });
   activeSessionPoller = setInterval(pollActiveSession, 2000);
+}
+
+function buildRealExecutionConfirmation(mode) {
+  const normalizedMode = normalizeSessionKind(mode);
+  switch (normalizedMode) {
+    case "paired_close":
+      return [
+        copyOrDefault("runtime.real_execution_confirm_title", "确认发起实盘执行？"),
+        `${copyOrDefault("runtime.confirm_symbol", "交易对")}：${closeExecutionSymbol.value}`,
+        `${copyOrDefault("runtime.confirm_mode", "模式")}：${formatModeLabel(normalizedMode)}`,
+        `${copyOrDefault("runtime.confirm_direction", "方向")}：${document.getElementById("closeTrend").value}`,
+        `${copyOrDefault("runtime.confirm_total_qty", "预计总数量")}：${document.getElementById("closeQty").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_rounds", "轮数")}：${document.getElementById("closeRounds").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_profile", "执行策略")}：${copyOrDefault("console.execution_profile.default", "默认")}`,
+      ].join("\n");
+    case "single_open":
+      return [
+        copyOrDefault("runtime.real_execution_confirm_title", "确认发起实盘执行？"),
+        `${copyOrDefault("runtime.confirm_symbol", "交易对")}：${document.getElementById("singleOpenExecutionSymbol").value}`,
+        `${copyOrDefault("runtime.confirm_mode", "模式")}：${formatModeLabel(normalizedMode)}`,
+        `${copyOrDefault("runtime.confirm_direction", "方向")}：${document.getElementById("singleOpenOrder").value || "--"}`,
+        `${copyOrDefault("runtime.confirm_total_qty", "预计总数量")}：${document.getElementById("singleOpenQty").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_rounds", "轮数")}：${document.getElementById("singleOpenRounds").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_leverage", "杠杆")}：${document.getElementById("singleOpenLeverage").value || "1"}x`,
+        `${copyOrDefault("runtime.confirm_profile", "执行策略")}：${copyOrDefault("console.execution_profile.default", "默认")}`,
+      ].join("\n");
+    case "single_close":
+      return [
+        copyOrDefault("runtime.real_execution_confirm_title", "确认发起实盘执行？"),
+        `${copyOrDefault("runtime.confirm_symbol", "交易对")}：${document.getElementById("singleCloseExecutionSymbol").value}`,
+        `${copyOrDefault("runtime.confirm_mode", "模式")}：${formatModeLabel(normalizedMode)}`,
+        `${copyOrDefault("runtime.confirm_direction", "方向")}：${document.getElementById("singleCloseOrder").value || "--"}`,
+        `${copyOrDefault("runtime.confirm_total_qty", "预计总数量")}：${document.getElementById("singleCloseQty").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_rounds", "轮数")}：${document.getElementById("singleCloseRounds").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_profile", "执行策略")}：${copyOrDefault("console.execution_profile.default", "默认")}`,
+      ].join("\n");
+    default:
+      return [
+        copyOrDefault("runtime.real_execution_confirm_title", "确认发起实盘执行？"),
+        `${copyOrDefault("runtime.confirm_symbol", "交易对")}：${executionSymbol.value}`,
+        `${copyOrDefault("runtime.confirm_mode", "模式")}：${formatModeLabel(normalizedMode)}`,
+        `${copyOrDefault("runtime.confirm_direction", "方向")}：${document.getElementById("trend").value}`,
+        `${copyOrDefault("runtime.confirm_total_qty", "预计总数量")}：${document.getElementById("roundQty").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_rounds", "轮数")}：${document.getElementById("calcRounds").value || "0"}`,
+        `${copyOrDefault("runtime.confirm_leverage", "杠杆")}：${document.getElementById("leverage").value || "1"}x`,
+        `${copyOrDefault("runtime.confirm_profile", "执行策略")}：${copyOrDefault("console.execution_profile.default", "默认")}`,
+      ].join("\n");
+  }
+}
+
+function confirmSimulationAbort() {
+  return window.confirm(copyOrDefault("runtime.simulation_abort_confirm", "确认终止当前模拟吗？"));
+}
+
+function confirmSessionAbort() {
+  return window.confirm(
+    copyOrDefault(
+      "runtime.session_abort_confirm",
+      "确认终止当前实盘执行吗？系统只会停止后续轮次，不会回滚已经发出的订单。",
+    ),
+  );
+}
+
+async function requestSimulationAbort() {
+  if (simulationAbortInFlight) return;
+  if (!confirmSimulationAbort()) return;
+  simulationAbortInFlight = true;
+  refreshExecutionActionButtons();
+  try {
+    const payload = await request("/simulation/abort", { method: "POST" });
+    appendLog(payload.requested ? "warn" : "info", "", undefined, {
+      messageCode: payload.message_code,
+      messageParams: payload.message_params,
+    });
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.simulation_run_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
+    simulationAbortInFlight = false;
+  } finally {
+    refreshExecutionActionButtons();
+  }
+}
+
+async function requestSessionAbort() {
+  if (sessionAbortInFlight || !activeSessionId) return;
+  if (!confirmSessionAbort()) return;
+  sessionAbortInFlight = true;
+  refreshExecutionActionButtons();
+  try {
+    const payload = await request(`/sessions/${encodeURIComponent(activeSessionId)}/abort`, { method: "POST" });
+    appendLog("warn", "", undefined, {
+      messageCode: payload.message_code || "runtime.session_abort_requested",
+      messageParams: payload.message_params,
+    });
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.session_create_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
+    sessionAbortInFlight = false;
+  } finally {
+    refreshExecutionActionButtons();
+  }
+}
+
+async function detectRecoverableSession() {
+  try {
+    const sessions = await request("/sessions");
+    recoverableSessionState = selectRecoverableSession(sessions || []);
+    recoverableSessionDismissed = false;
+    renderRecoverableSessionBanner();
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.session_restore_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
+  }
+}
+
+async function restoreRecoverableSession() {
+  if (!recoverableSessionState) return;
+  const session = recoverableSessionState;
+  try {
+    setExecutionMode(normalizeSessionKind(session.session_kind));
+    if (String(session.status) === "exception") {
+      const payload = await request(`/sessions/${encodeURIComponent(session.session_id)}/resume`, { method: "POST" });
+      appendLog("success", "", undefined, {
+        messageCode: payload.message_code || "runtime.session_resume_requested",
+        messageParams: payload.message_params,
+      });
+    } else {
+      appendLog("info", "", undefined, {
+        messageCode: "runtime.session_monitor_restored",
+        messageParams: { session_id: session.session_id },
+      });
+    }
+    startSessionPolling(session.session_id);
+    recoverableSessionState = null;
+    renderRecoverableSessionBanner();
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.session_restore_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
+  }
 }
 
 async function refreshSymbolInfo(symbol, { applyState = true } = {}) {
@@ -1396,7 +2152,7 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
   const targetSymbol = normalizeSymbol(nextSymbol);
   if (!targetSymbol) {
     rebuildSymbolOptions(activeSymbol);
-    appendLog("warn", "请输入有效交易对");
+    appendLog("warn", "", undefined, { messageCode: "runtime.invalid_symbol_input" });
     return false;
   }
   if (targetSymbol === activeSymbol) {
@@ -1418,15 +2174,18 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
         body: JSON.stringify({ symbol: targetSymbol })
       });
     }
-    appendLog("info", `已切换交易对：${targetSymbol}`);
+    appendLog("info", "", undefined, { messageCode: "runtime.symbol_switched", messageParams: { symbol: targetSymbol } });
     if (symbolInfo.allowed === false) {
-      appendLog("warn", `${targetSymbol} 存在于币安 U 本位合约，但不在当前白名单中，真实下单将失败。`);
+      appendLog("warn", "", undefined, { messageCode: "runtime.symbol_not_whitelisted", messageParams: { symbol: targetSymbol } });
     }
     return true;
   } catch (error) {
     temporaryCustomSymbol = previousTemporaryCustomSymbol;
     applySymbolContext(previousSymbol, previousSymbolInfo, { syncInput: true });
-    appendLog("error", `切换交易对 ${targetSymbol} 失败：${String(error)}`);
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.symbol_switch_failed",
+      messageParams: { symbol: targetSymbol, error: userVisibleErrorMessage(error) },
+    });
     return false;
   }
 }
@@ -1451,11 +2210,15 @@ connectionToggle.addEventListener("change", async (event) => {
         symbol,
         account_id: currentAccount.id,
         account_name: currentAccount.name,
-        message: "\u5df2\u65ad\u5f00",
+        message_code: "runtime.connection_disconnected",
+        message: copyOrDefault("runtime.connection_disconnected", "已断开"),
       });
     }
   } catch (error) {
-    appendLog("error", String(error));
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.market_action_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
     event.target.checked = false;
   }
 });
@@ -1492,26 +2255,30 @@ accountSelect.addEventListener("change", async (event) => {
           symbol: activeSymbol,
           account_id: payload.account.id,
           account_name: payload.account.name,
-          message: "\u5df2\u65ad\u5f00",
+          message_code: "runtime.connection_disconnected",
+          message: copyOrDefault("runtime.connection_disconnected", "已断开"),
         });
       }
-      appendLog("success", `已切换账户：${payload.account.name}`);
+      appendLog("success", "", undefined, { messageCode: "runtime.account_switched", messageParams: { account_name: payload.account.name } });
       maybeScheduleCurrentModePrecheck("mode_switch");
     } catch (error) {
       connectionToggle.checked = false;
-      setConnectionState({
-        connected: false,
-        status: "error",
-        symbol: activeSymbol,
-        account_id: payload.account.id,
-        account_name: payload.account.name,
-        message: String(error)
+        setConnectionState({
+          connected: false,
+          status: "error",
+          symbol: activeSymbol,
+          account_id: payload.account.id,
+          account_name: payload.account.name,
+          message: userVisibleErrorMessage(error)
+        });
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.account_switch_partial_failure",
+        messageParams: { account_name: payload.account.name, symbol: activeSymbol, error: userVisibleErrorMessage(error) },
       });
-      appendLog("error", `已切换到账户 ${payload.account.name}，但加载 ${activeSymbol} 失败： ${String(error)}`);
     }
   } catch (error) {
     setCurrentAccount(previousAccount.id, previousAccount.name, true);
-    appendLog("error", `切换账户失败： ${String(error)}`);
+    appendLog("error", "", undefined, { messageCode: "runtime.account_switch_failed", messageParams: { error: userVisibleErrorMessage(error) } });
   }
 });
 
@@ -1530,13 +2297,19 @@ editWhitelistBtn.addEventListener("click", async () => {
     const currentSymbol = normalizeSymbol(executionSymbol.value);
     temporaryCustomSymbol = whitelistSymbols.includes(currentSymbol) ? null : currentSymbol;
     rebuildSymbolOptions(currentSymbol);
-    appendLog("success", `白名单已更新： ${(payload.symbols || []).join(", ")}`);
+    appendLog("success", "", undefined, {
+      messageCode: "runtime.whitelist_updated",
+      messageParams: { symbols: (payload.symbols || []).join(", ") },
+    });
     await refreshSymbolInfo(currentSymbol);
     if (!(payload.symbols || []).includes(currentSymbol)) {
-      appendLog("warn", `${currentSymbol} 已不在白名单中，真实下单将失败。`);
+      appendLog("warn", "", undefined, { messageCode: "runtime.symbol_not_whitelisted", messageParams: { symbol: currentSymbol } });
     }
   } catch (error) {
-    appendLog("error", `更新白名单失败： ${String(error)}`);
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.whitelist_update_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
   }
 });
 
@@ -1554,7 +2327,22 @@ orderBookInput.addEventListener("change", async (event) => {
   await switchSymbol(event.target.value, connectionToggle.checked);
 });
 
+recoverSessionBtn?.addEventListener("click", async () => {
+  await restoreRecoverableSession();
+});
+
+dismissRecoverSessionBtn?.addEventListener("click", () => {
+  recoverableSessionDismissed = true;
+  renderRecoverableSessionBanner();
+});
+
 simulateBtn.addEventListener("click", async () => {
+  if (hasActiveSimulationRun()) {
+    await requestSimulationAbort();
+    return;
+  }
+  simulationRunInFlight = true;
+  refreshExecutionActionButtons();
   try {
     openSse();
     await refreshSymbolInfo(executionSymbol.value);
@@ -1570,108 +2358,174 @@ simulateBtn.addEventListener("click", async () => {
       })
     });
   } catch (error) {
-    appendLog("error", String(error));
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.simulation_run_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
+    simulationRunInFlight = false;
+  } finally {
+    refreshExecutionActionButtons();
   }
 });
 
 createBtn.addEventListener("click", async () => {
-  setPrecheckPaused(true);
-  try {
-    const payload = await request("/sessions/open", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: executionSymbol.value,
-        trend_bias: document.getElementById("trend").value,
-        leverage: Number(document.getElementById("leverage").value),
-        round_count: Number(document.getElementById("calcRounds").value),
-        round_qty: document.getElementById("roundQty").value,
-        round_interval_seconds: Number(document.getElementById("roundIntervalSeconds").value)
-      })
-    });
-    appendLog("success", `已创建双向开仓会话： ${payload.session_id}`);
-    startSessionPolling(payload.session_id);
-  } catch (error) {
-    if (error.precheck) applyPrecheckResult("paired_open", error.precheck);
-    appendLog("error", String(error));
-  } finally {
-    setPrecheckPaused(false);
+  if (activeSessionKind() === "paired_open") {
+    await requestSessionAbort();
+    return;
   }
+  if (!window.confirm(buildRealExecutionConfirmation("paired_open"))) {
+    return;
+  }
+  await withExecutionActionLock(async () => {
+    setPrecheckPaused(true);
+    try {
+      const payload = await request("/sessions/open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: executionSymbol.value,
+          trend_bias: document.getElementById("trend").value,
+          leverage: Number(document.getElementById("leverage").value),
+          round_count: Number(document.getElementById("calcRounds").value),
+          round_qty: document.getElementById("roundQty").value,
+          round_interval_seconds: Number(document.getElementById("roundIntervalSeconds").value)
+        })
+      });
+      appendLog("success", "", undefined, {
+        messageCode: "runtime.session_created",
+        messageParams: { session_id: payload.session_id },
+      });
+      startSessionPolling(payload.session_id);
+    } catch (error) {
+      if (error.precheck) applyPrecheckResult("paired_open", error.precheck);
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.session_create_failed",
+        messageParams: { error: userVisibleErrorMessage(error) },
+      });
+    } finally {
+      setPrecheckPaused(false);
+    }
+  });
 });
 
 createCloseBtn.addEventListener("click", async () => {
-  setPrecheckPaused(true);
-  try {
-    const payload = await request("/sessions/close", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: closeExecutionSymbol.value,
-        trend_bias: document.getElementById("closeTrend").value,
-        close_qty: document.getElementById("closeQty").value,
-        round_count: Number(document.getElementById("closeRounds").value),
-        round_interval_seconds: Number(document.getElementById("closeRoundIntervalSeconds").value)
-      })
-    });
-    appendLog("success", `已创建双向平仓会话： ${payload.session_id}`);
-    startSessionPolling(payload.session_id);
-  } catch (error) {
-    if (error.precheck) applyPrecheckResult("paired_close", error.precheck);
-    appendLog("error", String(error));
-  } finally {
-    setPrecheckPaused(false);
+  if (activeSessionKind() === "paired_close") {
+    await requestSessionAbort();
+    return;
   }
+  if (!window.confirm(buildRealExecutionConfirmation("paired_close"))) {
+    return;
+  }
+  await withExecutionActionLock(async () => {
+    setPrecheckPaused(true);
+    try {
+      const payload = await request("/sessions/close", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: closeExecutionSymbol.value,
+          trend_bias: document.getElementById("closeTrend").value,
+          close_qty: document.getElementById("closeQty").value,
+          round_count: Number(document.getElementById("closeRounds").value),
+          round_interval_seconds: Number(document.getElementById("closeRoundIntervalSeconds").value)
+        })
+      });
+      appendLog("success", "", undefined, {
+        messageCode: "runtime.session_created",
+        messageParams: { session_id: payload.session_id },
+      });
+      startSessionPolling(payload.session_id);
+    } catch (error) {
+      if (error.precheck) applyPrecheckResult("paired_close", error.precheck);
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.session_create_failed",
+        messageParams: { error: userVisibleErrorMessage(error) },
+      });
+    } finally {
+      setPrecheckPaused(false);
+    }
+  });
 });
 
 createSingleOpenBtn.addEventListener("click", async () => {
-  setPrecheckPaused(true);
-  try {
-    const payload = await request("/sessions/single-open", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: document.getElementById("singleOpenExecutionSymbol").value,
-        open_mode: document.getElementById("singleOpenMode").value,
-        selected_position_side: document.getElementById("singleOpenMode").value === "align" ? null : (document.getElementById("singleOpenOrder").value || null),
-        open_qty: document.getElementById("singleOpenQty").value,
-        leverage: Number(document.getElementById("singleOpenLeverage").value),
-        round_count: Number(document.getElementById("singleOpenRounds").value),
-        round_interval_seconds: Number(document.getElementById("singleOpenRoundIntervalSeconds").value)
-      })
-    });
-    appendLog("success", `已创建单向开仓会话： ${payload.session_id}`);
-    startSessionPolling(payload.session_id);
-  } catch (error) {
-    if (error.precheck) applyPrecheckResult("single_open", error.precheck);
-    appendLog("error", String(error));
-  } finally {
-    setPrecheckPaused(false);
+  if (activeSessionKind() === "single_open") {
+    await requestSessionAbort();
+    return;
   }
+  if (!window.confirm(buildRealExecutionConfirmation("single_open"))) {
+    return;
+  }
+  await withExecutionActionLock(async () => {
+    setPrecheckPaused(true);
+    try {
+      const payload = await request("/sessions/single-open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: document.getElementById("singleOpenExecutionSymbol").value,
+          open_mode: document.getElementById("singleOpenMode").value,
+          selected_position_side: document.getElementById("singleOpenMode").value === "align" ? null : (document.getElementById("singleOpenOrder").value || null),
+          open_qty: document.getElementById("singleOpenQty").value,
+          leverage: Number(document.getElementById("singleOpenLeverage").value),
+          round_count: Number(document.getElementById("singleOpenRounds").value),
+          round_interval_seconds: Number(document.getElementById("singleOpenRoundIntervalSeconds").value)
+        })
+      });
+      appendLog("success", "", undefined, {
+        messageCode: "runtime.session_created",
+        messageParams: { session_id: payload.session_id },
+      });
+      startSessionPolling(payload.session_id);
+    } catch (error) {
+      if (error.precheck) applyPrecheckResult("single_open", error.precheck);
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.session_create_failed",
+        messageParams: { error: userVisibleErrorMessage(error) },
+      });
+    } finally {
+      setPrecheckPaused(false);
+    }
+  });
 });
 
 createSingleCloseBtn.addEventListener("click", async () => {
-  setPrecheckPaused(true);
-  try {
-    const payload = await request("/sessions/single-close", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: document.getElementById("singleCloseExecutionSymbol").value,
-        close_mode: document.getElementById("singleCloseMode").value,
-        selected_position_side: document.getElementById("singleCloseMode").value === "align" ? null : (document.getElementById("singleCloseOrder").value || null),
-        close_qty: document.getElementById("singleCloseQty").value,
-        round_count: Number(document.getElementById("singleCloseRounds").value),
-        round_interval_seconds: Number(document.getElementById("singleCloseRoundIntervalSeconds").value)
-      })
-    });
-    appendLog("success", `已创建单向平仓会话： ${payload.session_id}`);
-    startSessionPolling(payload.session_id);
-  } catch (error) {
-    if (error.precheck) applyPrecheckResult("single_close", error.precheck);
-    appendLog("error", String(error));
-  } finally {
-    setPrecheckPaused(false);
+  if (activeSessionKind() === "single_close") {
+    await requestSessionAbort();
+    return;
   }
+  if (!window.confirm(buildRealExecutionConfirmation("single_close"))) {
+    return;
+  }
+  await withExecutionActionLock(async () => {
+    setPrecheckPaused(true);
+    try {
+      const payload = await request("/sessions/single-close", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: document.getElementById("singleCloseExecutionSymbol").value,
+          close_mode: document.getElementById("singleCloseMode").value,
+          selected_position_side: document.getElementById("singleCloseMode").value === "align" ? null : (document.getElementById("singleCloseOrder").value || null),
+          close_qty: document.getElementById("singleCloseQty").value,
+          round_count: Number(document.getElementById("singleCloseRounds").value),
+          round_interval_seconds: Number(document.getElementById("singleCloseRoundIntervalSeconds").value)
+        })
+      });
+      appendLog("success", "", undefined, {
+        messageCode: "runtime.session_created",
+        messageParams: { session_id: payload.session_id },
+      });
+      startSessionPolling(payload.session_id);
+    } catch (error) {
+      if (error.precheck) applyPrecheckResult("single_close", error.precheck);
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.session_create_failed",
+        messageParams: { error: userVisibleErrorMessage(error) },
+      });
+    } finally {
+      setPrecheckPaused(false);
+    }
+  });
 });
 
 const modeValidationSnapshots = new Map();
@@ -1997,7 +2851,10 @@ function queueUiRender() {
     if (pendingLogEntries.length) {
       const entries = pendingLogEntries.splice(0, pendingLogEntries.length);
       entries.forEach((entry) => {
-        appendLog(entry.level || "info", entry.message || "", entry.created_at);
+        appendLog(entry.level || "info", entry.message || "", entry.created_at, {
+          messageCode: entry.message_code,
+          messageParams: entry.message_params,
+        });
       });
       document.getElementById("streamClock").textContent = nowTime();
     }
@@ -2092,6 +2949,7 @@ function applyPrecheckResult(mode, precheck) {
     tone: Boolean(precheck.ok) ? "success" : "",
     message: buildModeSuccessHint(mode, precheck),
   });
+  syncPrecheckFreshnessState(mode);
 }
 
 function shouldSilentlyRefreshMode(mode, trigger) {
@@ -2104,6 +2962,7 @@ async function runPrecheck(mode = executionMode, trigger = "user_input") {
   if (precheckPaused || mode !== executionMode) return;
   const payload = buildPrecheckPayload(mode);
   if (!canRunPrecheck(mode, payload)) {
+    syncPrecheckFreshnessState(mode);
     return;
   }
   const requestKey = JSON.stringify({ mode, accountId: currentAccount.id, payload });
@@ -2129,6 +2988,12 @@ async function runPrecheck(mode = executionMode, trigger = "user_input") {
       canSimulate: false,
       tone: "",
       message: mode === "paired_close" || mode === "single_close" ? "正在校验平仓参数..." : "正在校验开仓参数...",
+    });
+    precheckFreshnessStateByMode.set(mode, {
+      fresh: false,
+      reason: "pending",
+      label: copyOrDefault("runtime.precheck_status_pending", "待校验"),
+      message: copyOrDefault("runtime.precheck_status_pending", "待校验"),
     });
   }
   try {
@@ -2158,13 +3023,17 @@ async function runPrecheck(mode = executionMode, trigger = "user_input") {
       storeModeValidationSnapshot(mode, paramsKey, precheck, contextKey, validationPrice);
       return;
     }
-    const message = `预检失败： ${String(error)}`;
+    const message = copyOrDefault("runtime.precheck_request_failed", "预检失败：{error}", {
+      error: userVisibleErrorMessage(error),
+    });
     setHintStateForMode(mode, {
       canCreate: false,
       canSimulate: false,
       tone: "error",
       message,
     });
+    updateTopRiskBanner("error", message);
+    renderRiskBanner();
   } finally {
     if (inFlightPrecheckPayloadByMode.get(mode) === requestKey) {
       inFlightPrecheckPayloadByMode.delete(mode);
@@ -2172,6 +3041,7 @@ async function runPrecheck(mode = executionMode, trigger = "user_input") {
     if (precheckAbortControllersByMode.get(mode) === controller) {
       precheckAbortControllersByMode.delete(mode);
     }
+    syncPrecheckFreshnessState(mode);
   }
 }
 
@@ -2213,7 +3083,7 @@ function applySymbolContext(symbol, info, options = {}) {
   refreshSingleClosePositionOptions();
   recalculateMode(executionMode);
   const footerStatus = document.getElementById("footerStatus");
-  footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
+  footerStatus.textContent = `${statusLabel(connectionToggle.checked ? "connected" : "disconnected")} ${activeSymbol}`;
   maybeScheduleCurrentModePrecheck("mode_switch");
 }
 
@@ -2230,6 +3100,8 @@ function setExecutionMode(mode) {
   if (!restored) {
     recalculateMode(mode);
   }
+  syncPrecheckFreshnessState(mode);
+  refreshExecutionActionButtons();
   maybeScheduleCurrentModePrecheck("mode_switch");
 }
 
@@ -2255,7 +3127,7 @@ function setActiveSymbol(symbol, syncInput = true, options = {}) {
     recalculateMode(executionMode);
   }
   const footerStatus = document.getElementById("footerStatus");
-  footerStatus.textContent = `${connectionToggle.checked ? "已连接" : "已断开"} ${activeSymbol}`;
+  footerStatus.textContent = `${statusLabel(connectionToggle.checked ? "connected" : "disconnected")} ${activeSymbol}`;
   if (!suppressPrecheck) {
     maybeScheduleCurrentModePrecheck("mode_switch");
   }
@@ -2329,10 +3201,18 @@ document.getElementById("closeTrend")?.addEventListener("change", (event) => {
   schedulePrecheck("paired_close", 400, "user_input");
 });
 
-asksContainer.innerHTML = '<div class="empty-state orderbook-empty">开启连接后加载卖盘</div>';
-bidsContainer.innerHTML = '<div class="empty-state orderbook-empty">开启连接后加载买盘</div>';
+setEmptyState(asksContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_asks"] || "开启连接后加载卖盘");
+setEmptyState(bidsContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_bids"] || "开启连接后加载买盘");
 setActiveSymbol(activeSymbol, false);
-renderAccountOverview({ status: "idle", message: "已断开", totals: {}, positions: [], account_id: currentAccount.id, account_name: currentAccount.name });
+renderAccountOverview({
+  status: "idle",
+  message_code: "runtime.connection_disconnected",
+  message: copyOrDefault("runtime.connection_disconnected", "已断开"),
+  totals: {},
+  positions: [],
+  account_id: currentAccount.id,
+  account_name: currentAccount.name,
+});
 updateExecutionStats({
   mode: "paired_open",
   status: "idle",
@@ -2349,8 +3229,12 @@ syncTrendSelectTone(document.getElementById("trend"));
 syncTrendSelectTone(document.getElementById("closeTrend"));
 syncPositionSideTone(document.getElementById("singleOpenOrder"));
 syncPositionSideTone(document.getElementById("singleCloseOrder"));
+renderExecutionSummaryBanner();
+renderRiskBanner();
+renderRecoverableSessionBanner();
+refreshExecutionActionButtons();
 setExecutionMode("paired_open");
-appendLog("info", "控制台已就绪，请从白名单选择交易对或切换到自定义交易对。");
+appendLog("info", "", undefined, { messageCode: "runtime.console_ready" });
 Promise.allSettled([
   loadAccounts(),
   loadWhitelist(),
@@ -2358,16 +3242,26 @@ Promise.allSettled([
 ]).then((results) => {
   const [accountsResult, whitelistResult, symbolInfoResult] = results;
   if (accountsResult.status === "rejected") {
-    appendLog("error", `加载账户列表失败： ${String(accountsResult.reason)}`);
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.accounts_load_failed",
+      messageParams: { error: userVisibleErrorMessage(accountsResult.reason) },
+    });
   }
   if (whitelistResult.status === "rejected") {
     temporaryCustomSymbol = activeSymbol;
     rebuildSymbolOptions(activeSymbol);
-    appendLog("error", `加载白名单失败： ${String(whitelistResult.reason)}`);
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.whitelist_load_failed",
+      messageParams: { error: userVisibleErrorMessage(whitelistResult.reason) },
+    });
   }
   if (symbolInfoResult.status === "rejected") {
-    appendLog("error", `加载交易对规则失败： ${String(symbolInfoResult.reason)}`);
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.symbol_info_load_failed",
+      messageParams: { error: userVisibleErrorMessage(symbolInfoResult.reason) },
+    });
   }
+  detectRecoverableSession().catch(() => {});
 });
 setInterval(() => {
   maybeScheduleCurrentModePrecheck("interval");

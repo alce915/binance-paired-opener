@@ -16,4 +16,4 @@ if "%EXIT_CODE%"=="0" (
     echo %~dp0api.runtime.log
 )
 echo.
-pause
+if not "%EXIT_CODE%"=="0" pause

@@ -1,0 +1,10 @@
+{
+  "log.simulation.blocked_min_notional": {
+    "key": "log.simulation.blocked_min_notional",
+    "params": ["per_round_notional", "min_notional", "symbol"]
+  },
+  "log.simulation.blocked_min_notional_close": {
+    "key": "log.simulation.blocked_min_notional_close",
+    "params": ["per_round_notional", "min_notional", "symbol"]
+  }
+}

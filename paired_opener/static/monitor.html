@@ -20,9 +20,7 @@
       --shadow: 0 18px 50px rgba(71, 50, 18, 0.12);
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     body {
       margin: 0;
@@ -125,9 +123,7 @@
       backdrop-filter: blur(10px);
     }
 
-    .card {
-      padding: 18px;
-    }
+    .card { padding: 18px; }
 
     .label {
       color: var(--muted);
@@ -146,9 +142,7 @@
       gap: 16px;
     }
 
-    .account {
-      overflow: hidden;
-    }
+    .account { overflow: hidden; }
 
     .account-head {
       display: flex;
@@ -231,13 +225,9 @@
       background: rgba(255, 248, 238, 0.7);
     }
 
-    tr:last-child td {
-      border-bottom: none;
-    }
+    tr:last-child td { border-bottom: none; }
 
-    .mono {
-      font-family: Consolas, "SFMono-Regular", monospace;
-    }
+    .mono { font-family: Consolas, "SFMono-Regular", monospace; }
 
     .empty {
       padding: 20px 16px;
@@ -269,9 +259,9 @@
 <body>
   <main class="shell">
     <section class="hero">
-      <div class="badge" id="connectionBadge">等待连接</div>
-      <h1>Binance 统一账户监控台</h1>
-      <p>这是独立部署的监控控制台，专门通过 SSE 持续接收已配置账户的统一账户快照，不影响现有开单页面和接口。</p>
+      <div class="badge" id="connectionBadge">idle</div>
+      <h1>Binance Account Monitor</h1>
+      <p>独立账户监控页，持续聚合统一账户余额、持仓、收益和利息摘要。</p>
     </section>
 
     <section class="toolbar">
@@ -284,6 +274,12 @@
   </main>
 
   <script>
+    const APP_CONFIG = window.__APP_CONFIG__ || {};
+    const APP_I18N = window.__APP_I18N__ || {};
+    const I18N_MESSAGES = APP_I18N.messages || {};
+    const locale = APP_CONFIG.locale || APP_I18N.default_locale || 'zh-CN';
+    const timezone = APP_CONFIG.timezone || APP_I18N.default_timezone || 'Asia/Shanghai';
+
     const summaryCards = document.getElementById('summaryCards');
     const accountsContainer = document.getElementById('accountsContainer');
     const connectionBadge = document.getElementById('connectionBadge');
@@ -295,16 +291,37 @@
     const streamUrl = accountIds ? `/stream/accounts?account_ids=${encodeURIComponent(accountIds)}` : '/stream/accounts';
     const snapshotUrl = accountIds ? `/api/accounts?account_ids=${encodeURIComponent(accountIds)}` : '/api/accounts';
 
+    function formatCopy(key, params = {}) {
+      const template = I18N_MESSAGES[key];
+      if (typeof template !== 'string') return key;
+      return template.replace(/\{(\w+)\}/g, (_, name) => {
+        const value = params[name];
+        return value === undefined || value === null ? `{${name}}` : String(value);
+      });
+    }
+
+    function resolveStructuredMessage(payload, fallback = '-') {
+      if (payload && typeof payload === 'object') {
+        if (payload.message_code) {
+          const rendered = formatCopy(payload.message_code, payload.message_params || {});
+          if (rendered !== payload.message_code) {
+            return rendered;
+          }
+        }
+      }
+      return fallback;
+    }
+
     function fmt(value) {
       const number = Number(value || 0);
-      return Number.isFinite(number) ? number.toLocaleString('zh-CN', { maximumFractionDigits: 8 }) : String(value ?? '-');
+      return Number.isFinite(number) ? number.toLocaleString(locale, { maximumFractionDigits: 8 }) : String(value ?? '-');
     }
 
     function fmtTime(value) {
       if (!value) return '-';
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString('zh-CN', { hour12: false });
+      return date.toLocaleString(locale, { hour12: false, timeZone: timezone });
     }
 
     function renderSummary(summary = {}) {
@@ -333,12 +350,8 @@
       }
       return `
         <table>
-          <thead>
-            <tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr>
-          </thead>
-          <tbody>
-            ${rows.map((row) => formatter(row)).join('')}
-          </tbody>
+          <thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead>
+          <tbody>${rows.map((row) => formatter(row)).join('')}</tbody>
         </table>
       `;
     }
@@ -414,7 +427,7 @@
               <h3>收益摘要</h3>
               <div class="empty">
                 窗口 ${incomeSummary.window_days || 0} 天，记录 ${incomeSummary.records || 0} 条，收入汇总 ${fmt(incomeSummary.total_income)}。
-                ${Object.keys(sectionErrors).length ? `<br>部分附加数据获取异常：${Object.entries(sectionErrors).map(([k, v]) => `${k}: ${v}`).join(' | ')}` : ''}
+                ${Object.keys(sectionErrors).length ? `<br>部分附加数据获取异常：${Object.entries(sectionErrors).map(([key, value]) => `${key}: ${value}`).join(' | ')}` : ''}
               </div>
             </section>
             <section class="section">
@@ -432,11 +445,13 @@
       const status = payload.status || 'idle';
       connectionBadge.textContent = status;
       connectionBadge.className = `badge ${status === 'ok' ? 'status-ok' : status === 'partial' ? 'status-partial' : status === 'error' ? 'status-error' : ''}`;
-      messageText.textContent = payload.message || '-';
+      messageText.textContent = resolveStructuredMessage(payload, '-');
       updatedAt.textContent = `更新时间 ${fmtTime(payload.updated_at)}`;
       renderSummary(payload.summary || {});
       const accounts = payload.accounts || [];
-      accountsContainer.innerHTML = accounts.length ? accounts.map(renderAccount).join('') : '<article class="account"><div class="empty">暂无账户数据</div></article>';
+      accountsContainer.innerHTML = accounts.length
+        ? accounts.map(renderAccount).join('')
+        : '<article class="account"><div class="empty">暂无账户数据</div></article>';
     }
 
     async function bootstrap() {

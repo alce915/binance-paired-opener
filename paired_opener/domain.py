@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from app_i18n.runtime import DEFAULT_ACCOUNT_NAME
 from paired_opener.errors import ExchangeStateError
 
 
@@ -162,7 +163,7 @@ class OpenSession:
     session_id: str
     spec: SessionSpec
     account_id: str = "default"
-    account_name: str = "默认账户"
+    account_name: str = DEFAULT_ACCOUNT_NAME
     status: SessionStatus = SessionStatus.PENDING
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
@@ -171,6 +172,9 @@ class OpenSession:
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    last_error_params: dict[str, Any] = field(default_factory=dict)
+    last_error_raw_message: str | None = None
+    last_error_contract_version: str | None = None
     recovery_status: RecoveryStatus | None = None
     recovery_summary: str | None = None
     recovery_checked_at: datetime | None = None
@@ -181,7 +185,7 @@ class OpenSession:
     completed_with_final_alignment: bool = False
 
     @staticmethod
-    def create(spec: SessionSpec, *, account_id: str = "default", account_name: str = "默认账户") -> "OpenSession":
+    def create(spec: SessionSpec, *, account_id: str = "default", account_name: str = DEFAULT_ACCOUNT_NAME) -> "OpenSession":
         return OpenSession(session_id=str(uuid4()), spec=spec, account_id=account_id, account_name=account_name)
 
 

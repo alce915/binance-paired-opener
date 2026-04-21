@@ -1,0 +1,8 @@
+{
+  "system_open_orders": {
+    "label_key": "precheck.labels.system_open_orders",
+    "statuses": {
+      "fail_read_error": "precheck.system_open_orders.fail_read_error"
+    }
+  }
+}

@@ -1,11 +1,5 @@
 $ErrorActionPreference = 'Stop'
 
-function Test-IsAdmin {
-    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($current)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
 function Read-EnvConfig {
     param([string]$Path)
 
@@ -29,6 +23,36 @@ function Read-EnvConfig {
     return $config
 }
 
+function Test-PythonCandidate {
+    param(
+        [string]$Command,
+        [string[]]$Arguments = @()
+    )
+
+    if (-not $Command) {
+        return $null
+    }
+
+    if (($Command -like '*\*') -or ($Command -like '*:*')) {
+        if (-not (Test-Path $Command)) {
+            return $null
+        }
+    }
+
+    try {
+        & $Command @Arguments -c "print('codex_python_ok')" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            return @{
+                exe = $Command
+                args = @($Arguments)
+            }
+        }
+    } catch {
+    }
+
+    return $null
+}
+
 function Resolve-ServicePython {
     param(
         [string]$ProjectRoot,
@@ -38,14 +62,15 @@ function Resolve-ServicePython {
     $localPyVenvConfig = Join-Path $ProjectRoot '.venv\pyvenv.cfg'
     $localVenvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
     $parentVenvPython = Join-Path (Split-Path $ProjectRoot -Parent) '.venv\Scripts\python.exe'
-    $pythonExecutable = $null
+    $bundledPython = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+    $candidates = New-Object System.Collections.Generic.List[object]
 
     foreach ($envKey in @('OPENER_PYTHON', 'SERVICE_PYTHON')) {
         if ($EnvConfig.ContainsKey($envKey) -and $EnvConfig[$envKey]) {
-            return @{
+            $candidates.Add([pscustomobject]@{
                 exe = $EnvConfig[$envKey]
                 args = @()
-            }
+            })
         }
     }
 
@@ -56,65 +81,160 @@ function Resolve-ServicePython {
             if ($homePath) {
                 $candidate = Join-Path $homePath 'python.exe'
                 if (Test-Path $candidate) {
-                    $pythonExecutable = $candidate
+                    $candidates.Add([pscustomobject]@{
+                        exe = $candidate
+                        args = @()
+                    })
                 }
             }
         }
     }
 
-    if (-not $pythonExecutable) {
-        if (Test-Path $localVenvPython) {
-            $pythonExecutable = $localVenvPython
-        } elseif (Test-Path $parentVenvPython) {
-            $pythonExecutable = $parentVenvPython
-        }
-    }
-
-    if ($pythonExecutable -and (Test-Path $pythonExecutable)) {
-        return @{
-            exe = $pythonExecutable
+    if (Test-Path $localVenvPython) {
+        $candidates.Add([pscustomobject]@{
+            exe = $localVenvPython
             args = @()
-        }
+        })
     }
 
-    $pyCommand = Get-Command py -ErrorAction SilentlyContinue
-    if ($pyCommand) {
-        return @{
+    if (Test-Path $parentVenvPython) {
+        $candidates.Add([pscustomobject]@{
+            exe = $parentVenvPython
+            args = @()
+        })
+    }
+
+    if (Test-Path $bundledPython) {
+        $candidates.Add([pscustomobject]@{
+            exe = $bundledPython
+            args = @()
+        })
+    }
+
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        $candidates.Add([pscustomobject]@{
+            exe = 'py'
+            args = @('-3.12')
+        })
+        $candidates.Add([pscustomobject]@{
             exe = 'py'
             args = @('-3')
-        }
+        })
     }
 
-    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-    if ($pythonCommand) {
-        return @{
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        $candidates.Add([pscustomobject]@{
             exe = 'python'
             args = @()
+        })
+    }
+
+    foreach ($candidateInfo in $candidates) {
+        $resolved = Test-PythonCandidate -Command $candidateInfo.exe -Arguments $candidateInfo.args
+        if ($resolved) {
+            return $resolved
         }
     }
 
     throw 'No runnable Python launcher was found. Configure OPENER_PYTHON or SERVICE_PYTHON in .env first.'
 }
 
-if (-not (Test-IsAdmin)) {
-    try {
-        $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
-        $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $argsList -Verb RunAs -Wait -PassThru
-        exit $process.ExitCode
-    } catch {
-        throw "Unable to elevate start_service.ps1: $($_.Exception.Message)"
+function Resolve-ServicePythonExecutable {
+    param([hashtable]$PythonInfo)
+
+    $candidateExe = $PythonInfo.exe
+    if (($candidateExe -like '*\*') -or ($candidateExe -like '*:*')) {
+        $pythonDir = Split-Path $candidateExe -Parent
+        $windowedPython = Join-Path $pythonDir 'pythonw.exe'
+        if (Test-Path $windowedPython) {
+            return $windowedPython
+        }
     }
+
+    return $candidateExe
+}
+
+function Get-ListeningConnections {
+    param([int]$Port)
+
+    $connections = @()
+
+    try {
+        $connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
+    } catch {
+        $connections = @()
+    }
+
+    if ($connections.Count -gt 0) {
+        return $connections
+    }
+
+    $netstat = netstat -ano | Select-String -Pattern ":$port\s+\S+\s+LISTENING"
+    foreach ($line in $netstat) {
+        $parts = $line.Line -split '\s+'
+        if ($parts.Length -gt 0) {
+            $owningProcessId = $parts[-1]
+            if ($owningProcessId -match '^\d+$') {
+                $connections += [pscustomobject]@{ OwningProcess = [int]$owningProcessId }
+            }
+        }
+    }
+
+    return $connections
+}
+
+function Test-HealthResponds {
+    param(
+        [string]$HostAddress,
+        [int]$Port
+    )
+
+    try {
+        & curl.exe -fsS --max-time 3 ("http://{0}:{1}/" -f $HostAddress, $Port) 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Write-ServiceProcessMetadata {
+    param(
+        [string]$MetadataPath,
+        [System.Diagnostics.Process]$LauncherProcess,
+        [string]$HostAddress,
+        [int]$Port
+    )
+
+    $stateDir = Split-Path $MetadataPath -Parent
+    if (-not (Test-Path $stateDir)) {
+        New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    }
+
+    $payload = @{
+        launcher_pid = $LauncherProcess.Id
+        launcher_start_time = $LauncherProcess.StartTime.ToUniversalTime().ToString('o')
+        host = $HostAddress
+        port = $Port
+        recorded_at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    $payload | ConvertTo-Json | Set-Content -Path $MetadataPath -Encoding UTF8
 }
 
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $envFile = Join-Path $projectRoot '.env'
 $runtimeLog = Join-Path $projectRoot 'api.runtime.log'
-$consoleScript = Join-Path $PSScriptRoot 'run_service_console.ps1'
+$serviceRunner = Join-Path $PSScriptRoot 'run_service.py'
+$serviceMetadataPath = Join-Path $projectRoot '.codex-runtime\service-process.json'
 $envConfig = Read-EnvConfig -Path $envFile
 $pythonInfo = Resolve-ServicePython -ProjectRoot $projectRoot -EnvConfig $envConfig
+$servicePythonExe = Resolve-ServicePythonExecutable -PythonInfo $pythonInfo
 $hostAddress = if ($envConfig.ContainsKey('API_HOST') -and $envConfig['API_HOST']) { $envConfig['API_HOST'] } else { '127.0.0.1' }
 $port = if ($envConfig.ContainsKey('API_PORT') -and $envConfig['API_PORT']) { [int]$envConfig['API_PORT'] } else { 8000 }
-$visibleConsole = $true
+$visibleConsole = $false
 if ($envConfig.ContainsKey('SERVICE_VISIBLE_CONSOLE') -and $envConfig['SERVICE_VISIBLE_CONSOLE']) {
     $visibleConsole = $envConfig['SERVICE_VISIBLE_CONSOLE'].ToLowerInvariant() -in @('1', 'true', 'yes', 'on')
 }
@@ -127,24 +247,7 @@ $pythonPathValue = "$sitePackages;$projectRoot"
 
 Set-Location $projectRoot
 
-try {
-    $connections = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop
-} catch {
-    $connections = @()
-}
-
-if (-not $connections -or $connections.Count -eq 0) {
-    $netstat = netstat -ano | Select-String -Pattern ":$port\s+\S+\s+LISTENING"
-    foreach ($line in $netstat) {
-        $parts = $line.Line -split '\s+'
-        if ($parts.Length -gt 0) {
-            $pid = $parts[-1]
-            if ($pid -match '^\d+$') {
-                $connections += [pscustomobject]@{ OwningProcess = [int]$pid }
-            }
-        }
-    }
-}
+$connections = Get-ListeningConnections -Port $port
 
 foreach ($connection in $connections) {
     try {
@@ -154,48 +257,64 @@ foreach ($connection in $connections) {
     }
 }
 
+$remainingListeners = Get-ListeningConnections -Port $port
+if ($remainingListeners.Count -gt 0) {
+    throw "Service start failed: port $port is already in use"
+}
+
 $env:PYTHONPATH = $pythonPathValue
 & $pythonInfo.exe @($pythonInfo.args) -m paired_opener.log_retention --file $runtimeLog
 
-$pythonArgsJson = ConvertTo-Json -Compress -InputObject @($pythonInfo.args)
-$startArgs = @(
-    '-NoExit',
-    '-NoProfile',
-    '-ExecutionPolicy', 'Bypass',
-    '-File', $consoleScript,
-    '-ProjectRoot', $projectRoot,
-    '-PythonExe', $pythonInfo.exe,
-    '-PythonArgsJson', $pythonArgsJson,
-    '-HostAddress', $hostAddress,
-    '-Port', "$port",
-    '-PythonPathValue', $pythonPathValue,
-    '-RuntimeLog', $runtimeLog
+if (Test-Path $serviceMetadataPath) {
+    Remove-Item -Path $serviceMetadataPath -Force -ErrorAction SilentlyContinue
+}
+$serviceArgs = @($pythonInfo.args) + @(
+    $serviceRunner,
+    '--project-root', $projectRoot,
+    '--site-packages', $sitePackages,
+    '--runtime-log', $runtimeLog,
+    '--host', $hostAddress,
+    '--port', $port.ToString()
 )
+
 if ($visibleConsole) {
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $startArgs -WindowStyle Normal | Out-Null
+    $null = Start-Process -FilePath $servicePythonExe -ArgumentList $serviceArgs -WorkingDirectory $projectRoot -WindowStyle Normal -PassThru
 } else {
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $startArgs -WindowStyle Hidden | Out-Null
+    $null = Start-Process -FilePath $servicePythonExe -ArgumentList $serviceArgs -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
 }
 
 $deadline = (Get-Date).AddSeconds(20)
 $started = $false
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
-    try {
-        & curl.exe -fsS --max-time 3 ("http://{0}:{1}/" -f $hostAddress, $port) | Out-Null
+    if (Test-HealthResponds -HostAddress $hostAddress -Port $port) {
         $started = $true
         break
-    } catch {
     }
 }
 
 if (-not $started) {
-    $runtime = if (Test-Path $runtimeLog) { Get-Content $runtimeLog -Raw -ErrorAction SilentlyContinue } else { '' }
+    if (Test-Path $serviceMetadataPath) {
+        Remove-Item -Path $serviceMetadataPath -Force -ErrorAction SilentlyContinue
+    }
+    $failureDetails = @()
+    if (Test-Path $runtimeLog) {
+        $failureDetails += ((Get-Content $runtimeLog -Tail 80 -ErrorAction SilentlyContinue) -join [Environment]::NewLine)
+    }
+    $runtime = ($failureDetails | Where-Object { $_ }) -join [Environment]::NewLine
     if (-not $runtime) {
         $runtime = 'service did not become healthy within timeout'
     }
     throw "Service restart failed: $runtime"
 }
 
-$listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop | Select-Object -First 1
+$listener = Get-ListeningConnections -Port $port | Select-Object -First 1
+if (-not $listener) {
+    throw "Service started but no listening process was detected on port $port"
+}
+try {
+    $serviceProcess = Get-Process -Id $listener.OwningProcess -ErrorAction Stop
+    Write-ServiceProcessMetadata -MetadataPath $serviceMetadataPath -LauncherProcess $serviceProcess -HostAddress $hostAddress -Port $port
+} catch {
+}
 "Service started successfully on http://$hostAddress`:$port/ (PID=$($listener.OwningProcess))"

@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME
 from paired_opener.domain import ExecutionProfile, FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SingleCloseMode, SingleOpenMode, TrendBias
 
 
@@ -115,15 +116,22 @@ class SimulationRunRequest(ExecutionPolicyFields):
 SimulationRequest = SimulationRunRequest
 
 class PrecheckItem(BaseModel):
+    contract_version: str = CONTRACT_VERSION
     code: str
+    label_key: str | None = None
     label: str
     status: str
+    message_key: str | None = None
+    message_params: dict[str, Any] = Field(default_factory=dict)
     message: str
     details: dict[str, Any] | None = None
 
 
 class SessionPrecheckResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
     ok: bool
+    summary_code: str | None = None
+    summary_params: dict[str, Any] = Field(default_factory=dict)
     summary: str
     checks: list[PrecheckItem]
     derived: dict[str, Any] = Field(default_factory=dict)
@@ -133,7 +141,7 @@ class SessionSummary(BaseModel):
     session_id: str
     session_kind: SessionKind = SessionKind.PAIRED_OPEN
     account_id: str = "default"
-    account_name: str = "默认账户"
+    account_name: str = DEFAULT_ACCOUNT_NAME
     symbol: str
     trend_bias: TrendBias
     leverage: int
@@ -158,6 +166,8 @@ class SessionSummary(BaseModel):
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    last_error_params: dict[str, Any] = Field(default_factory=dict)
+    last_error_contract_version: str | None = None
     recovery_status: RecoveryStatus | None = None
     recovery_summary: str | None = None
     recovery_checked_at: datetime | None = None
@@ -170,7 +180,7 @@ class SessionDetail(BaseModel):
     session_id: str
     session_kind: SessionKind = SessionKind.PAIRED_OPEN
     account_id: str = "default"
-    account_name: str = "默认账户"
+    account_name: str = DEFAULT_ACCOUNT_NAME
     symbol: str
     trend_bias: TrendBias
     leverage: int
@@ -200,6 +210,8 @@ class SessionDetail(BaseModel):
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    last_error_params: dict[str, Any] = Field(default_factory=dict)
+    last_error_contract_version: str | None = None
     recovery_status: RecoveryStatus | None = None
     recovery_summary: str | None = None
     recovery_checked_at: datetime | None = None
@@ -219,10 +231,23 @@ class SessionUpdatesResponse(BaseModel):
 
 
 class SessionActionResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
     session_id: str
     status: SessionStatus
     requested: bool = False
     requested_action: str | None = None
+    message_code: str | None = None
+    message_params: dict[str, Any] = Field(default_factory=dict)
+    message: str | None = None
+
+
+class SimulationActionResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    status: str
+    requested: bool = False
+    requested_action: str | None = None
+    message_code: str | None = None
+    message_params: dict[str, Any] = Field(default_factory=dict)
     message: str | None = None
 
 
