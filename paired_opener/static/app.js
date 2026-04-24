@@ -263,6 +263,33 @@ function formatExecutionStatus(status) {
   }
 }
 
+function formatStopReason(reason) {
+  switch (String(reason || "")) {
+    case "filled":
+      return "已完成";
+    case "below_min_notional":
+      return "残量低于最小下单金额";
+    case "insufficient_balance":
+      return "余额不足";
+    case "insufficient_position":
+      return "持仓不足";
+    case "price_guard_blocked":
+      return "价格保护阻断";
+    case "quote_stale":
+      return "行情已过期";
+    case "open_order_conflict_detected":
+      return "检测到挂单冲突";
+    case "target_guard_blocked":
+      return "目标保护阻断";
+    case "max_extension_rounds_reached":
+      return "补充轮已耗尽";
+    case "max_session_duration_reached":
+      return "已超过最长执行时长";
+    default:
+      return "--";
+  }
+}
+
 function summarizeExecutionSummary(summary) {
   if (!summary) return "";
   const segments = [
@@ -273,6 +300,18 @@ function summarizeExecutionSummary(summary) {
     `${copyOrDefault("console.summary.residual_side", "残量归属")}：${summary.residualSide || "--"}`,
     `${copyOrDefault("console.summary.alignment", "最终对齐")}：${formatAlignmentStatus(summary.finalAlignmentStatus)}`,
   ];
+  if (Array.isArray(summary.plannedRoundQtys) && summary.plannedRoundQtys.length) {
+    segments.push(`计划轮量：${summary.plannedRoundQtys.join(" / ")}`);
+  }
+  if (Number(summary.maxExtensionRounds || 0) > 0) {
+    segments.push(`补充轮：${Number(summary.extensionRoundsUsed || 0)} / ${Number(summary.maxExtensionRounds || 0)}`);
+  }
+  if (summary.stopReason) {
+    segments.push(`停止原因：${formatStopReason(summary.stopReason)}`);
+  }
+  if (summary.sessionDeadlineAt) {
+    segments.push(`截止：${new Date(summary.sessionDeadlineAt).toLocaleTimeString(APP_LOCALE, { hour12: false, timeZone: APP_TIMEZONE })}`);
+  }
   if (summary.abortRequested) {
     segments.push(copyOrDefault("console.summary.abort_requested", "已请求终止"));
   }
@@ -310,6 +349,12 @@ function buildExecutionSummary(source = {}, overrides = {}) {
     carryoverQty: Number(overrides.carryoverQty ?? resolveResidualQty(source) ?? 0),
     residualSide: overrides.residualSide || latestResidualSideLabel || "--",
     finalAlignmentStatus: String(overrides.finalAlignmentStatus || source.final_alignment_status || "not_needed"),
+    plannedRoundQtys: overrides.plannedRoundQtys || source.planned_round_qtys || [],
+    extensionRoundsUsed: Number(overrides.extensionRoundsUsed ?? source.extension_rounds_used ?? 0),
+    remainingExtensionRounds: Number(overrides.remainingExtensionRounds ?? source.remaining_extension_rounds ?? 0),
+    maxExtensionRounds: Number(overrides.maxExtensionRounds ?? source.max_extension_rounds ?? 0),
+    sessionDeadlineAt: overrides.sessionDeadlineAt || source.session_deadline_at || null,
+    stopReason: String(overrides.stopReason || source.stop_reason || ""),
     abortRequested: Boolean(overrides.abortRequested),
   };
 }
@@ -836,12 +881,20 @@ function rebuildSymbolOptions(selectedSymbol = activeSymbol) {
   }
 }
 
-async function loadWhitelist() {
+async function loadWhitelist(options = {}) {
+  const { preferWhitelistDefault = false } = options;
   const payload = await request("/config/whitelist");
   whitelistSymbols = (payload.symbols || []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean);
   const currentSymbol = normalizeSymbol(executionSymbol.value || activeSymbol);
-  temporaryCustomSymbol = whitelistSymbols.includes(currentSymbol) ? null : currentSymbol;
-  rebuildSymbolOptions(currentSymbol);
+  const selectedSymbol =
+    preferWhitelistDefault && whitelistSymbols.length && !whitelistSymbols.includes(currentSymbol)
+      ? whitelistSymbols[0]
+      : currentSymbol;
+  temporaryCustomSymbol = whitelistSymbols.includes(selectedSymbol) ? null : selectedSymbol;
+  if (selectedSymbol !== currentSymbol) {
+    setActiveSymbol(selectedSymbol, false, { suppressRecalc: true, suppressPrecheck: true });
+  }
+  rebuildSymbolOptions(selectedSymbol);
   return whitelistSymbols;
 }
 
@@ -1783,14 +1836,14 @@ function summarizeSessionEvent(event) {
     case "single_open_session_preflight_failed":
       return { level: "error", message: `\u771f\u5b9e\u5355\u5411\u5f00\u4ed3\u9884\u68c0\u5931\u8d25\uff1a ${payload.error || "未知错误"}` };
     case "single_open_round_started":
-      return { level: "info", message: `第 ${payload.round_index} 轮开始执行单向开仓` };
+      return { level: "info", message: payload.is_extension_round ? `开始执行第 ${payload.extension_round_index || 1} 个单向开仓补充轮` : `第 ${payload.round_index} 轮开始执行单向开仓` };
     case "single_open_fill":
     case "single_open_late_fill":
       return { level: "success", message: `第 ${payload.round_index} 轮单向开仓成交 ${payload.filled_qty}` };
     case "single_open_zero_fill_retry":
       return { level: "warn", message: `第 ${payload.round_index} 轮单向开仓零成交重试，第 ${payload.retry} 次` };
     case "single_open_round_completed":
-      return { level: "success", message: `第 ${payload.round_index} 轮单向开仓完成` };
+      return { level: "success", message: payload.is_extension_round ? `单向开仓补充轮完成，计划量 ${payload.planned_qty || payload.filled_qty || "0"}` : `第 ${payload.round_index} 轮单向开仓完成` };
     case "single_open_round_skipped":
       return { level: "warn", message: `第 ${payload.round_index} 轮单向开仓已跳过` };
     case "single_open_round_interval_wait":
@@ -1805,14 +1858,14 @@ function summarizeSessionEvent(event) {
     case "single_close_session_preflight_failed":
       return { level: "error", message: `\u771f\u5b9e\u5355\u5411\u5e73\u4ed3\u9884\u68c0\u5931\u8d25\uff1a ${payload.error || "未知错误"}` };
     case "single_close_round_started":
-      return { level: "info", message: `第 ${payload.round_index} 轮开始执行单向平仓` };
+      return { level: "info", message: payload.is_extension_round ? `开始执行第 ${payload.extension_round_index || 1} 个单向平仓补充轮` : `第 ${payload.round_index} 轮开始执行单向平仓` };
     case "single_close_fill":
     case "single_close_late_fill":
       return { level: "success", message: `第 ${payload.round_index} 轮单向平仓成交 ${payload.filled_qty}` };
     case "single_close_zero_fill_retry":
       return { level: "warn", message: `第 ${payload.round_index} 轮单向平仓零成交重试，第 ${payload.retry} 次` };
     case "single_close_round_completed":
-      return { level: "success", message: `第 ${payload.round_index} 轮单向平仓完成` };
+      return { level: "success", message: payload.is_extension_round ? `单向平仓补充轮完成，计划量 ${payload.planned_qty || payload.filled_qty || "0"}` : `第 ${payload.round_index} 轮单向平仓完成` };
     case "single_close_round_skipped":
       return { level: "warn", message: `第 ${payload.round_index} 轮无可平持仓，已跳过` };
     case "single_close_round_interval_wait":
@@ -1823,6 +1876,10 @@ function summarizeSessionEvent(event) {
       return { level: "success", message: "真实单向平仓会话完成" };
     case "single_close_session_failed":
       return { level: "error", message: `\u771f\u5b9e\u5355\u5411\u5e73\u4ed3\u4f1a\u8bdd\u5931\u8d25\uff1a ${payload.error || "未知错误"}` };
+    case "quote_stale":
+      return { level: "warn", message: `第 ${payload.round_index} 轮报价已过期，已停止继续执行` };
+    case "extension_round_conflict_detected":
+      return { level: "warn", message: `补充轮前检测到${payload.order_class === "manual" ? "人工" : "系统"}挂单冲突，已停止继续执行` };
     default:
       return null;
   }
@@ -1843,19 +1900,27 @@ function updateRealSessionStats(session) {
   if (isTerminalSession(session.status)) {
     sessionAbortInFlight = false;
   }
-  const terminalRounds = Array.isArray(session.rounds)
-    ? session.rounds.filter((round) => ["round_completed", "stage1_skipped"].includes(String(round.status || ""))).length
+  const regularTerminalRounds = Array.isArray(session.rounds)
+    ? session.rounds.filter((round) => {
+      const status = String(round.status || "");
+      const isExtensionRound = Boolean(round?.notes?.is_extension_round);
+      return ["round_completed", "stage1_skipped"].includes(status) && !isExtensionRound;
+    }).length
     : 0;
+  const latestRound = Array.isArray(session.rounds) && session.rounds.length
+    ? session.rounds[session.rounds.length - 1]
+    : null;
+  const currentPlannedQty = latestRound?.notes?.current_planned_qty ?? session.round_qty ?? 0;
   document.getElementById("statSessionStatus").textContent = session.status || "idle";
   document.getElementById("statMode").textContent = formatModeLabel(session.session_kind || executionMode);
-  document.getElementById("statRounds").textContent = `${terminalRounds} / ${session.round_count || 0}`;
+  document.getElementById("statRounds").textContent = `${regularTerminalRounds} / ${session.round_count || 0}`;
   document.getElementById("statCarryoverQty").textContent = formatNumber(resolveResidualQty(session), 6);
   document.getElementById("statFinalAlignment").textContent = formatAlignmentStatus(session.final_alignment_status);
-  document.getElementById("statLastQty").textContent = formatNumber(session.round_qty || 0, 8);
+  document.getElementById("statLastQty").textContent = formatNumber(currentPlannedQty || 0, 8);
   document.getElementById("statResidualSide").textContent = latestResidualSideLabel || "--";
   updateAbortStateLabel(session.status, sessionAbortInFlight);
   updateExecutionSummary(buildExecutionSummary(session, {
-    roundsCompleted: terminalRounds,
+    roundsCompleted: regularTerminalRounds,
     roundsTotal: session.round_count || 0,
     abortRequested: sessionAbortInFlight || session.status === "aborting",
   }));
@@ -2808,7 +2873,7 @@ function maybeScheduleCurrentModePrecheck(trigger = "price_tick") {
     decision.reason === "price_drift" ||
     decision.reason === "interval_elapsed" ||
     decision.reason === "context_interval" ||
-    (decision.reason === "context_stale" && trigger === "mode_switch");
+    decision.reason === "context_stale";
   if (shouldRun) {
     const scheduleTrigger =
       decision.reason === "price_drift"
@@ -2816,7 +2881,7 @@ function maybeScheduleCurrentModePrecheck(trigger = "price_tick") {
         : decision.reason === "context_interval"
           ? "account_update"
           : decision.reason === "context_stale"
-            ? "mode_switch"
+            ? trigger
           : decision.reason === "interval_elapsed"
             ? "interval"
             : trigger;
@@ -3005,8 +3070,8 @@ async function runPrecheck(mode = executionMode, trigger = "user_input") {
     });
     if (controller.signal.aborted || token !== (latestPrecheckTokensByMode.get(mode) || 0) || mode !== executionMode) return;
     latestResolvedPrecheckPayloadByMode.set(mode, requestKey);
-    applyPrecheckResult(mode, precheck);
     storeModeValidationSnapshot(mode, paramsKey, precheck, contextKey, validationPrice);
+    applyPrecheckResult(mode, precheck);
   } catch (error) {
     if (controller.signal.aborted || error?.name === "AbortError") {
       return;
@@ -3019,8 +3084,8 @@ async function runPrecheck(mode = executionMode, trigger = "user_input") {
     }
     if (precheck) {
       latestResolvedPrecheckPayloadByMode.set(mode, requestKey);
-      applyPrecheckResult(mode, precheck);
       storeModeValidationSnapshot(mode, paramsKey, precheck, contextKey, validationPrice);
+      applyPrecheckResult(mode, precheck);
       return;
     }
     const message = copyOrDefault("runtime.precheck_request_failed", "预检失败：{error}", {
@@ -3237,10 +3302,9 @@ setExecutionMode("paired_open");
 appendLog("info", "", undefined, { messageCode: "runtime.console_ready" });
 Promise.allSettled([
   loadAccounts(),
-  loadWhitelist(),
-  refreshSymbolInfo(activeSymbol),
+  loadWhitelist({ preferWhitelistDefault: true }),
 ]).then((results) => {
-  const [accountsResult, whitelistResult, symbolInfoResult] = results;
+  const [accountsResult, whitelistResult] = results;
   if (accountsResult.status === "rejected") {
     appendLog("error", "", undefined, {
       messageCode: "runtime.accounts_load_failed",
@@ -3255,12 +3319,14 @@ Promise.allSettled([
       messageParams: { error: userVisibleErrorMessage(whitelistResult.reason) },
     });
   }
-  if (symbolInfoResult.status === "rejected") {
+  return refreshSymbolInfo(activeSymbol);
+}).then(() => {
+  detectRecoverableSession().catch(() => {});
+}).catch((error) => {
     appendLog("error", "", undefined, {
       messageCode: "runtime.symbol_info_load_failed",
-      messageParams: { error: userVisibleErrorMessage(symbolInfoResult.reason) },
+      messageParams: { error: userVisibleErrorMessage(error) },
     });
-  }
   detectRecoverableSession().catch(() => {});
 });
 setInterval(() => {

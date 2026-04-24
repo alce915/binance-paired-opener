@@ -198,6 +198,210 @@ this.selectRecoverableSession = selectRecoverableSession;
   return sandbox;
 }
 
+function loadPrecheckSchedulingHelpers(decision) {
+  const sources = {
+    maybeScheduleCurrentModePrecheck: extract(
+      /function maybeScheduleCurrentModePrecheck\(trigger = "price_tick"\) \{[\s\S]*?\n\}/,
+      "maybeScheduleCurrentModePrecheck",
+    ),
+  };
+
+  const scheduled = [];
+  const sandbox = {
+    precheckPaused: false,
+    executionMode: "paired_open",
+    getModeValidationDecision() {
+      return decision;
+    },
+    schedulePrecheck(mode, delay, trigger) {
+      scheduled.push({ mode, delay, trigger });
+    },
+  };
+
+  vm.runInNewContext(
+    `
+${sources.maybeScheduleCurrentModePrecheck}
+this.maybeScheduleCurrentModePrecheck = maybeScheduleCurrentModePrecheck;
+`,
+    sandbox,
+  );
+
+  return {
+    maybeScheduleCurrentModePrecheck: sandbox.maybeScheduleCurrentModePrecheck,
+    scheduled,
+  };
+}
+
+function loadRunPrecheckOrderHelpers() {
+  const sources = {
+    runPrecheck: extract(/async function runPrecheck\(mode = executionMode, trigger = "user_input"\) \{[\s\S]*?\n\}/, "runPrecheck"),
+  };
+
+  const events = [];
+  let snapshotStored = false;
+  const sandbox = {
+    precheckPaused: false,
+    executionMode: "paired_open",
+    currentAccount: { id: "account-1" },
+    inFlightPrecheckPayloadByMode: new Map(),
+    precheckAbortControllersByMode: new Map(),
+    latestPrecheckTokensByMode: new Map(),
+    latestResolvedPrecheckPayloadByMode: new Map(),
+    precheckFreshnessStateByMode: new Map(),
+    buildPrecheckPayload() {
+      return {
+        session_kind: "paired_open",
+        symbol: "BTCUSDT",
+        trend_bias: "long_short",
+        leverage: 50,
+        round_count: 10,
+        round_qty: "0.006",
+      };
+    },
+    canRunPrecheck() {
+      return true;
+    },
+    buildModeParamsKey() {
+      return "params-key";
+    },
+    buildModeContextKey() {
+      return "context-key";
+    },
+    getModeValidationPrice() {
+      return 100;
+    },
+    shouldSilentlyRefreshMode() {
+      return false;
+    },
+    setHintStateForMode(_mode, state) {
+      events.push({ name: "setHint", state });
+    },
+    copyOrDefault(_key, fallback) {
+      return fallback;
+    },
+    async request() {
+      return {
+        ok: true,
+        derived: {
+          min_notional: 50,
+          per_round_notional: 500,
+        },
+      };
+    },
+    applyPrecheckResult(_mode, precheck) {
+      events.push({ name: "apply", ok: Boolean(precheck?.ok), snapshotStored });
+    },
+    storeModeValidationSnapshot() {
+      snapshotStored = true;
+      events.push({ name: "store" });
+    },
+    syncPrecheckFreshnessState() {
+      events.push({ name: "sync", snapshotStored });
+    },
+    updateTopRiskBanner() {},
+    renderRiskBanner() {},
+    userVisibleErrorMessage(error) {
+      return String(error?.message || error || "");
+    },
+    AbortController,
+    JSON,
+    Map,
+    Number,
+    Boolean,
+    String,
+    Error,
+    Promise,
+  };
+
+  vm.runInNewContext(
+    `
+${sources.runPrecheck}
+this.runPrecheck = runPrecheck;
+`,
+    sandbox,
+  );
+
+  return {
+    events,
+    runPrecheck: sandbox.runPrecheck,
+  };
+}
+
+function loadSymbolWhitelistHelpers({ initialSymbol = "BTCUSDT", whitelist = ["BTCUSDC", "ETHUSDC"] } = {}) {
+  const sources = {
+    normalizeSymbol: extract(/function normalizeSymbol\(value\) \{[\s\S]*?\n\}/, "normalizeSymbol"),
+    rebuildSymbolOptions: extract(/function rebuildSymbolOptions\(selectedSymbol = activeSymbol\) \{[\s\S]*?\n\}/, "rebuildSymbolOptions"),
+    loadWhitelist: extract(/async function loadWhitelist\([^)]*\) \{[\s\S]*?\n\}/, "loadWhitelist"),
+  };
+
+  const orderBookInput = {
+    options: [],
+    value: "",
+    set innerHTML(_value) {
+      this.options = [];
+    },
+    get innerHTML() {
+      return "";
+    },
+    appendChild(option) {
+      this.options.push(option);
+    },
+  };
+
+  const sandbox = {
+    orderBookInput,
+    executionSymbol: { value: initialSymbol },
+    activeSymbol: initialSymbol,
+    whitelistSymbols: [],
+    temporaryCustomSymbol: null,
+    document: {
+      createElement(tagName) {
+        assert.equal(tagName, "option");
+        return { value: "", textContent: "" };
+      },
+    },
+    async request(pathName) {
+      assert.equal(pathName, "/config/whitelist");
+      return { symbols: whitelist };
+    },
+    copyOrDefault(_key, fallback) {
+      return fallback;
+    },
+    setActiveSymbol(symbol) {
+      const normalized = sandbox.normalizeSymbol(symbol);
+      sandbox.activeSymbol = normalized;
+      sandbox.executionSymbol.value = normalized;
+    },
+    String,
+    Boolean,
+    Array,
+  };
+
+  vm.runInNewContext(
+    `
+${sources.normalizeSymbol}
+${sources.rebuildSymbolOptions}
+${sources.loadWhitelist}
+this.normalizeSymbol = normalizeSymbol;
+this.loadWhitelist = loadWhitelist;
+this.state = () => ({
+  activeSymbol,
+  executionSymbolValue: executionSymbol.value,
+  whitelistSymbols,
+  temporaryCustomSymbol,
+  selectedSymbol: orderBookInput.value,
+  options: orderBookInput.options.map((option) => ({ value: option.value, textContent: option.textContent })),
+});
+`,
+    sandbox,
+  );
+
+  return {
+    loadWhitelist: sandbox.loadWhitelist,
+    state: sandbox.state,
+  };
+}
+
 {
   const { resolveStructuredMessage } = loadErrorHelpers(async () => {
     throw new Error("fetch should not be called in helper-only tests");
@@ -346,6 +550,70 @@ this.selectRecoverableSession = selectRecoverableSession;
     },
   ]);
   assert.equal(selected.session_id, "session-running", "active sessions should be preferred over recoverable exceptions");
+}
+
+{
+  const { maybeScheduleCurrentModePrecheck, scheduled } = loadPrecheckSchedulingHelpers({
+    runnable: true,
+    reason: "context_stale",
+  });
+
+  maybeScheduleCurrentModePrecheck("account_update");
+
+  assert.deepEqual(
+    scheduled,
+    [{ mode: "paired_open", delay: 0, trigger: "account_update" }],
+    "context_stale prechecks should refresh immediately after account updates",
+  );
+}
+
+{
+  const { loadWhitelist, state } = loadSymbolWhitelistHelpers({
+    initialSymbol: "BTCUSDT",
+    whitelist: ["BTCUSDC", "ETHUSDC"],
+  });
+
+  await loadWhitelist({ preferWhitelistDefault: true });
+
+  assert.equal(state().activeSymbol, "BTCUSDC");
+  assert.equal(state().executionSymbolValue, "BTCUSDC");
+  assert.equal(state().selectedSymbol, "BTCUSDC");
+  assert.equal(state().temporaryCustomSymbol, null);
+  assert.deepEqual(
+    state().options.map((option) => option.value),
+    ["BTCUSDC", "ETHUSDC"],
+    "initial whitelist load should not keep the HTML default BTCUSDT as a custom symbol",
+  );
+}
+
+{
+  const { loadWhitelist, state } = loadSymbolWhitelistHelpers({
+    initialSymbol: "BTCUSDT",
+    whitelist: ["BTCUSDC", "ETHUSDC"],
+  });
+
+  await loadWhitelist();
+
+  assert.equal(state().activeSymbol, "BTCUSDT");
+  assert.equal(state().temporaryCustomSymbol, "BTCUSDT");
+  assert.deepEqual(
+    state().options.map((option) => option.value),
+    ["BTCUSDC", "BTCUSDT", "ETHUSDC"],
+    "non-initial whitelist refresh should preserve an explicit custom symbol",
+  );
+}
+
+{
+  const { runPrecheck, events } = loadRunPrecheckOrderHelpers();
+
+  await runPrecheck("paired_open", "user_input");
+
+  const applyEvent = events.find((event) => event.name === "apply");
+  assert.equal(
+    applyEvent?.snapshotStored,
+    true,
+    "successful precheck should store the validation snapshot before refreshing success hints and action buttons",
+  );
 }
 
 {

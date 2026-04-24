@@ -9,7 +9,7 @@ import pytest
 
 from paired_opener.binance import BinanceFuturesGateway
 from paired_opener.config import Settings
-from paired_opener.domain import ExchangeOrder, ExchangeOrderStatus, OrderSide, PositionSide
+from paired_opener.domain import ExchangeOrder, ExchangeOrderStatus, OrderSide, PositionSide, Quote
 
 
 @pytest.mark.asyncio
@@ -226,6 +226,53 @@ async def test_gateway_keeps_connected_but_quiet_user_stream_healthy() -> None:
         await gateway.close()
 
     assert healthy is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_quote_bypasses_stale_stream_cache() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
+    gateway._quote_cache["BTCUSDT"] = Quote(
+        symbol="BTCUSDT",
+        bid_price=Decimal("100"),
+        ask_price=Decimal("101"),
+        event_time=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    calls: list[tuple[str, str, dict[str, str]]] = []
+
+    async def fake_public_request(method: str, path: str, params: dict[str, str]):
+        calls.append((method, path, params))
+        return {"symbol": "BTCUSDT", "bidPrice": "110", "askPrice": "111"}
+
+    gateway._public_request = fake_public_request  # type: ignore[method-assign]
+    try:
+        quote = await gateway.refresh_quote("BTCUSDT")
+        cached = await gateway.get_quote("BTCUSDT")
+    finally:
+        await gateway.close()
+
+    assert calls == [("GET", "/fapi/v1/ticker/bookTicker", {"symbol": "BTCUSDT"})]
+    assert quote.bid_price == Decimal("110")
+    assert quote.ask_price == Decimal("111")
+    assert cached.bid_price == Decimal("110")
+
+
+@pytest.mark.asyncio
+async def test_get_open_orders_strict_raises_instead_of_returning_stale_cache() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"))
+    gateway._open_orders_cache["BTCUSDT"] = (
+        gateway._monotonic(),
+        [{"symbol": "BTCUSDT", "orderId": 123, "clientOrderId": "cached-order"}],
+    )
+
+    async def fake_signed_request(method: str, path: str, params: dict[str, str]):
+        raise RuntimeError("open orders unavailable")
+
+    gateway._signed_request = fake_signed_request  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="open orders unavailable"):
+            await gateway.get_open_orders_strict("BTCUSDT")
+    finally:
+        await gateway.close()
 
 
 @pytest.mark.asyncio

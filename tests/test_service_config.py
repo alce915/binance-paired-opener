@@ -26,6 +26,7 @@ from paired_opener.domain import (
     SessionKind,
     SessionSpec,
     SessionStatus,
+    SessionStopReason,
     SingleCloseMode,
     SingleOpenMode,
     SymbolRules,
@@ -922,6 +923,46 @@ async def test_create_single_open_session_align_mode_uses_smaller_side_differenc
 
 
 @pytest.mark.asyncio
+async def test_create_single_open_session_persists_planned_round_metadata(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "single-open-planned-rounds.db")
+    gateway = SimpleGateway()
+    gateway.rules = SymbolRules(
+        symbol="BTCUSDT",
+        tick_size=Decimal("0.1"),
+        step_size=Decimal("0.001"),
+        min_qty=Decimal("0.001"),
+        min_notional=Decimal("0.1"),
+        max_leverage=125,
+    )
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+
+    session = await service.create_single_open_session(
+        SingleOpenSessionRequest(
+            symbol="BTCUSDT",
+            open_mode="regular",
+            selected_position_side=PositionSide.LONG,
+            open_qty=Decimal("0.010"),
+            leverage=50,
+            round_count=3,
+        )
+    )
+
+    payload = service.get_session(session.session_id)
+    assert payload["session_kind"] == "single_open"
+    assert payload["planned_round_qtys"] == ["0.003", "0.003", "0.004"]
+    assert payload["final_round_qty"] == "0.004"
+    assert payload["extension_round_cap_qty"] == "0.004"
+    assert payload["max_extension_rounds"] == 5
+    assert payload["remaining_extension_rounds"] == 5
+    assert payload["max_session_duration_seconds"] == 1800
+    assert payload["session_deadline_at"] is not None
+    assert payload["stop_reason"] is None
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_create_single_open_session_regular_short_uses_sell_short_orders(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
     repository = SqliteRepository(tmp_path / "single-open-regular.db")
@@ -1543,6 +1584,8 @@ async def test_startup_recovery_marks_exhausted_single_open_with_residual_as_non
         )
     )
     session.final_unaligned_qty = Decimal("0.050")
+    session.remaining_extension_rounds = 0
+    session.stop_reason = SessionStopReason.MAX_EXTENSION_ROUNDS_REACHED
     repository.update_session_runtime(session)
 
     await service.evaluate_startup_recovery()
@@ -1550,6 +1593,58 @@ async def test_startup_recovery_marks_exhausted_single_open_with_residual_as_non
 
     assert payload is not None
     assert payload["status"] == SessionStatus.COMPLETED_WITH_SKIPS.value
+    assert payload["recovery_status"] is None
+    assert payload["recovery_summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_recomputes_exhausted_extension_rounds_from_round_records(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "startup-recovery-stale-extension-runtime.db")
+    gateway = SimpleGateway()
+    service = OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=25,
+            round_count=1,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=2,
+            market_fallback_attempts=2,
+            created_by="test",
+            session_kind=SessionKind.SINGLE_OPEN,
+            open_mode=SingleOpenMode.REGULAR,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("1.000"),
+            max_extension_rounds=5,
+        )
+    )
+    repository.create_session(session)
+    for round_index in range(1, 7):
+        execution = RoundExecution(
+            session_id=session.session_id,
+            round_index=round_index,
+            status=RoundStatus.ROUND_COMPLETED,
+            stage1_filled_qty=Decimal("0.050"),
+            ended_at=datetime.now(UTC),
+        )
+        execution.notes["is_extension_round"] = round_index > session.spec.round_count
+        repository.upsert_round(execution)
+    session.final_unaligned_qty = Decimal("0.700")
+    session.extension_rounds_used = 4
+    session.remaining_extension_rounds = 1
+    repository.update_session_runtime(session)
+
+    await service.evaluate_startup_recovery()
+    payload = repository.get_session(session.session_id)
+
+    assert payload is not None
+    assert payload["status"] == SessionStatus.COMPLETED_WITH_SKIPS.value
+    assert payload["extension_rounds_used"] == 5
+    assert payload["remaining_extension_rounds"] == 0
     assert payload["recovery_status"] is None
     assert payload["recovery_summary"] is None
 

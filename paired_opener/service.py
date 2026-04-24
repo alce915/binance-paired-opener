@@ -21,6 +21,7 @@ from paired_opener.domain import (
     SessionKind,
     SessionSpec,
     SessionStatus,
+    SessionStopReason,
     SingleCloseMode,
     SingleOpenMode,
     TrendBias,
@@ -58,6 +59,9 @@ SYSTEM_ORDER_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-",
     re.IGNORECASE,
 )
+
+DEFAULT_SINGLE_MAX_EXTENSION_ROUNDS = 5
+DEFAULT_SINGLE_MAX_SESSION_DURATION_SECONDS = 30 * 60
 
 
 class SessionPrecheckFailed(ValueError):
@@ -157,6 +161,11 @@ class OpenSessionService:
             selected_position_side=self._enum_value(payload.get("selected_position_side"), PositionSide),
             target_open_qty=Decimal(str(payload.get("target_open_qty") or "0")),
             target_close_qty=Decimal(str(payload.get("target_close_qty") or "0")),
+            planned_round_qtys=[Decimal(str(item)) for item in payload.get("planned_round_qtys") or []],
+            final_round_qty=Decimal(str(payload.get("final_round_qty") or "0")),
+            extension_round_cap_qty=Decimal(str(payload.get("extension_round_cap_qty") or "0")),
+            max_extension_rounds=int(payload.get("max_extension_rounds") or DEFAULT_SINGLE_MAX_EXTENSION_ROUNDS),
+            max_session_duration_seconds=int(payload.get("max_session_duration_seconds") or DEFAULT_SINGLE_MAX_SESSION_DURATION_SECONDS),
         )
         return OpenSession(
             session_id=str(payload["session_id"]),
@@ -182,6 +191,11 @@ class OpenSessionService:
             final_alignment_status=self._enum_value(payload.get("final_alignment_status"), FinalAlignmentStatus, FinalAlignmentStatus.NOT_NEEDED),
             final_unaligned_qty=Decimal(str(payload.get("final_unaligned_qty") or "0")),
             completed_with_final_alignment=bool(payload.get("completed_with_final_alignment")),
+            session_deadline_at=self._parse_datetime(payload.get("session_deadline_at")) if payload.get("session_deadline_at") else None,
+            extension_rounds_used=int(payload.get("extension_rounds_used") or 0),
+            remaining_extension_rounds=int(payload.get("remaining_extension_rounds") or 0),
+            stop_reason=self._enum_value(payload.get("stop_reason"), SessionStopReason),
+            residual_source=payload.get("residual_source"),
         )
 
     def _extract_session_order_ids(self, payload: dict[str, Any]) -> list[str]:
@@ -196,25 +210,40 @@ class OpenSessionService:
     def _recovery_round_progress(self, payload: dict[str, Any]) -> dict[str, Any]:
         completed_rounds = 0
         skipped_rounds = 0
+        regular_completed_rounds = 0
+        regular_skipped_rounds = 0
+        extension_rounds_used = 0
         stage1_filled_total = Decimal("0")
         stage2_filled_total = Decimal("0")
         non_terminal_rounds: list[dict[str, Any]] = []
         next_round_index = 1
+        regular_round_limit = int(payload.get("round_count") or 0)
         for round_payload in payload.get("rounds", []):
             round_index = int(round_payload.get("round_index") or 0)
             next_round_index = max(next_round_index, round_index + 1)
             status_value = str(round_payload.get("status") or "")
+            notes = round_payload.get("notes") or {}
+            is_extension_round = bool(notes.get("is_extension_round")) or round_index > regular_round_limit
             stage1_filled_total += Decimal(str(round_payload.get("stage1_filled_qty") or "0"))
             stage2_filled_total += Decimal(str(round_payload.get("stage2_filled_qty") or "0"))
             if status_value == RoundStatus.ROUND_COMPLETED.value:
                 completed_rounds += 1
+                if not is_extension_round:
+                    regular_completed_rounds += 1
             elif status_value == RoundStatus.STAGE1_SKIPPED.value:
                 skipped_rounds += 1
+                if not is_extension_round:
+                    regular_skipped_rounds += 1
             elif status_value:
                 non_terminal_rounds.append({"round_index": round_index, "status": status_value})
+            if is_extension_round:
+                extension_rounds_used += 1
         return {
             "completed_rounds": completed_rounds,
             "skipped_rounds": skipped_rounds,
+            "regular_completed_rounds": regular_completed_rounds,
+            "regular_skipped_rounds": regular_skipped_rounds,
+            "extension_rounds_used": extension_rounds_used,
             "stage1_filled_total": stage1_filled_total,
             "stage2_filled_total": stage2_filled_total,
             "next_round_index": next_round_index,
@@ -261,6 +290,23 @@ class OpenSessionService:
         session = self._build_session_from_payload(payload)
         checked_at = datetime.now(UTC)
         progress = self._recovery_round_progress(payload)
+        stored_extension_rounds_used = session.extension_rounds_used
+        stored_remaining_extension_rounds = session.remaining_extension_rounds
+        if session.spec.session_kind in (SessionKind.SINGLE_OPEN, SessionKind.SINGLE_CLOSE):
+            if session.stop_reason == SessionStopReason.MAX_EXTENSION_ROUNDS_REACHED:
+                session.extension_rounds_used = max(int(progress["extension_rounds_used"]), stored_extension_rounds_used)
+                session.remaining_extension_rounds = 0
+            else:
+                session.extension_rounds_used = int(progress["extension_rounds_used"])
+                session.remaining_extension_rounds = max(
+                    int(session.spec.max_extension_rounds or 0) - session.extension_rounds_used,
+                    0,
+                )
+            if (
+                session.extension_rounds_used != stored_extension_rounds_used
+                or session.remaining_extension_rounds != stored_remaining_extension_rounds
+            ):
+                self._repository.update_session_runtime(session)
         details: dict[str, Any] = {
             "session_kind": session.spec.session_kind.value,
             "account_id": session.account_id,
@@ -269,12 +315,21 @@ class OpenSessionService:
             "round_progress": {
                 "completed_rounds": progress["completed_rounds"],
                 "skipped_rounds": progress["skipped_rounds"],
+                "regular_completed_rounds": progress["regular_completed_rounds"],
+                "regular_skipped_rounds": progress["regular_skipped_rounds"],
+                "extension_rounds_used": progress["extension_rounds_used"],
                 "next_round_index": progress["next_round_index"],
                 "stage1_filled_total": str(progress["stage1_filled_total"]),
                 "stage2_filled_total": str(progress["stage2_filled_total"]),
                 "non_terminal_rounds": progress["non_terminal_rounds"],
             },
             "stage2_carryover_qty": str(session.stage2_carryover_qty),
+            "remaining_extension_rounds": session.remaining_extension_rounds,
+            "stored_extension_rounds_used": stored_extension_rounds_used,
+            "stored_remaining_extension_rounds": stored_remaining_extension_rounds,
+            "session_deadline_at": session.session_deadline_at.isoformat() if session.session_deadline_at else None,
+            "stop_reason": session.stop_reason.value if session.stop_reason else None,
+            "residual_source": session.residual_source,
         }
         processed_rounds = progress["completed_rounds"] + progress["skipped_rounds"]
         details["processed_rounds"] = processed_rounds
@@ -431,6 +486,23 @@ class OpenSessionService:
                     details,
                     final_status=self._completed_status_for_recovery(session, progress),
                 )
+            if session.session_deadline_at and checked_at >= session.session_deadline_at:
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "单向平仓会话已超过最长执行时长，无法继续恢复。",
+                    checked_at,
+                    details,
+                    final_status=self._completed_status_with_remaining_qty(session, progress, remaining_close_qty),
+                )
+            regular_processed_rounds = progress["regular_completed_rounds"] + progress["regular_skipped_rounds"]
+            if regular_processed_rounds >= session.spec.round_count and session.remaining_extension_rounds <= 0:
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "单向平仓补充轮已耗尽，无需恢复。",
+                    checked_at,
+                    details,
+                    final_status=self._completed_status_with_remaining_qty(session, progress, remaining_close_qty),
+                )
         elif session.spec.session_kind == SessionKind.SINGLE_OPEN:
             remaining_open_qty = max(Decimal("0"), session.spec.target_open_qty - progress["stage1_filled_total"])
             details["remaining_target_open_qty"] = str(remaining_open_qty)
@@ -442,10 +514,19 @@ class OpenSessionService:
                     details,
                     final_status=self._completed_status_for_recovery(session, progress),
                 )
-            if processed_rounds >= session.spec.round_count:
+            if session.session_deadline_at and checked_at >= session.session_deadline_at:
                 return self._recovery_result(
                     RecoveryStatus.NON_RECOVERABLE,
-                    "单向开仓轮次已全部完成，无需恢复。",
+                    "单向开仓会话已超过最长执行时长，无法继续恢复。",
+                    checked_at,
+                    details,
+                    final_status=self._completed_status_with_remaining_qty(session, progress, remaining_open_qty),
+                )
+            regular_processed_rounds = progress["regular_completed_rounds"] + progress["regular_skipped_rounds"]
+            if regular_processed_rounds >= session.spec.round_count and session.remaining_extension_rounds <= 0:
+                return self._recovery_result(
+                    RecoveryStatus.NON_RECOVERABLE,
+                    "单向开仓补充轮已耗尽，无需恢复。",
                     checked_at,
                     details,
                     final_status=self._completed_status_with_remaining_qty(session, progress, remaining_open_qty),
@@ -683,6 +764,26 @@ class OpenSessionService:
         if value is None:
             return "0.00"
         return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def _build_single_round_plan(
+        self,
+        *,
+        normalized_target_qty: Decimal,
+        round_count: int,
+        rules,
+    ) -> tuple[Decimal, Decimal, list[Decimal], Decimal]:
+        round_qty = normalize_qty(normalized_target_qty / Decimal(round_count), rules)
+        if round_qty <= Decimal("0"):
+            raise ValueError("每轮数量归一化后为 0，无法执行")
+        final_round_qty = normalize_qty(
+            normalized_target_qty - (round_qty * Decimal(max(round_count - 1, 0))),
+            rules,
+        )
+        if final_round_qty <= Decimal("0"):
+            raise ValueError("最后一轮数量归一化后为 0，无法执行")
+        planned_round_qtys = [round_qty for _ in range(max(round_count - 1, 0))] + [final_round_qty]
+        extension_round_cap_qty = max(planned_round_qtys) if planned_round_qtys else round_qty
+        return round_qty, final_round_qty, planned_round_qtys, extension_round_cap_qty
     async def _get_open_order_counts(self, symbol: str) -> tuple[int | None, int | None, str | None]:
         try:
             open_orders = await self._gateway.get_open_orders(symbol)
@@ -1274,9 +1375,11 @@ class OpenSessionService:
             if normalized_open_qty <= Decimal("0"):
                 raise ValueError("开仓数量归一化后为 0，无法单向开仓")
 
-            round_qty = normalize_qty(normalized_open_qty / Decimal(request.round_count), rules)
-            if round_qty <= Decimal("0"):
-                raise ValueError("每轮数量归一化后为 0，无法单向开仓")
+            round_qty, final_round_qty, planned_round_qtys, extension_round_cap_qty = self._build_single_round_plan(
+                normalized_target_qty=normalized_open_qty,
+                round_count=request.round_count,
+                rules=rules,
+            )
 
             available_balance = Decimal(str(account_overview.get("totals", {}).get("available_balance") or "0"))
             has_existing_positions = long_qty > Decimal("0") or short_qty > Decimal("0")
@@ -1296,12 +1399,6 @@ class OpenSessionService:
             quote = await self._gateway.get_quote(symbol)
             _, single_open_price = self._single_open_params(selected_position_side, quote)
             single_open_price = normalize_price(single_open_price, rules)
-            final_round_qty = normalize_qty(
-                normalized_open_qty - (round_qty * Decimal(max(request.round_count - 1, 0))),
-                rules,
-            )
-            if final_round_qty <= Decimal("0"):
-                raise ValueError("最后一轮数量归一化后为 0，无法单向开仓")
             try:
                 validate_qty_and_notional(round_qty, single_open_price, rules)
                 validate_qty_and_notional(final_round_qty, single_open_price, rules)
@@ -1346,6 +1443,11 @@ class OpenSessionService:
                 open_mode=request.open_mode,
                 selected_position_side=selected_position_side,
                 target_open_qty=normalized_open_qty,
+                planned_round_qtys=planned_round_qtys,
+                final_round_qty=final_round_qty,
+                extension_round_cap_qty=extension_round_cap_qty,
+                max_extension_rounds=DEFAULT_SINGLE_MAX_EXTENSION_ROUNDS,
+                max_session_duration_seconds=DEFAULT_SINGLE_MAX_SESSION_DURATION_SECONDS,
             )
             session = OpenSession.create(spec, account_id=self._account_id, account_name=self._account_name)
             self._repository.create_session(session)
@@ -1360,6 +1462,12 @@ class OpenSessionService:
                     "open_qty": str(normalized_open_qty),
                     "round_count": spec.round_count,
                     "round_qty": str(spec.round_qty),
+                    "planned_round_qtys": [str(item) for item in planned_round_qtys],
+                    "final_round_qty": str(final_round_qty),
+                    "extension_round_cap_qty": str(extension_round_cap_qty),
+                    "max_extension_rounds": spec.max_extension_rounds,
+                    "max_session_duration_seconds": spec.max_session_duration_seconds,
+                    "session_deadline_at": session.session_deadline_at.isoformat() if session.session_deadline_at else None,
                     "round_interval_seconds": spec.round_interval_seconds,
                     "account_id": self._account_id,
                     "account_name": self._account_name,
@@ -1549,19 +1657,15 @@ class OpenSessionService:
             if normalized_close_qty <= Decimal("0"):
                 raise ValueError("平仓数量归一化后为 0，无法单向平仓")
 
-            round_qty = normalize_qty(normalized_close_qty / Decimal(request.round_count), rules)
-            if round_qty <= Decimal("0"):
-                raise ValueError("每轮数量归一化后为 0，无法单向平仓")
+            round_qty, final_round_qty, planned_round_qtys, extension_round_cap_qty = self._build_single_round_plan(
+                normalized_target_qty=normalized_close_qty,
+                round_count=request.round_count,
+                rules=rules,
+            )
 
             quote = await self._gateway.get_quote(symbol)
             single_close_side, single_close_price = self._single_close_params(selected_position_side, quote)
             single_close_price = normalize_price(single_close_price, rules)
-            final_round_qty = normalize_qty(
-                normalized_close_qty - (round_qty * Decimal(max(request.round_count - 1, 0))),
-                rules,
-            )
-            if final_round_qty <= Decimal("0"):
-                raise ValueError("最后一轮数量归一化后为 0，无法单向平仓")
             try:
                 validate_qty_and_notional(round_qty, single_close_price, rules)
                 validate_qty_and_notional(final_round_qty, single_close_price, rules)
@@ -1616,6 +1720,11 @@ class OpenSessionService:
                 close_mode=request.close_mode,
                 selected_position_side=selected_position_side,
                 target_close_qty=normalized_close_qty,
+                planned_round_qtys=planned_round_qtys,
+                final_round_qty=final_round_qty,
+                extension_round_cap_qty=extension_round_cap_qty,
+                max_extension_rounds=DEFAULT_SINGLE_MAX_EXTENSION_ROUNDS,
+                max_session_duration_seconds=DEFAULT_SINGLE_MAX_SESSION_DURATION_SECONDS,
             )
             session = OpenSession.create(spec, account_id=self._account_id, account_name=self._account_name)
             self._repository.create_session(session)
@@ -1630,6 +1739,12 @@ class OpenSessionService:
                     "close_qty": str(normalized_close_qty),
                     "round_count": spec.round_count,
                     "round_qty": str(spec.round_qty),
+                    "planned_round_qtys": [str(item) for item in planned_round_qtys],
+                    "final_round_qty": str(final_round_qty),
+                    "extension_round_cap_qty": str(extension_round_cap_qty),
+                    "max_extension_rounds": spec.max_extension_rounds,
+                    "max_session_duration_seconds": spec.max_session_duration_seconds,
+                    "session_deadline_at": session.session_deadline_at.isoformat() if session.session_deadline_at else None,
                     "round_interval_seconds": spec.round_interval_seconds,
                     "account_id": self._account_id,
                     "account_name": self._account_name,
@@ -1677,10 +1792,16 @@ class OpenSessionService:
                     "session_kind": session.spec.session_kind.value,
                     "completed_rounds": completed_rounds,
                     "skipped_rounds": skipped_rounds,
+                    "planned_round_qtys": [str(item) for item in session.spec.planned_round_qtys],
+                    "extension_rounds_used": session.extension_rounds_used,
+                    "remaining_extension_rounds": session.remaining_extension_rounds,
                     "stage2_carryover_qty": str(session.stage2_carryover_qty),
                     "final_alignment_status": session.final_alignment_status.value,
                     "final_unaligned_qty": str(session.final_unaligned_qty),
                     "completed_with_final_alignment": session.completed_with_final_alignment,
+                    "session_deadline_at": session.session_deadline_at.isoformat() if session.session_deadline_at else None,
+                    "stop_reason": session.stop_reason.value if session.stop_reason else None,
+                    "residual_source": session.residual_source,
                 },
             )
         except Exception as exc:

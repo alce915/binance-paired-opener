@@ -20,7 +20,9 @@ from paired_opener.domain import (
     RoundExecution,
     RoundStatus,
     SessionAbortedError,
+    SessionKind,
     SessionSpec,
+    SessionStopReason,
     SymbolRules,
     TrendBias,
 )
@@ -46,6 +48,7 @@ class _StageResult:
     remaining_qty: Decimal
     zero_fill_retries: int
     market_fallback_used: bool
+    stop_reason: SessionStopReason | None = None
 
 
 class PairedOpeningEngine:
@@ -264,7 +267,23 @@ class PairedOpeningEngine:
 
         while remaining_qty > Decimal("0"):
             await self._respect_control(control)
-            quote = await self._gateway.get_quote(spec.symbol)
+            if spec.session_kind in (SessionKind.SINGLE_OPEN, SessionKind.SINGLE_CLOSE):
+                quote = await self._get_fresh_quote(
+                    session=session,
+                    symbol=spec.symbol,
+                    round_index=round_index,
+                    label=label,
+                )
+                if quote is None:
+                    return _StageResult(
+                        filled_qty=total_filled,
+                        remaining_qty=remaining_qty,
+                        zero_fill_retries=zero_fill_retries,
+                        market_fallback_used=market_fallback_used,
+                        stop_reason=SessionStopReason.QUOTE_STALE,
+                    )
+            else:
+                quote = await self._gateway.get_quote(spec.symbol)
             price = normalize_price(price_selector(quote), rules)
             if reference_price is None:
                 reference_price = price
@@ -294,6 +313,7 @@ class PairedOpeningEngine:
                     remaining_qty=remaining_qty,
                     zero_fill_retries=zero_fill_retries,
                     market_fallback_used=market_fallback_used,
+                    stop_reason=SessionStopReason.PRICE_GUARD_BLOCKED if spec.session_kind in (SessionKind.SINGLE_OPEN, SessionKind.SINGLE_CLOSE) else None,
                 )
             if last_price is not None and price != last_price:
                 self._repository.add_event(
@@ -327,6 +347,7 @@ class PairedOpeningEngine:
                     remaining_qty=remaining_qty,
                     zero_fill_retries=zero_fill_retries,
                     market_fallback_used=market_fallback_used,
+                    stop_reason=SessionStopReason.BELOW_MIN_NOTIONAL if spec.session_kind in (SessionKind.SINGLE_OPEN, SessionKind.SINGLE_CLOSE) else None,
                 )
             order = await self._gateway.place_limit_order(
                 symbol=spec.symbol,
@@ -879,6 +900,146 @@ class PairedOpeningEngine:
             return OrderSide.SELL, PositionSide.SHORT, lambda quote: quote.ask_price
         return OrderSide.BUY, PositionSide.LONG, lambda quote: quote.bid_price
 
+    def _single_round_planned_qty(self, spec: SessionSpec, round_index: int, rules: SymbolRules) -> Decimal:
+        if spec.planned_round_qtys and 1 <= round_index <= len(spec.planned_round_qtys):
+            return normalize_qty(Decimal(str(spec.planned_round_qtys[round_index - 1])), rules)
+        if round_index == spec.round_count and spec.final_round_qty > Decimal("0"):
+            return normalize_qty(spec.final_round_qty, rules)
+        if round_index == spec.round_count:
+            target_total = spec.target_open_qty if spec.session_kind == SessionKind.SINGLE_OPEN else spec.target_close_qty
+            if target_total > Decimal("0"):
+                derived_final_round_qty = normalize_qty(
+                    target_total - (spec.round_qty * Decimal(max(spec.round_count - 1, 0))),
+                    rules,
+                )
+                if derived_final_round_qty > Decimal("0"):
+                    return derived_final_round_qty
+        return normalize_qty(spec.round_qty, rules)
+
+    def _single_extension_cap_qty(self, spec: SessionSpec, rules: SymbolRules) -> Decimal:
+        if spec.extension_round_cap_qty > Decimal("0"):
+            return normalize_qty(spec.extension_round_cap_qty, rules)
+        planned = [normalize_qty(Decimal(str(item)), rules) for item in spec.planned_round_qtys]
+        if planned:
+            return max(planned)
+        return normalize_qty(spec.round_qty, rules)
+
+    def _single_planned_qty_total(self, session: OpenSession) -> Decimal:
+        total = Decimal("0")
+        for round_payload in self._repository.list_rounds(session.session_id):
+            notes = round_payload.get("notes") or {}
+            total += Decimal(str(notes.get("current_planned_qty") or "0"))
+        return total
+
+    def _single_target_tolerance(self, rules: SymbolRules) -> Decimal:
+        return normalize_qty(rules.step_size, rules)
+
+    def _mark_single_stop(
+        self,
+        session: OpenSession,
+        reason: SessionStopReason,
+        *,
+        residual_source: str | None = None,
+    ) -> None:
+        session.stop_reason = reason
+        if residual_source is not None:
+            session.residual_source = residual_source
+
+    def _mark_single_extension_exhausted_if_needed(self, session: OpenSession) -> None:
+        if session.final_unaligned_qty <= Decimal("0"):
+            return
+        if session.remaining_extension_rounds > 0:
+            return
+        if session.stop_reason not in (None, SessionStopReason.FILLED):
+            return
+        self._mark_single_stop(
+            session,
+            SessionStopReason.MAX_EXTENSION_ROUNDS_REACHED,
+            residual_source=session.residual_source or "unfilled_residual",
+        )
+
+    def _quote_age_seconds(self, quote: Quote) -> float:
+        event_time = getattr(quote, "event_time", None)
+        if not isinstance(event_time, datetime):
+            return 0.0
+        return max((datetime.now(UTC) - event_time).total_seconds(), 0.0)
+
+    async def _get_fresh_quote(
+        self,
+        *,
+        session: OpenSession,
+        symbol: str,
+        round_index: int,
+        label: str,
+        max_age_seconds: int = 5,
+    ) -> Quote | None:
+        stale_age_seconds: float | None = None
+        refresh_error: str | None = None
+        try:
+            quote = await self._gateway.get_quote(symbol)
+            age_seconds = self._quote_age_seconds(quote)
+            if age_seconds <= float(max_age_seconds):
+                return quote
+            stale_age_seconds = age_seconds
+        except Exception as exc:
+            refresh_error = str(exc)
+        try:
+            quote = await self._gateway.refresh_quote(symbol)
+            age_seconds = self._quote_age_seconds(quote)
+            if age_seconds <= float(max_age_seconds):
+                return quote
+            stale_age_seconds = age_seconds
+        except Exception as exc:
+            refresh_error = str(exc)
+        self._repository.add_event(
+            session.session_id,
+            "quote_stale",
+            {
+                "round_index": round_index,
+                "label": label,
+                "max_age_seconds": max_age_seconds,
+                "age_seconds": stale_age_seconds,
+                "refresh_error": refresh_error,
+            },
+            round_index=round_index,
+        )
+        self._mark_single_stop(session, SessionStopReason.QUOTE_STALE, residual_source=session.residual_source or "unfilled_residual")
+        return None
+
+    async def _check_extension_open_order_conflict(self, session: OpenSession) -> bool:
+        try:
+            open_orders = await self._gateway.get_open_orders_strict(session.spec.symbol)
+        except Exception as exc:
+            self._repository.add_event(
+                session.session_id,
+                "extension_round_conflict_detected",
+                {"order_id": "", "client_order_id": "", "order_class": "unknown", "check_failed": True, "error": str(exc)},
+            )
+            self._mark_single_stop(
+                session,
+                SessionStopReason.OPEN_ORDER_CONFLICT_DETECTED,
+                residual_source=session.residual_source or "unfilled_residual",
+            )
+            return False
+        for order in open_orders:
+            client_order_id = str(order.get("clientOrderId") or order.get("client_order_id") or "")
+            order_id = str(order.get("orderId") or order.get("order_id") or "")
+            order_class = "system" if client_order_id and client_order_id.startswith(f"{session.session_id}-") else (
+                "system" if client_order_id and client_order_id.count("-") >= 5 else "manual"
+            )
+            self._repository.add_event(
+                session.session_id,
+                "extension_round_conflict_detected",
+                {"order_id": order_id, "client_order_id": client_order_id, "order_class": order_class},
+            )
+            self._mark_single_stop(
+                session,
+                SessionStopReason.OPEN_ORDER_CONFLICT_DETECTED,
+                residual_source=session.residual_source or "unfilled_residual",
+            )
+            return False
+        return True
+
 
 
 
@@ -890,8 +1051,65 @@ class SingleOpeningEngine(PairedOpeningEngine):
             session.stage2_carryover_qty = Decimal("0")
             session.final_unaligned_qty = Decimal("0")
             session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
-        for round_index in range(next_round_index, session.spec.round_count + 1):
+            session.extension_rounds_used = 0
+            session.remaining_extension_rounds = max(int(session.spec.max_extension_rounds or 0), 0)
+            session.stop_reason = None
+            session.residual_source = None
+        round_index = next_round_index
+        max_round_index = session.spec.round_count + max(int(session.spec.max_extension_rounds or 0), 0)
+        while round_index <= max_round_index:
             await self._respect_control(control)
+            rules = await self._gateway.get_symbol_rules(session.spec.symbol)
+            remaining_target_qty = normalize_qty(session.spec.target_open_qty - self._single_open_opened_qty(session), rules)
+            session.final_unaligned_qty = remaining_target_qty
+            if remaining_target_qty <= Decimal("0"):
+                session.stop_reason = SessionStopReason.FILLED
+                break
+            if session.session_deadline_at and datetime.now(UTC) >= session.session_deadline_at:
+                self._mark_single_stop(session, SessionStopReason.MAX_SESSION_DURATION_REACHED, residual_source=session.residual_source or "unfilled_residual")
+                break
+
+            is_extension_round = round_index > session.spec.round_count
+            if is_extension_round:
+                if session.remaining_extension_rounds <= 0:
+                    self._mark_single_stop(session, SessionStopReason.MAX_EXTENSION_ROUNDS_REACHED, residual_source=session.residual_source or "unfilled_residual")
+                    break
+                if not await self._check_extension_open_order_conflict(session):
+                    break
+                quote = await self._get_fresh_quote(
+                    session=session,
+                    symbol=session.spec.symbol,
+                    round_index=round_index,
+                    label="single_open_extension_precheck",
+                )
+                if quote is None:
+                    break
+                _, price_selector = self._single_open_params(session.spec.selected_position_side)
+                candidate_price = normalize_price(price_selector(quote), rules)
+                candidate_qty = normalize_qty(
+                    min(remaining_target_qty, self._single_extension_cap_qty(session.spec, rules)),
+                    rules,
+                )
+                try:
+                    validate_qty_and_notional(candidate_qty, candidate_price, rules)
+                except ValueError:
+                    self._mark_single_stop(
+                        session,
+                        SessionStopReason.BELOW_MIN_NOTIONAL,
+                        residual_source=session.residual_source or "rounding_residual",
+                    )
+                    break
+                overview = await self._gateway.get_account_overview()
+                available_balance = Decimal(str(overview.get("totals", {}).get("available_balance") or "0"))
+                implied_open_amount = (candidate_qty * candidate_price) / Decimal(max(session.spec.leverage, 1))
+                if implied_open_amount > (available_balance * Decimal("0.95")):
+                    self._mark_single_stop(
+                        session,
+                        SessionStopReason.INSUFFICIENT_BALANCE,
+                        residual_source=session.residual_source or "unfilled_residual",
+                    )
+                    break
+
             execution = await self.execute_round(session=session, round_index=round_index, control=control)
             self._repository.update_session_runtime(session)
             if execution.status == RoundStatus.STAGE1_SKIPPED:
@@ -900,14 +1118,25 @@ class SingleOpeningEngine(PairedOpeningEngine):
                 completed_rounds += 1
             if control.aborted:
                 raise SessionAbortedError("Session aborted by operator after safe checkpoint")
-            if round_index < session.spec.round_count and session.spec.round_interval_seconds > 0:
+            if session.stop_reason not in (None, SessionStopReason.FILLED):
+                break
+            if session.final_unaligned_qty <= Decimal("0"):
+                session.stop_reason = SessionStopReason.FILLED
+                break
+            if round_index < max_round_index and session.spec.round_interval_seconds > 0:
                 self._repository.add_event(
                     session.session_id,
                     "single_open_round_interval_wait",
-                    {"round_index": round_index, "wait_seconds": session.spec.round_interval_seconds},
+                    {
+                        "round_index": round_index,
+                        "wait_seconds": session.spec.round_interval_seconds,
+                        "is_extension_round": is_extension_round,
+                    },
                     round_index=round_index,
                 )
                 await self._sleep_with_control(session.spec.round_interval_seconds, control)
+            round_index += 1
+        self._mark_single_extension_exhausted_if_needed(session)
         return completed_rounds, skipped_rounds
 
     async def execute_round(
@@ -922,14 +1151,42 @@ class SingleOpeningEngine(PairedOpeningEngine):
             raise ExchangeStateError(f"Single open session {session.session_id} is missing selected_position_side")
 
         rules = await self._gateway.get_symbol_rules(spec.symbol)
+        is_extension_round = round_index > spec.round_count
         already_opened_qty = self._single_open_opened_qty(session)
         remaining_target_qty = normalize_qty(spec.target_open_qty - already_opened_qty, rules)
-        target_qty = normalize_qty(min(spec.round_qty, remaining_target_qty), rules)
+        planned_qty = (
+            normalize_qty(min(remaining_target_qty, self._single_extension_cap_qty(spec, rules)), rules)
+            if is_extension_round
+            else self._single_round_planned_qty(spec, round_index, rules)
+        )
+        target_qty = normalize_qty(min(planned_qty, remaining_target_qty), rules)
+        if is_extension_round:
+            session.extension_rounds_used += 1
+            session.remaining_extension_rounds = max(session.remaining_extension_rounds - 1, 0)
+
+        target_tolerance = self._single_target_tolerance(rules)
+        if self._single_planned_qty_total(session) + target_qty > spec.target_open_qty + target_tolerance:
+            session.final_unaligned_qty = remaining_target_qty
+            self._mark_single_stop(session, SessionStopReason.TARGET_GUARD_BLOCKED, residual_source=session.residual_source or "unfilled_residual")
+            execution = RoundExecution(session_id=session.session_id, round_index=round_index, status=RoundStatus.STAGE1_SKIPPED)
+            execution.notes["skip_reason"] = SessionStopReason.TARGET_GUARD_BLOCKED.value
+            execution.notes["is_extension_round"] = is_extension_round
+            execution.notes["extension_round_index"] = max(round_index - spec.round_count, 0)
+            execution.notes["current_planned_qty"] = str(planned_qty)
+            execution.notes["residual_in"] = str(remaining_target_qty)
+            execution.notes["residual_out"] = str(remaining_target_qty)
+            execution.ended_at = datetime.now(UTC)
+            self._repository.upsert_round(execution)
+            return execution
 
         execution = RoundExecution(session_id=session.session_id, round_index=round_index, status=RoundStatus.STAGE1_PENDING)
         execution.notes["open_mode"] = spec.open_mode.value if spec.open_mode else None
         execution.notes["selected_position_side"] = spec.selected_position_side.value
         execution.notes["remaining_target_qty_in"] = str(remaining_target_qty)
+        execution.notes["is_extension_round"] = is_extension_round
+        execution.notes["extension_round_index"] = max(round_index - spec.round_count, 0)
+        execution.notes["current_planned_qty"] = str(planned_qty)
+        execution.notes["residual_in"] = str(remaining_target_qty)
         self._repository.upsert_round(execution)
         self._repository.add_event(
             session.session_id,
@@ -938,6 +1195,9 @@ class SingleOpeningEngine(PairedOpeningEngine):
                 "round_index": round_index,
                 "selected_position_side": spec.selected_position_side.value,
                 "remaining_target_qty": str(remaining_target_qty),
+                "planned_qty": str(planned_qty),
+                "is_extension_round": is_extension_round,
+                "extension_round_index": max(round_index - spec.round_count, 0),
             },
             round_index=round_index,
         )
@@ -978,9 +1238,16 @@ class SingleOpeningEngine(PairedOpeningEngine):
         execution.notes["round_target_qty"] = str(target_qty)
         execution.notes["round_remaining_qty"] = str(stage_result.remaining_qty)
         execution.notes["remaining_target_qty_out"] = str(normalize_qty(remaining_target_qty - stage_result.filled_qty, rules))
+        execution.notes["residual_out"] = str(normalize_qty(remaining_target_qty - stage_result.filled_qty, rules))
+        execution.notes["residual_source"] = "unfilled_residual" if stage_result.remaining_qty > Decimal("0") else None
         session.stage2_carryover_qty = Decimal("0")
         session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
         session.final_unaligned_qty = normalize_qty(remaining_target_qty - stage_result.filled_qty, rules)
+        if session.final_unaligned_qty > Decimal("0") and stage_result.filled_qty < target_qty:
+            session.residual_source = "unfilled_residual"
+        if stage_result.stop_reason is not None:
+            fallback_source = session.residual_source or ("rounding_residual" if stage_result.stop_reason == SessionStopReason.BELOW_MIN_NOTIONAL else "unfilled_residual")
+            self._mark_single_stop(session, stage_result.stop_reason, residual_source=fallback_source)
         execution.status = RoundStatus.ROUND_COMPLETED if stage_result.filled_qty > Decimal("0") else RoundStatus.STAGE1_SKIPPED
         execution.ended_at = datetime.now(UTC)
         self._repository.upsert_round(execution)
@@ -994,6 +1261,10 @@ class SingleOpeningEngine(PairedOpeningEngine):
                 "remaining_qty": str(stage_result.remaining_qty),
                 "market_fallback_used": stage_result.market_fallback_used,
                 "selected_position_side": spec.selected_position_side.value,
+                "planned_qty": str(planned_qty),
+                "is_extension_round": is_extension_round,
+                "extension_round_index": max(round_index - spec.round_count, 0),
+                "stop_reason": stage_result.stop_reason.value if stage_result.stop_reason else None,
             },
             round_index=round_index,
         )
@@ -1048,8 +1319,64 @@ class SingleClosingEngine(PairedOpeningEngine):
             session.stage2_carryover_qty = Decimal("0")
             session.final_unaligned_qty = Decimal("0")
             session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
-        for round_index in range(next_round_index, session.spec.round_count + 1):
+            session.extension_rounds_used = 0
+            session.remaining_extension_rounds = max(int(session.spec.max_extension_rounds or 0), 0)
+            session.stop_reason = None
+            session.residual_source = None
+        round_index = next_round_index
+        max_round_index = session.spec.round_count + max(int(session.spec.max_extension_rounds or 0), 0)
+        while round_index <= max_round_index:
             await self._respect_control(control)
+            rules = await self._gateway.get_symbol_rules(session.spec.symbol)
+            remaining_target_qty = normalize_qty(session.spec.target_close_qty - self._single_close_closed_qty(session), rules)
+            session.final_unaligned_qty = remaining_target_qty
+            if remaining_target_qty <= Decimal("0"):
+                session.stop_reason = SessionStopReason.FILLED
+                break
+            if session.session_deadline_at and datetime.now(UTC) >= session.session_deadline_at:
+                self._mark_single_stop(session, SessionStopReason.MAX_SESSION_DURATION_REACHED, residual_source=session.residual_source or "unfilled_residual")
+                break
+
+            is_extension_round = round_index > session.spec.round_count
+            if is_extension_round:
+                if session.remaining_extension_rounds <= 0:
+                    self._mark_single_stop(session, SessionStopReason.MAX_EXTENSION_ROUNDS_REACHED, residual_source=session.residual_source or "unfilled_residual")
+                    break
+                if not await self._check_extension_open_order_conflict(session):
+                    break
+                quote = await self._get_fresh_quote(
+                    session=session,
+                    symbol=session.spec.symbol,
+                    round_index=round_index,
+                    label="single_close_extension_precheck",
+                )
+                if quote is None:
+                    break
+                side, price_selector = self._single_close_params(session.spec.selected_position_side)
+                candidate_price = normalize_price(price_selector(quote), rules)
+                overview = await self._gateway.get_account_overview()
+                available_qty = normalize_qty(self._position_qty(overview, session.spec.symbol, session.spec.selected_position_side), rules)
+                candidate_qty = normalize_qty(
+                    min(remaining_target_qty, available_qty, self._single_extension_cap_qty(session.spec, rules)),
+                    rules,
+                )
+                if available_qty <= Decimal("0") or candidate_qty <= Decimal("0"):
+                    self._mark_single_stop(
+                        session,
+                        SessionStopReason.INSUFFICIENT_POSITION,
+                        residual_source=session.residual_source or "unfilled_residual",
+                    )
+                    break
+                try:
+                    validate_qty_and_notional(candidate_qty, candidate_price, rules)
+                except ValueError:
+                    self._mark_single_stop(
+                        session,
+                        SessionStopReason.BELOW_MIN_NOTIONAL,
+                        residual_source=session.residual_source or "rounding_residual",
+                    )
+                    break
+
             execution = await self.execute_round(session=session, round_index=round_index, control=control)
             self._repository.update_session_runtime(session)
             if execution.status == RoundStatus.STAGE1_SKIPPED:
@@ -1058,14 +1385,25 @@ class SingleClosingEngine(PairedOpeningEngine):
                 completed_rounds += 1
             if control.aborted:
                 raise SessionAbortedError("Session aborted by operator after safe checkpoint")
-            if round_index < session.spec.round_count and session.spec.round_interval_seconds > 0:
+            if session.stop_reason not in (None, SessionStopReason.FILLED):
+                break
+            if session.final_unaligned_qty <= Decimal("0"):
+                session.stop_reason = SessionStopReason.FILLED
+                break
+            if round_index < max_round_index and session.spec.round_interval_seconds > 0:
                 self._repository.add_event(
                     session.session_id,
                     "single_close_round_interval_wait",
-                    {"round_index": round_index, "wait_seconds": session.spec.round_interval_seconds},
+                    {
+                        "round_index": round_index,
+                        "wait_seconds": session.spec.round_interval_seconds,
+                        "is_extension_round": is_extension_round,
+                    },
                     round_index=round_index,
                 )
                 await self._sleep_with_control(session.spec.round_interval_seconds, control)
+            round_index += 1
+        self._mark_single_extension_exhausted_if_needed(session)
         return completed_rounds, skipped_rounds
 
     async def execute_round(
@@ -1080,17 +1418,45 @@ class SingleClosingEngine(PairedOpeningEngine):
             raise ExchangeStateError(f"Single close session {session.session_id} is missing selected_position_side")
 
         rules = await self._gateway.get_symbol_rules(spec.symbol)
+        is_extension_round = round_index > spec.round_count
         already_closed_qty = self._single_close_closed_qty(session)
         remaining_target_qty = normalize_qty(spec.target_close_qty - already_closed_qty, rules)
         overview = await self._gateway.get_account_overview()
         available_qty = normalize_qty(self._position_qty(overview, spec.symbol, spec.selected_position_side), rules)
-        target_qty = normalize_qty(min(spec.round_qty, remaining_target_qty, available_qty), rules)
+        planned_qty = (
+            normalize_qty(min(remaining_target_qty, self._single_extension_cap_qty(spec, rules)), rules)
+            if is_extension_round
+            else self._single_round_planned_qty(spec, round_index, rules)
+        )
+        target_qty = normalize_qty(min(planned_qty, remaining_target_qty, available_qty), rules)
+        if is_extension_round:
+            session.extension_rounds_used += 1
+            session.remaining_extension_rounds = max(session.remaining_extension_rounds - 1, 0)
+
+        target_tolerance = self._single_target_tolerance(rules)
+        if self._single_planned_qty_total(session) + target_qty > spec.target_close_qty + target_tolerance:
+            session.final_unaligned_qty = remaining_target_qty
+            self._mark_single_stop(session, SessionStopReason.TARGET_GUARD_BLOCKED, residual_source=session.residual_source or "unfilled_residual")
+            execution = RoundExecution(session_id=session.session_id, round_index=round_index, status=RoundStatus.STAGE1_SKIPPED)
+            execution.notes["skip_reason"] = SessionStopReason.TARGET_GUARD_BLOCKED.value
+            execution.notes["is_extension_round"] = is_extension_round
+            execution.notes["extension_round_index"] = max(round_index - spec.round_count, 0)
+            execution.notes["current_planned_qty"] = str(planned_qty)
+            execution.notes["residual_in"] = str(remaining_target_qty)
+            execution.notes["residual_out"] = str(remaining_target_qty)
+            execution.ended_at = datetime.now(UTC)
+            self._repository.upsert_round(execution)
+            return execution
 
         execution = RoundExecution(session_id=session.session_id, round_index=round_index, status=RoundStatus.STAGE1_PENDING)
         execution.notes["close_mode"] = spec.close_mode.value if spec.close_mode else None
         execution.notes["selected_position_side"] = spec.selected_position_side.value
         execution.notes["remaining_target_qty_in"] = str(remaining_target_qty)
         execution.notes["available_position_qty_in"] = str(available_qty)
+        execution.notes["is_extension_round"] = is_extension_round
+        execution.notes["extension_round_index"] = max(round_index - spec.round_count, 0)
+        execution.notes["current_planned_qty"] = str(planned_qty)
+        execution.notes["residual_in"] = str(remaining_target_qty)
         self._repository.upsert_round(execution)
         self._repository.add_event(
             session.session_id,
@@ -1100,6 +1466,9 @@ class SingleClosingEngine(PairedOpeningEngine):
                 "selected_position_side": spec.selected_position_side.value,
                 "remaining_target_qty": str(remaining_target_qty),
                 "available_qty": str(available_qty),
+                "planned_qty": str(planned_qty),
+                "is_extension_round": is_extension_round,
+                "extension_round_index": max(round_index - spec.round_count, 0),
             },
             round_index=round_index,
         )
@@ -1143,9 +1512,16 @@ class SingleClosingEngine(PairedOpeningEngine):
         execution.notes["round_target_qty"] = str(target_qty)
         execution.notes["round_remaining_qty"] = str(stage_result.remaining_qty)
         execution.notes["remaining_target_qty_out"] = str(normalize_qty(remaining_target_qty - stage_result.filled_qty, rules))
+        execution.notes["residual_out"] = str(normalize_qty(remaining_target_qty - stage_result.filled_qty, rules))
+        execution.notes["residual_source"] = "unfilled_residual" if stage_result.remaining_qty > Decimal("0") else None
         session.stage2_carryover_qty = Decimal("0")
         session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
         session.final_unaligned_qty = normalize_qty(remaining_target_qty - stage_result.filled_qty, rules)
+        if session.final_unaligned_qty > Decimal("0") and stage_result.filled_qty < target_qty:
+            session.residual_source = "unfilled_residual"
+        if stage_result.stop_reason is not None:
+            fallback_source = session.residual_source or ("rounding_residual" if stage_result.stop_reason == SessionStopReason.BELOW_MIN_NOTIONAL else "unfilled_residual")
+            self._mark_single_stop(session, stage_result.stop_reason, residual_source=fallback_source)
         execution.status = RoundStatus.ROUND_COMPLETED if stage_result.filled_qty > Decimal("0") else RoundStatus.STAGE1_SKIPPED
         execution.ended_at = datetime.now(UTC)
         self._repository.upsert_round(execution)
@@ -1159,6 +1535,10 @@ class SingleClosingEngine(PairedOpeningEngine):
                 "remaining_qty": str(stage_result.remaining_qty),
                 "market_fallback_used": stage_result.market_fallback_used,
                 "selected_position_side": spec.selected_position_side.value,
+                "planned_qty": str(planned_qty),
+                "is_extension_round": is_extension_round,
+                "extension_round_index": max(round_index - spec.round_count, 0),
+                "stop_reason": stage_result.stop_reason.value if stage_result.stop_reason else None,
             },
             round_index=round_index,
         )

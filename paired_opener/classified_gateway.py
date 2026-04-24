@@ -247,6 +247,9 @@ class ClassifiedExchangeGateway(ExchangeGateway):
     async def get_quote(self, symbol: str) -> Quote:
         return await self._call("get_quote", lambda: self._delegate.get_quote(symbol), symbol=symbol)
 
+    async def refresh_quote(self, symbol: str) -> Quote:
+        return await self._call("refresh_quote", lambda: self._delegate.refresh_quote(symbol), symbol=symbol)
+
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
         return await self._call("get_order_book", lambda: self._delegate.get_order_book(symbol, limit), symbol=symbol, limit=limit)
 
@@ -258,6 +261,9 @@ class ClassifiedExchangeGateway(ExchangeGateway):
 
     async def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         return await self._call("get_open_orders", lambda: self._delegate.get_open_orders(symbol), symbol=symbol)
+
+    async def get_open_orders_strict(self, symbol: str) -> list[dict[str, Any]]:
+        return await self._call("get_open_orders_strict", lambda: self._delegate.get_open_orders_strict(symbol), symbol=symbol)
 
     async def place_limit_order(
         self,

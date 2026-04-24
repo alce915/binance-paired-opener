@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -76,6 +76,19 @@ class FinalAlignmentStatus(StrEnum):
     MARKET_ALIGNED = "market_aligned"
     FLATTENED_BOTH_SIDES = "flattened_both_sides"
     FAILED = "failed"
+
+
+class SessionStopReason(StrEnum):
+    FILLED = "filled"
+    BELOW_MIN_NOTIONAL = "below_min_notional"
+    INSUFFICIENT_BALANCE = "insufficient_balance"
+    INSUFFICIENT_POSITION = "insufficient_position"
+    PRICE_GUARD_BLOCKED = "price_guard_blocked"
+    QUOTE_STALE = "quote_stale"
+    OPEN_ORDER_CONFLICT_DETECTED = "open_order_conflict_detected"
+    TARGET_GUARD_BLOCKED = "target_guard_blocked"
+    MAX_EXTENSION_ROUNDS_REACHED = "max_extension_rounds_reached"
+    MAX_SESSION_DURATION_REACHED = "max_session_duration_reached"
 
 
 class OrderSide(StrEnum):
@@ -156,6 +169,11 @@ class SessionSpec:
     selected_position_side: PositionSide | None = None
     target_open_qty: Decimal = Decimal("0")
     target_close_qty: Decimal = Decimal("0")
+    planned_round_qtys: list[Decimal] = field(default_factory=list)
+    final_round_qty: Decimal = Decimal("0")
+    extension_round_cap_qty: Decimal = Decimal("0")
+    max_extension_rounds: int = 5
+    max_session_duration_seconds: int = 1800
 
 
 @dataclass(slots=True)
@@ -183,10 +201,27 @@ class OpenSession:
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
     completed_with_final_alignment: bool = False
+    session_deadline_at: datetime | None = None
+    extension_rounds_used: int = 0
+    remaining_extension_rounds: int = 0
+    stop_reason: SessionStopReason | None = None
+    residual_source: str | None = None
 
     @staticmethod
     def create(spec: SessionSpec, *, account_id: str = "default", account_name: str = DEFAULT_ACCOUNT_NAME) -> "OpenSession":
-        return OpenSession(session_id=str(uuid4()), spec=spec, account_id=account_id, account_name=account_name)
+        now = utc_now()
+        return OpenSession(
+            session_id=str(uuid4()),
+            spec=spec,
+            account_id=account_id,
+            account_name=account_name,
+            created_at=now,
+            updated_at=now,
+            session_deadline_at=now + timedelta(seconds=max(int(spec.max_session_duration_seconds or 0), 0))
+            if int(spec.max_session_duration_seconds or 0) > 0
+            else None,
+            remaining_extension_rounds=max(int(spec.max_extension_rounds or 0), 0),
+        )
 
 
 @dataclass(slots=True)

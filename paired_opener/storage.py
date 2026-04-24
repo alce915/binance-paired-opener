@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME, redact_debug_text
-from paired_opener.domain import OpenSession, RecoveryStatus, RoundExecution, SessionStatus
+from paired_opener.domain import OpenSession, RecoveryStatus, RoundExecution, SessionStatus, SessionStopReason
 
 
 def _json_dumps(payload: dict[str, Any]) -> str:
@@ -25,11 +25,11 @@ def _json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, default=encode, ensure_ascii=True, sort_keys=True)
 
 
-def _json_loads(payload: str) -> dict[str, Any]:
+def _json_load(payload: str, default: Any) -> Any:
     try:
-        return json.loads(payload) if payload else {}
+        return json.loads(payload) if payload else default
     except json.JSONDecodeError:
-        return {}
+        return default
 
 
 class SqliteRepository:
@@ -79,6 +79,11 @@ class SqliteRepository:
                     selected_position_side TEXT,
                     target_open_qty TEXT NOT NULL DEFAULT '0',
                     target_close_qty TEXT NOT NULL DEFAULT '0',
+                    planned_round_qtys_json TEXT NOT NULL DEFAULT '[]',
+                    final_round_qty TEXT NOT NULL DEFAULT '0',
+                    extension_round_cap_qty TEXT NOT NULL DEFAULT '0',
+                    max_extension_rounds INTEGER NOT NULL DEFAULT 5,
+                    max_session_duration_seconds INTEGER NOT NULL DEFAULT 1800,
                     created_by TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -98,7 +103,12 @@ class SqliteRepository:
                     stage2_carryover_qty TEXT NOT NULL DEFAULT '0',
                     final_alignment_status TEXT NOT NULL DEFAULT 'not_needed',
                     final_unaligned_qty TEXT NOT NULL DEFAULT '0',
-                    completed_with_final_alignment INTEGER NOT NULL DEFAULT 0
+                    completed_with_final_alignment INTEGER NOT NULL DEFAULT 0,
+                    session_deadline_at TEXT,
+                    extension_rounds_used INTEGER NOT NULL DEFAULT 0,
+                    remaining_extension_rounds INTEGER NOT NULL DEFAULT 0,
+                    stop_reason TEXT,
+                    residual_source TEXT
                 );
                 CREATE TABLE IF NOT EXISTS rounds (
                     session_id TEXT NOT NULL,
@@ -139,10 +149,20 @@ class SqliteRepository:
             self._ensure_column("sessions", "selected_position_side", "TEXT")
             self._ensure_column("sessions", "target_open_qty", "TEXT NOT NULL DEFAULT '0'")
             self._ensure_column("sessions", "target_close_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "planned_round_qtys_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column("sessions", "final_round_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "extension_round_cap_qty", "TEXT NOT NULL DEFAULT '0'")
+            self._ensure_column("sessions", "max_extension_rounds", "INTEGER NOT NULL DEFAULT 5")
+            self._ensure_column("sessions", "max_session_duration_seconds", "INTEGER NOT NULL DEFAULT 1800")
             self._ensure_column("sessions", "stage2_carryover_qty", "TEXT NOT NULL DEFAULT '0'")
             self._ensure_column("sessions", "final_alignment_status", "TEXT NOT NULL DEFAULT 'not_needed'")
             self._ensure_column("sessions", "final_unaligned_qty", "TEXT NOT NULL DEFAULT '0'")
             self._ensure_column("sessions", "completed_with_final_alignment", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("sessions", "session_deadline_at", "TEXT")
+            self._ensure_column("sessions", "extension_rounds_used", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("sessions", "remaining_extension_rounds", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("sessions", "stop_reason", "TEXT")
+            self._ensure_column("sessions", "residual_source", "TEXT")
             self._ensure_column("sessions", "last_error_category", "TEXT")
             self._ensure_column("sessions", "last_error_strategy", "TEXT")
             self._ensure_column("sessions", "last_error_code", "TEXT")
@@ -174,11 +194,14 @@ class SqliteRepository:
                     poll_interval_ms, order_ttl_ms, max_zero_fill_retries, market_fallback_attempts,
                     execution_profile, market_fallback_max_ratio, market_fallback_min_residual_qty,
                     max_reprice_ticks, max_spread_bps, max_reference_deviation_bps,
-                    round_interval_seconds, open_mode, close_mode, selected_position_side, target_open_qty, target_close_qty, created_by, status, created_at, updated_at, last_error,
+                    round_interval_seconds, open_mode, close_mode, selected_position_side, target_open_qty, target_close_qty,
+                    planned_round_qtys_json, final_round_qty, extension_round_cap_qty, max_extension_rounds, max_session_duration_seconds,
+                    created_by, status, created_at, updated_at, last_error,
                     last_error_category, last_error_strategy, last_error_code, last_error_operator_action,
                     last_error_params_json, last_error_raw_message, last_error_contract_version,
-                    stage2_carryover_qty, final_alignment_status, final_unaligned_qty, completed_with_final_alignment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stage2_carryover_qty, final_alignment_status, final_unaligned_qty, completed_with_final_alignment,
+                    session_deadline_at, extension_rounds_used, remaining_extension_rounds, stop_reason, residual_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.session_id,
@@ -206,6 +229,11 @@ class SqliteRepository:
                     session.spec.selected_position_side.value if session.spec.selected_position_side else None,
                     str(session.spec.target_open_qty),
                     str(session.spec.target_close_qty),
+                    json.dumps([str(item) for item in session.spec.planned_round_qtys], ensure_ascii=True),
+                    str(session.spec.final_round_qty),
+                    str(session.spec.extension_round_cap_qty),
+                    int(session.spec.max_extension_rounds),
+                    int(session.spec.max_session_duration_seconds),
                     session.spec.created_by,
                     session.status.value,
                     session.created_at.isoformat(),
@@ -222,6 +250,11 @@ class SqliteRepository:
                     session.final_alignment_status.value,
                     str(session.final_unaligned_qty),
                     int(session.completed_with_final_alignment),
+                    session.session_deadline_at.isoformat() if session.session_deadline_at else None,
+                    int(session.extension_rounds_used),
+                    int(session.remaining_extension_rounds),
+                    session.stop_reason.value if isinstance(session.stop_reason, SessionStopReason) else session.stop_reason,
+                    session.residual_source,
                 ),
             )
 
@@ -349,7 +382,12 @@ class SqliteRepository:
                     stage2_carryover_qty = ?,
                     final_alignment_status = ?,
                     final_unaligned_qty = ?,
-                    completed_with_final_alignment = ?
+                    completed_with_final_alignment = ?,
+                    session_deadline_at = ?,
+                    extension_rounds_used = ?,
+                    remaining_extension_rounds = ?,
+                    stop_reason = ?,
+                    residual_source = ?
                 WHERE session_id = ?
                 """,
                 (
@@ -358,6 +396,11 @@ class SqliteRepository:
                     session.final_alignment_status.value,
                     str(session.final_unaligned_qty),
                     int(session.completed_with_final_alignment),
+                    session.session_deadline_at.isoformat() if session.session_deadline_at else None,
+                    int(session.extension_rounds_used),
+                    int(session.remaining_extension_rounds),
+                    session.stop_reason.value if isinstance(session.stop_reason, SessionStopReason) else session.stop_reason,
+                    session.residual_source,
                     session.session_id,
                 ),
             )
@@ -626,24 +669,28 @@ class SqliteRepository:
 
     def _deserialize_round_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
-        payload["notes"] = _json_loads(payload.pop("notes_json", "{}"))
+        payload["notes"] = _json_load(payload.pop("notes_json", "{}"), {})
         payload["market_fallback_used"] = bool(payload.get("market_fallback_used"))
         return payload
 
     def _deserialize_event_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
-        payload["payload"] = _json_loads(payload.pop("payload_json", "{}"))
+        payload["payload"] = _json_load(payload.pop("payload_json", "{}"), {})
         return payload
 
     def _deserialize_session_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["completed_with_final_alignment"] = bool(payload.get("completed_with_final_alignment"))
-        payload["last_error_params"] = _json_loads(payload.pop("last_error_params_json", "{}"))
+        payload["last_error_params"] = _json_load(payload.pop("last_error_params_json", "{}"), {})
         recovery_status = payload.get("recovery_status")
         if recovery_status:
             payload["recovery_status"] = RecoveryStatus(recovery_status)
-        details_payload = _json_loads(payload.pop("recovery_details_json", "{}"))
+        details_payload = _json_load(payload.pop("recovery_details_json", "{}"), {})
         payload["recovery_details"] = details_payload
+        payload["planned_round_qtys"] = _json_load(payload.pop("planned_round_qtys_json", "[]"), [])
+        stop_reason = payload.get("stop_reason")
+        if stop_reason:
+            payload["stop_reason"] = SessionStopReason(stop_reason)
         return payload
 
 

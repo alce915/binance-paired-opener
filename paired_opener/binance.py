@@ -288,10 +288,12 @@ class BinanceFuturesGateway(ExchangeGateway):
                 async with websockets.connect(stream, ping_interval=20, ping_timeout=20) as websocket:
                     async for message in websocket:
                         payload = json.loads(message)
+                        event_timestamp = payload.get("E")
                         self._quote_cache[symbol] = Quote(
                             symbol=symbol,
                             bid_price=Decimal(payload["b"]),
                             ask_price=Decimal(payload["a"]),
+                            event_time=datetime.fromtimestamp(event_timestamp / 1000, tz=UTC) if event_timestamp else datetime.now(UTC),
                         )
             except asyncio.CancelledError:
                 raise
@@ -304,8 +306,19 @@ class BinanceFuturesGateway(ExchangeGateway):
         quote = self._quote_cache.get(symbol)
         if quote is not None:
             return quote
-        payload = await self._public_request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
-        return Quote(symbol=symbol, bid_price=Decimal(payload["bidPrice"]), ask_price=Decimal(payload["askPrice"]))
+        return await self.refresh_quote(symbol)
+
+    async def refresh_quote(self, symbol: str) -> Quote:
+        target = symbol.upper()
+        payload = await self._public_request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": target})
+        quote = Quote(
+            symbol=target,
+            bid_price=Decimal(payload["bidPrice"]),
+            ask_price=Decimal(payload["askPrice"]),
+            event_time=datetime.now(UTC),
+        )
+        self._quote_cache[target] = quote
+        return quote
 
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
         normalized_symbol = symbol.upper()
@@ -355,6 +368,16 @@ class BinanceFuturesGateway(ExchangeGateway):
         if not isinstance(payload, list):
             return []
         orders = [item for item in payload if isinstance(item, dict)]
+        self._open_orders_cache[target] = (self._monotonic(), orders)
+        return list(orders)
+
+    async def get_open_orders_strict(self, symbol: str) -> list[dict[str, Any]]:
+        target = symbol.upper()
+        payload = await self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": target})
+        if not isinstance(payload, list):
+            orders: list[dict[str, Any]] = []
+        else:
+            orders = [item for item in payload if isinstance(item, dict)]
         self._open_orders_cache[target] = (self._monotonic(), orders)
         return list(orders)
 

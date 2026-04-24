@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME
-from paired_opener.domain import ExecutionProfile, FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SingleCloseMode, SingleOpenMode, TrendBias
+from paired_opener.domain import ExecutionProfile, FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SessionStopReason, SingleCloseMode, SingleOpenMode, TrendBias
 
 
 class ExecutionPolicyFields(BaseModel):
@@ -152,6 +152,11 @@ class SessionSummary(BaseModel):
     selected_position_side: PositionSide | None = None
     target_open_qty: Decimal = Decimal("0")
     target_close_qty: Decimal = Decimal("0")
+    planned_round_qtys: list[Decimal] = Field(default_factory=list)
+    final_round_qty: Decimal = Decimal("0")
+    extension_round_cap_qty: Decimal = Decimal("0")
+    max_extension_rounds: int = 5
+    max_session_duration_seconds: int = 1800
     execution_profile: ExecutionProfile = ExecutionProfile.BALANCED
     market_fallback_max_ratio: Decimal = Decimal("1")
     market_fallback_min_residual_qty: Decimal = Decimal("0")
@@ -174,6 +179,11 @@ class SessionSummary(BaseModel):
     stage2_carryover_qty: Decimal = Decimal("0")
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
+    session_deadline_at: datetime | None = None
+    extension_rounds_used: int = 0
+    remaining_extension_rounds: int = 0
+    stop_reason: SessionStopReason | None = None
+    residual_source: str | None = None
 
 
 class SessionDetail(BaseModel):
@@ -191,6 +201,11 @@ class SessionDetail(BaseModel):
     selected_position_side: PositionSide | None = None
     target_open_qty: Decimal = Decimal("0")
     target_close_qty: Decimal = Decimal("0")
+    planned_round_qtys: list[Decimal] = Field(default_factory=list)
+    final_round_qty: Decimal = Decimal("0")
+    extension_round_cap_qty: Decimal = Decimal("0")
+    max_extension_rounds: int = 5
+    max_session_duration_seconds: int = 1800
     poll_interval_ms: int
     order_ttl_ms: int
     max_zero_fill_retries: int
@@ -219,6 +234,11 @@ class SessionDetail(BaseModel):
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
     completed_with_final_alignment: bool = False
+    session_deadline_at: datetime | None = None
+    extension_rounds_used: int = 0
+    remaining_extension_rounds: int = 0
+    stop_reason: SessionStopReason | None = None
+    residual_source: str | None = None
     rounds: list[dict[str, Any]]
     events: list[dict[str, Any]]
 

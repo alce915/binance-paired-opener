@@ -26,6 +26,10 @@ repo-name-overrides.json
 # <<< codex git-sync <<<
 config/binance_api.local.env
 .codex-runtime/
-
-
+.codex-submit-*/
+pytest-cache-files-*/
+tmp_pytest*/
+tmp_direct_verify/
+tmp_storage_check/
+data/pytest-temp/
 

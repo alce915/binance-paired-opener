@@ -32,6 +32,9 @@ class ExchangeGateway(ABC):
     async def get_quote(self, symbol: str) -> Quote:
         raise NotImplementedError
 
+    async def refresh_quote(self, symbol: str) -> Quote:
+        return await self.get_quote(symbol)
+
     @abstractmethod
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
         raise NotImplementedError
@@ -47,6 +50,9 @@ class ExchangeGateway(ABC):
     @abstractmethod
     async def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+    async def get_open_orders_strict(self, symbol: str) -> list[dict[str, Any]]:
+        return await self.get_open_orders(symbol)
 
     @abstractmethod
     async def place_limit_order(
