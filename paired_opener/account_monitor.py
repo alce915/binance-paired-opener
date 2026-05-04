@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Callable, Protocol
 
+from app_i18n.runtime import CATALOG_VERSION, CONTRACT_VERSION, format_copy
 from paired_opener.binance import BinanceFuturesGateway
 from paired_opener.config import AccountConfig, Settings
 
@@ -33,7 +34,7 @@ class AccountMonitorController:
         self._subscriptions: dict[asyncio.Queue[dict[str, Any]], set[str] | None] = {}
         self._lock = asyncio.Lock()
         self._refresh_task: asyncio.Task[None] | None = None
-        self._last_payload = self._build_idle_payload("idle", "等待监控连接")
+        self._last_payload = self._build_idle_payload("idle", "runtime.monitor_waiting_connection")
 
     def _utc_now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -48,6 +49,22 @@ class AccountMonitorController:
         if isinstance(payload, list):
             return [self._normalize(value) for value in payload]
         return payload
+
+    def _message_fields(
+        self,
+        message_code: str,
+        message_params: dict[str, Any] | None = None,
+        *,
+        fallback_message: str | None = None,
+    ) -> dict[str, Any]:
+        params = dict(message_params or {})
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "catalog_version": CATALOG_VERSION,
+            "message_code": message_code,
+            "message_params": params,
+            "message": fallback_message or format_copy(message_code, params),
+        }
 
     def current_snapshot(self, account_ids: list[str] | None = None) -> dict[str, Any]:
         normalized_ids = self._normalize_account_ids(account_ids)
@@ -94,15 +111,18 @@ class AccountMonitorController:
                 await asyncio.sleep(interval_seconds)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                self._last_payload = self._build_idle_payload("error", str(exc))
+            except Exception:
+                self._last_payload = self._build_idle_payload(
+                    "error",
+                    "runtime.monitor_refresh_failed",
+                )
                 await self._broadcast(self._last_payload)
                 await asyncio.sleep(interval_seconds)
 
     async def _refresh_once(self) -> None:
         accounts = list(self._settings.accounts.values())
         if not accounts:
-            payload = self._build_idle_payload("error", "未配置可监控的币安账户")
+            payload = self._build_idle_payload("error", "runtime.monitor_accounts_missing")
         else:
             snapshots = await asyncio.gather(*(self._fetch_account_snapshot(account) for account in accounts))
             payload = self._build_payload(snapshots)
@@ -118,18 +138,24 @@ class AccountMonitorController:
             snapshot = await gateway.get_unified_account_snapshot(
                 history_window_days=self._settings.monitor_history_window_days,
             )
+            snapshot.setdefault("contract_version", CONTRACT_VERSION)
+            snapshot.setdefault("catalog_version", CATALOG_VERSION)
             snapshot.setdefault("account_id", account.account_id)
             snapshot.setdefault("account_name", account.name)
-            snapshot.setdefault("message", "账户监控数据已更新")
+            snapshot.setdefault("message_code", "runtime.account_snapshot_updated")
+            snapshot.setdefault("message_params", {})
+            snapshot.setdefault("message", format_copy("runtime.account_snapshot_updated"))
             return snapshot
-        except Exception as exc:
+        except Exception:
             return {
+                "contract_version": CONTRACT_VERSION,
+                "catalog_version": CATALOG_VERSION,
                 "status": "error",
                 "source": "papi",
                 "account_id": account.account_id,
                 "account_name": account.name,
                 "updated_at": datetime.now(UTC),
-                "message": str(exc),
+                **self._message_fields("runtime.monitor_account_refresh_failed"),
                 "totals": {
                     "equity": Decimal("0"),
                     "margin": Decimal("0"),
@@ -184,10 +210,12 @@ class AccountMonitorController:
             if str(account.get("account_id", "")).lower() in account_ids
         ]
         summary = self._summarize_accounts(filtered_accounts)
-        status, message = self._status_and_message(summary)
+        status, message_code, message = self._status_and_message(summary)
         return {
             **payload,
             "status": status,
+            "message_code": message_code,
+            "message_params": {},
             "message": message,
             "accounts": filtered_accounts,
             "requested_account_ids": sorted(account_ids),
@@ -196,10 +224,14 @@ class AccountMonitorController:
 
     def _build_payload(self, accounts: list[dict[str, Any]]) -> dict[str, Any]:
         summary = self._summarize_accounts(accounts)
-        status, message = self._status_and_message(summary)
+        status, message_code, message = self._status_and_message(summary)
         return {
+            "contract_version": CONTRACT_VERSION,
+            "catalog_version": CATALOG_VERSION,
             "status": status,
             "updated_at": self._utc_now(),
+            "message_code": message_code,
+            "message_params": {},
             "message": message,
             "service": {
                 "refresh_interval_ms": self._settings.monitor_refresh_interval_ms,
@@ -210,11 +242,16 @@ class AccountMonitorController:
             "accounts": accounts,
         }
 
-    def _build_idle_payload(self, status: str, message: str) -> dict[str, Any]:
+    def _build_idle_payload(
+        self,
+        status: str,
+        message_code: str,
+        message_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {
             "status": status,
             "updated_at": self._utc_now(),
-            "message": message,
+            **self._message_fields(message_code, message_params),
             "service": {
                 "refresh_interval_ms": self._settings.monitor_refresh_interval_ms,
                 "history_window_days": self._settings.monitor_history_window_days,
@@ -224,14 +261,14 @@ class AccountMonitorController:
             "accounts": [],
         }
 
-    def _status_and_message(self, summary: dict[str, Any]) -> tuple[str, str]:
+    def _status_and_message(self, summary: dict[str, Any]) -> tuple[str, str, str]:
         if summary["account_count"] == 0:
-            return "idle", "暂无账户数据"
+            return "idle", "runtime.monitor_no_accounts", format_copy("runtime.monitor_no_accounts")
         if summary["error_count"] == 0:
-            return "ok", "全部账户监控正常"
+            return "ok", "runtime.monitor_all_healthy", format_copy("runtime.monitor_all_healthy")
         if summary["success_count"] == 0:
-            return "error", "全部账户获取失败"
-        return "partial", "部分账户获取失败"
+            return "error", "runtime.monitor_all_failed", format_copy("runtime.monitor_all_failed")
+        return "partial", "runtime.monitor_partial_failed", format_copy("runtime.monitor_partial_failed")
 
     def _summarize_accounts(self, accounts: list[dict[str, Any]]) -> dict[str, Any]:
         totals = {

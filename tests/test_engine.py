@@ -1,14 +1,16 @@
 ﻿from __future__ import annotations
 
+import asyncio
 from collections import deque
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from paired_opener.domain import (
+    ExecutionProfile,
     ExchangeOrder,
     ExchangeOrderStatus,
     FinalAlignmentStatus,
@@ -16,11 +18,13 @@ from paired_opener.domain import (
     OrderSide,
     PositionSide,
     Quote,
+    RoundStatus,
+    SessionKind,
     SessionSpec,
     SymbolRules,
     TrendBias,
 )
-from paired_opener.engine import PairedOpeningEngine, SessionControl
+from paired_opener.engine import PairedOpeningEngine, SessionControl, SingleClosingEngine, SingleOpeningEngine
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.storage import SqliteRepository
 
@@ -57,14 +61,27 @@ class FakeGateway(ExchangeGateway):
         limit_scripts: list[ScriptedOrder],
         market_scripts: list[ScriptedOrder] | None = None,
         account_overviews: list[dict] | None = None,
+        open_orders_sequence: list[list[dict[str, object]]] | None = None,
+        open_orders_error: Exception | None = None,
+        refresh_quote: Quote | None = None,
+        stream_healthy: bool | None = None,
     ) -> None:
         self.rules = rules
         self.quote = quote
         self.limit_scripts = deque(limit_scripts)
         self.market_scripts = deque(market_scripts or [])
         self.account_overviews = deque(account_overviews or [])
+        self.open_orders_sequence = deque(open_orders_sequence or [])
+        self.open_orders_error = open_orders_error
+        self.refresh_quote_value = refresh_quote
         self.orders: dict[str, ScriptedOrder] = {}
+        self.limit_order_requests: list[dict[str, object]] = []
         self.market_order_requests: list[dict[str, object]] = []
+        self.cached_orders: dict[str, ExchangeOrder] = {}
+        self.get_order_calls = 0
+        self.refresh_quote_calls = 0
+        self.strict_open_order_calls = 0
+        self.stream_healthy = stream_healthy
 
     async def ensure_hedge_mode(self) -> None:
         return None
@@ -84,6 +101,10 @@ class FakeGateway(ExchangeGateway):
     async def get_quote(self, symbol: str) -> Quote:
         return self.quote
 
+    async def refresh_quote(self, symbol: str) -> Quote:
+        self.refresh_quote_calls += 1
+        return self.refresh_quote_value or self.quote
+
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict:
         return {
             "symbol": symbol,
@@ -96,7 +117,17 @@ class FakeGateway(ExchangeGateway):
         return 50
 
     async def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
-        return []
+        if not self.open_orders_sequence:
+            return []
+        if len(self.open_orders_sequence) == 1:
+            return list(self.open_orders_sequence[0])
+        return list(self.open_orders_sequence.popleft())
+
+    async def get_open_orders_strict(self, symbol: str) -> list[dict[str, object]]:
+        self.strict_open_order_calls += 1
+        if self.open_orders_error is not None:
+            raise self.open_orders_error
+        return await self.get_open_orders(symbol)
 
     async def get_account_overview(self) -> dict:
         if not self.account_overviews:
@@ -127,6 +158,16 @@ class FakeGateway(ExchangeGateway):
         price: Decimal,
         client_order_id: str,
     ) -> ExchangeOrder:
+        self.limit_order_requests.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "position_side": position_side,
+                "qty": qty,
+                "price": price,
+                "client_order_id": client_order_id,
+            }
+        )
         script = self.limit_scripts.popleft()
         order = script.snapshots[0]
         self.orders[order.order_id] = script
@@ -156,11 +197,20 @@ class FakeGateway(ExchangeGateway):
         return order
 
     async def get_order(self, *, symbol: str, order_id: str) -> ExchangeOrder:
+        self.get_order_calls += 1
         return self.orders[order_id].next_snapshot()
 
     async def cancel_order(self, *, symbol: str, order_id: str) -> ExchangeOrder:
         script = self.orders[order_id]
         return script.cancel_snapshot or script.next_snapshot()
+
+    def get_cached_order(self, symbol: str, order_id: str) -> ExchangeOrder | None:
+        return self.cached_orders.get(order_id)
+
+    def is_order_stream_healthy(self) -> bool:
+        if self.stream_healthy is not None:
+            return self.stream_healthy
+        return bool(self.cached_orders)
 
 
 def make_order(
@@ -200,6 +250,7 @@ def build_session(*, round_count: int = 1) -> OpenSession:
             order_ttl_ms=3000,
             max_zero_fill_retries=2,
             market_fallback_attempts=2,
+            execution_profile=ExecutionProfile.BALANCED,
             created_by="test",
         )
     )
@@ -394,6 +445,752 @@ async def test_final_alignment_reduces_both_sides_to_match(tmp_path: Path) -> No
     assert session.final_alignment_status == FinalAlignmentStatus.MARKET_ALIGNED
     assert session.completed_with_final_alignment is True
     assert session.final_unaligned_qty == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_single_open_market_fallback_respects_ratio_and_leaves_residual(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=[
+            ScriptedOrder(
+                snapshots=[make_order("so1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.010", executed_qty="0.000", status=ExchangeOrderStatus.NEW)],
+                cancel_snapshot=make_order("so1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.010", executed_qty="0.000", status=ExchangeOrderStatus.CANCELED),
+            ),
+        ],
+        market_scripts=[
+            ScriptedOrder(snapshots=[make_order("som1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.002", executed_qty="0.002", status=ExchangeOrderStatus.FILLED)]),
+        ],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.010"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    execution = await engine.execute_round(session=session, round_index=1, control=SessionControl())
+
+    assert execution.market_fallback_used is True
+    assert execution.stage1_filled_qty == Decimal("0.002")
+    assert Decimal(execution.notes["round_remaining_qty"]) == Decimal("0.008")
+    assert session.final_unaligned_qty == Decimal("0.008")
+    assert gateway.market_order_requests[0]["qty"] == Decimal("0.002")
+
+
+@pytest.mark.asyncio
+async def test_single_open_price_guard_blocks_before_order_placement(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("100"), ask_price=Decimal("102")),
+        limit_scripts=[],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.100"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=5,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.100"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    execution = await engine.execute_round(session=session, round_index=1, control=SessionControl())
+    payload = repo.get_session(session.session_id)
+
+    assert execution.stage1_filled_qty == Decimal("0")
+    assert execution.status == RoundStatus.STAGE1_SKIPPED
+    assert session.final_unaligned_qty == Decimal("0.100")
+    assert gateway.orders == {}
+    assert any(event["event_type"] == "price_guard_blocked" for event in payload["events"])
+
+
+@pytest.mark.asyncio
+async def test_single_open_regular_rounds_use_planned_final_round_qty(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=[
+            ScriptedOrder(snapshots=[make_order("p1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.003", status=ExchangeOrderStatus.FILLED)]),
+            ScriptedOrder(snapshots=[make_order("p2", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.003", status=ExchangeOrderStatus.FILLED)]),
+            ScriptedOrder(snapshots=[make_order("p3", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.004", executed_qty="0.004", status=ExchangeOrderStatus.FILLED)]),
+        ],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=3,
+            round_qty=Decimal("0.003"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+
+    assert completed_rounds == 3
+    assert skipped_rounds == 0
+    assert [request["qty"] for request in gateway.limit_order_requests] == [
+        Decimal("0.003"),
+        Decimal("0.003"),
+        Decimal("0.004"),
+    ]
+    assert session.final_unaligned_qty == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_single_open_keeps_regular_rounds_fixed_then_uses_extension_round(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=[
+            ScriptedOrder(
+                snapshots=[make_order("e1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.002", status=ExchangeOrderStatus.PARTIALLY_FILLED)],
+                cancel_snapshot=make_order("e1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.002", status=ExchangeOrderStatus.CANCELED),
+            ),
+            ScriptedOrder(snapshots=[make_order("e2", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.003", status=ExchangeOrderStatus.FILLED)]),
+            ScriptedOrder(snapshots=[make_order("e3", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.004", executed_qty="0.004", status=ExchangeOrderStatus.FILLED)]),
+            ScriptedOrder(snapshots=[make_order("e4", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.001", executed_qty="0.001", status=ExchangeOrderStatus.FILLED)]),
+        ],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=3,
+            round_qty=Decimal("0.003"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+    rounds = repo.list_rounds(session.session_id)
+
+    assert completed_rounds == 4
+    assert skipped_rounds == 0
+    assert [request["qty"] for request in gateway.limit_order_requests] == [
+        Decimal("0.003"),
+        Decimal("0.003"),
+        Decimal("0.004"),
+        Decimal("0.001"),
+    ]
+    assert rounds[0]["notes"]["round_remaining_qty"] == "0.001"
+    assert session.final_unaligned_qty == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_single_open_marks_max_extension_rounds_reached_after_last_extension_residual(tmp_path: Path) -> None:
+    partial_scripts = [
+        ScriptedOrder(
+            snapshots=[
+                make_order(
+                    f"open-max-ext-{index}",
+                    side=OrderSide.BUY,
+                    position_side=PositionSide.LONG,
+                    qty="0.002",
+                    executed_qty="0.001",
+                    status=ExchangeOrderStatus.PARTIALLY_FILLED,
+                )
+            ],
+            cancel_snapshot=make_order(
+                f"open-max-ext-{index}",
+                side=OrderSide.BUY,
+                position_side=PositionSide.LONG,
+                qty="0.002",
+                executed_qty="0.001",
+                status=ExchangeOrderStatus.CANCELED,
+            ),
+        )
+        for index in range(1, 7)
+    ]
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=partial_scripts,
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.002"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.012"),
+            planned_round_qtys=[Decimal("0.002")],
+            extension_round_cap_qty=Decimal("0.002"),
+            max_extension_rounds=5,
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+
+    assert completed_rounds == 6
+    assert skipped_rounds == 0
+    assert len(gateway.limit_order_requests) == 6
+    assert session.remaining_extension_rounds == 0
+    assert session.final_unaligned_qty == Decimal("0.006")
+    assert session.stop_reason.value == "max_extension_rounds_reached"
+
+
+@pytest.mark.asyncio
+async def test_single_close_marks_max_extension_rounds_reached_after_last_extension_residual(tmp_path: Path) -> None:
+    partial_scripts = [
+        ScriptedOrder(
+            snapshots=[
+                make_order(
+                    f"close-max-ext-{index}",
+                    side=OrderSide.SELL,
+                    position_side=PositionSide.LONG,
+                    qty="0.002",
+                    executed_qty="0.001",
+                    status=ExchangeOrderStatus.PARTIALLY_FILLED,
+                )
+            ],
+            cancel_snapshot=make_order(
+                f"close-max-ext-{index}",
+                side=OrderSide.SELL,
+                position_side=PositionSide.LONG,
+                qty="0.002",
+                executed_qty="0.001",
+                status=ExchangeOrderStatus.CANCELED,
+            ),
+        )
+        for index in range(1, 7)
+    ]
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=partial_scripts,
+        account_overviews=[
+            [
+                {"symbol": "BTCUSDT", "position_side": PositionSide.LONG.value, "qty": Decimal("0.012")},
+            ]
+        ],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleClosingEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=1,
+            round_count=1,
+            round_qty=Decimal("0.002"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.BALANCED,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_close_qty=Decimal("0.012"),
+            planned_round_qtys=[Decimal("0.002")],
+            extension_round_cap_qty=Decimal("0.002"),
+            max_extension_rounds=5,
+            session_kind=SessionKind.SINGLE_CLOSE,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+
+    assert completed_rounds == 6
+    assert skipped_rounds == 0
+    assert len(gateway.limit_order_requests) == 6
+    assert session.remaining_extension_rounds == 0
+    assert session.final_unaligned_qty == Decimal("0.006")
+    assert session.stop_reason.value == "max_extension_rounds_reached"
+
+
+@pytest.mark.asyncio
+async def test_single_open_stops_when_quote_stays_stale(tmp_path: Path) -> None:
+    stale_quote = Quote(
+        symbol="BTCUSDT",
+        bid_price=Decimal("96500"),
+        ask_price=Decimal("96501"),
+        event_time=datetime.now(UTC) - timedelta(seconds=15),
+    )
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=stale_quote,
+        limit_scripts=[],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.010"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+
+    assert completed_rounds == 0
+    assert skipped_rounds == 1
+    assert gateway.limit_order_requests == []
+    assert session.stop_reason.value == "quote_stale"
+    assert session.final_unaligned_qty == Decimal("0.010")
+
+
+@pytest.mark.asyncio
+async def test_single_open_refreshes_stale_quote_once_before_ordering(tmp_path: Path) -> None:
+    stale_quote = Quote(
+        symbol="BTCUSDT",
+        bid_price=Decimal("96500"),
+        ask_price=Decimal("96501"),
+        event_time=datetime.now(UTC) - timedelta(seconds=15),
+    )
+    fresh_quote = Quote(
+        symbol="BTCUSDT",
+        bid_price=Decimal("96510"),
+        ask_price=Decimal("96511"),
+        event_time=datetime.now(UTC),
+    )
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=stale_quote,
+        refresh_quote=fresh_quote,
+        limit_scripts=[
+            ScriptedOrder(snapshots=[make_order("fresh-1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.010", executed_qty="0.010", status=ExchangeOrderStatus.FILLED, price="96510")]),
+        ],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.010"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+
+    assert completed_rounds == 1
+    assert skipped_rounds == 0
+    assert gateway.refresh_quote_calls == 1
+    assert gateway.limit_order_requests[0]["price"] == Decimal("96510")
+    assert session.stop_reason.value == "filled"
+    assert session.final_unaligned_qty == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_single_open_extension_stops_on_manual_open_order_conflict(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=[
+            ScriptedOrder(
+                snapshots=[make_order("c1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.002", status=ExchangeOrderStatus.PARTIALLY_FILLED)],
+                cancel_snapshot=make_order("c1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.002", status=ExchangeOrderStatus.CANCELED),
+            ),
+            ScriptedOrder(snapshots=[make_order("c2", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.003", status=ExchangeOrderStatus.FILLED)]),
+            ScriptedOrder(snapshots=[make_order("c3", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.004", executed_qty="0.004", status=ExchangeOrderStatus.FILLED)]),
+        ],
+        open_orders_sequence=[
+            [{"orderId": "manual-1", "clientOrderId": "manual-order", "status": "NEW"}],
+        ],
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=3,
+            round_qty=Decimal("0.003"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+
+    assert completed_rounds == 3
+    assert skipped_rounds == 0
+    assert [request["qty"] for request in gateway.limit_order_requests] == [
+        Decimal("0.003"),
+        Decimal("0.003"),
+        Decimal("0.004"),
+    ]
+    assert session.stop_reason.value == "open_order_conflict_detected"
+    assert session.final_unaligned_qty == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_single_open_extension_stops_when_open_order_check_fails(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=[
+            ScriptedOrder(
+                snapshots=[make_order("c1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.002", status=ExchangeOrderStatus.PARTIALLY_FILLED)],
+                cancel_snapshot=make_order("c1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.002", status=ExchangeOrderStatus.CANCELED),
+            ),
+            ScriptedOrder(snapshots=[make_order("c2", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.003", executed_qty="0.003", status=ExchangeOrderStatus.FILLED)]),
+            ScriptedOrder(snapshots=[make_order("c3", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.004", executed_qty="0.004", status=ExchangeOrderStatus.FILLED)]),
+            ScriptedOrder(snapshots=[make_order("extension-1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.001", executed_qty="0.001", status=ExchangeOrderStatus.FILLED)]),
+        ],
+        open_orders_error=RuntimeError("open orders unavailable"),
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = SingleOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = OpenSession.create(
+        SessionSpec(
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=3,
+            round_qty=Decimal("0.003"),
+            poll_interval_ms=50,
+            order_ttl_ms=3000,
+            max_zero_fill_retries=1,
+            market_fallback_attempts=1,
+            execution_profile=ExecutionProfile.MAKER_FIRST,
+            market_fallback_max_ratio=Decimal("0.25"),
+            market_fallback_min_residual_qty=Decimal("0"),
+            max_reprice_ticks=3,
+            max_spread_bps=8,
+            max_reference_deviation_bps=15,
+            selected_position_side=PositionSide.LONG,
+            target_open_qty=Decimal("0.010"),
+            planned_round_qtys=[Decimal("0.003"), Decimal("0.003"), Decimal("0.004")],
+            extension_round_cap_qty=Decimal("0.004"),
+            session_kind=SessionKind.SINGLE_OPEN,
+            created_by="test",
+        )
+    )
+    repo.create_session(session)
+
+    completed_rounds, skipped_rounds = await engine.execute_session(session, SessionControl())
+
+    assert completed_rounds == 3
+    assert skipped_rounds == 0
+    assert gateway.strict_open_order_calls == 1
+    assert [request["qty"] for request in gateway.limit_order_requests] == [
+        Decimal("0.003"),
+        Decimal("0.003"),
+        Decimal("0.004"),
+    ]
+    assert session.stop_reason.value == "open_order_conflict_detected"
+    assert session.final_unaligned_qty == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_observe_order_prefers_cached_user_stream_state(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=[
+            ScriptedOrder(
+                snapshots=[make_order("cache-1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.010", executed_qty="0.000", status=ExchangeOrderStatus.NEW)],
+                cancel_snapshot=make_order("cache-1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.010", executed_qty="0.010", status=ExchangeOrderStatus.FILLED),
+            ),
+            ScriptedOrder(
+                snapshots=[make_order("cache-2", side=OrderSide.SELL, position_side=PositionSide.SHORT, qty="0.010", executed_qty="0.010", status=ExchangeOrderStatus.FILLED, price="96501")],
+            ),
+        ],
+    )
+    gateway.cached_orders["cache-1"] = make_order(
+        "cache-1",
+        side=OrderSide.BUY,
+        position_side=PositionSide.LONG,
+        qty="0.010",
+        executed_qty="0.010",
+        status=ExchangeOrderStatus.FILLED,
+    )
+    gateway.cached_orders["cache-2"] = make_order(
+        "cache-2",
+        side=OrderSide.SELL,
+        position_side=PositionSide.SHORT,
+        qty="0.010",
+        executed_qty="0.010",
+        status=ExchangeOrderStatus.FILLED,
+        price="96501",
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = PairedOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = build_session()
+    repo.create_session(session)
+
+    execution = await engine.execute_round(session=session, round_index=1, control=SessionControl())
+
+    assert execution.stage1_filled_qty == Decimal("0.010")
+    assert gateway.get_order_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_observe_order_falls_back_to_rest_when_cached_stream_is_unhealthy(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        rules=SymbolRules(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+            max_leverage=125,
+        ),
+        quote=Quote(symbol="BTCUSDT", bid_price=Decimal("96500"), ask_price=Decimal("96501")),
+        limit_scripts=[
+            ScriptedOrder(
+                snapshots=[make_order("cache-rest-1", side=OrderSide.BUY, position_side=PositionSide.LONG, qty="0.010", executed_qty="0.010", status=ExchangeOrderStatus.FILLED)],
+            ),
+            ScriptedOrder(
+                snapshots=[make_order("cache-rest-2", side=OrderSide.SELL, position_side=PositionSide.SHORT, qty="0.010", executed_qty="0.010", status=ExchangeOrderStatus.FILLED, price="96501")],
+            ),
+        ],
+        stream_healthy=False,
+    )
+    gateway.cached_orders["cache-rest-1"] = make_order(
+        "cache-rest-1",
+        side=OrderSide.BUY,
+        position_side=PositionSide.LONG,
+        qty="0.010",
+        executed_qty="0.000",
+        status=ExchangeOrderStatus.NEW,
+    )
+    repo = build_repository(tmp_path)
+    clock = FakeClock()
+    engine = PairedOpeningEngine(gateway, repo, sleep_func=clock.sleep, monotonic_func=clock.monotonic)
+    session = build_session()
+    repo.create_session(session)
+
+    execution = await engine.execute_round(session=session, round_index=1, control=SessionControl())
+    payload = repo.get_session(session.session_id)
+
+    assert execution.stage1_filled_qty == Decimal("0.010")
+    assert gateway.get_order_calls >= 1
+    assert any(event["event_type"] == "user_stream_degraded" for event in payload["events"])
 
 
 @pytest.mark.asyncio

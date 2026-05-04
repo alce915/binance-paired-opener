@@ -34,7 +34,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.setuptools.packages.find]
-include = ["paired_opener*"]
+include = ["paired_opener*", "app_i18n*"]
 
 [tool.setuptools.package-data]
 paired_opener = ["static/*.html"]

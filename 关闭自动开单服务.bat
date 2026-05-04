@@ -15,4 +15,4 @@ if "%EXIT_CODE%"=="0" (
     echo Service stop failed.
 )
 echo.
-pause
+if not "%EXIT_CODE%"=="0" pause

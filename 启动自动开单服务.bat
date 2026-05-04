@@ -5,7 +5,7 @@ cd /d "%~dp0"
 echo Starting paired opener service...
 echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\restart_service.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_service.ps1"
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.
@@ -16,4 +16,4 @@ if "%EXIT_CODE%"=="0" (
     echo %~dp0api.runtime.log
 )
 echo.
-pause
+if not "%EXIT_CODE%"=="0" pause

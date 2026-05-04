@@ -32,6 +32,106 @@
         background: radial-gradient(circle at top, #fff8e7, var(--bg));
       }
       main { max-width: 1400px; margin: 0 auto; padding: 24px 18px 44px; }
+      .app-view-real [data-simulation-only],
+      .app-view-simulation [data-real-only] { display: none !important; }
+      .app-nav {
+        display: flex;
+        gap: 10px;
+        margin: 16px 0 18px;
+      }
+      .app-nav button {
+        width: auto;
+        min-width: 120px;
+        padding: 10px 18px;
+        border-radius: 999px;
+        background: #fffaf3;
+        color: var(--muted);
+        border: 1px solid var(--border);
+      }
+      .app-nav button.active {
+        background: var(--ink);
+        color: #fffaf3;
+        border-color: var(--ink);
+      }
+      .simulation-banner {
+        position: relative;
+        margin-bottom: 16px;
+        padding: 14px 16px;
+        padding-right: 120px;
+        border: 1px solid rgba(33, 152, 111, 0.28);
+        border-radius: 8px;
+        color: #0c6b4b;
+        background: var(--success-soft);
+        font-weight: 800;
+      }
+      .simulation-banner span {
+        white-space: nowrap;
+      }
+      .simulation-banner-reset {
+        position: absolute;
+        top: 50%;
+        right: 12px;
+        width: 92px;
+        height: 30px;
+        min-width: 0;
+        padding: 0 8px;
+        border: 1px solid rgba(33, 152, 111, 0.34);
+        border-radius: 6px;
+        background: rgba(255, 250, 243, 0.88);
+        color: #0c6b4b;
+        font-size: 13px;
+        line-height: 1;
+        box-shadow: none;
+        transform: translateY(-50%);
+      }
+      .simulation-banner-reset:hover:not(:disabled) {
+        background: #fffaf3;
+      }
+      .simulation-settings {
+        display: grid;
+        gap: 12px;
+      }
+      .compact-actions {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: 1fr 1fr;
+      }
+      .history-list {
+        display: grid;
+        gap: 10px;
+        max-height: 440px;
+        overflow: auto;
+      }
+      .history-item {
+        border: 1px solid rgba(216, 197, 170, 0.8);
+        border-radius: 8px;
+        padding: 12px;
+        background: #fffdf8;
+      }
+      .history-item-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 6px;
+      }
+      .history-item strong {
+        display: block;
+      }
+      .history-item-time {
+        flex: 0 0 auto;
+        color: #7a6b58;
+        font-size: 0.9rem;
+        font-weight: 700;
+        line-height: 1.5;
+        text-align: right;
+      }
+      .history-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
       .hero-header {
         display: flex;
         align-items: center;
@@ -65,6 +165,17 @@
         display: grid;
         gap: 18px;
         grid-template-columns: 340px minmax(420px, 1fr) 340px;
+        align-items: start;
+      }
+      .dashboard-lower {
+        display: grid;
+        gap: 18px;
+        margin-top: 18px;
+      }
+      .simulation-under-log-grid {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: minmax(280px, 420px) minmax(420px, 1fr);
         align-items: start;
       }
       .left-col, .center-col, .right-col { display: grid; gap: 18px; align-content: start; }
@@ -302,6 +413,77 @@
         background: var(--danger-soft);
         border-color: rgba(198, 81, 77, 0.24);
       }
+      .status-banner {
+        display: grid;
+        gap: 10px;
+        margin-bottom: 14px;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid rgba(216, 197, 170, 0.85);
+        background: var(--surface-soft);
+      }
+      .status-banner.hidden { display: none; }
+      .status-banner.summary {
+        background: linear-gradient(180deg, #fff8f1, #f8eee2);
+      }
+      .status-banner.warn {
+        background: var(--warn-soft);
+        border-color: rgba(208, 138, 34, 0.28);
+        color: #8f5c0c;
+      }
+      .status-banner.error {
+        background: var(--danger-soft);
+        border-color: rgba(198, 81, 77, 0.28);
+        color: #8d302d;
+      }
+      .status-banner.info {
+        background: var(--accent-soft);
+        border-color: rgba(181, 83, 47, 0.24);
+        color: #7a3d23;
+      }
+      .status-banner strong {
+        display: block;
+        font-size: 13px;
+        color: inherit;
+      }
+      .status-banner-text {
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1.5;
+      }
+      .status-banner-actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .status-banner-actions button {
+        width: auto;
+        min-width: 120px;
+      }
+      .active-session-list {
+        display: grid;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      .active-session-item {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        padding: 10px 12px;
+        border: 1px solid rgba(216, 197, 170, 0.72);
+        border-radius: 8px;
+        background: rgba(255, 250, 243, 0.82);
+      }
+      .active-session-meta {
+        display: grid;
+        gap: 4px;
+        min-width: 0;
+      }
+      .active-session-meta strong,
+      .active-session-meta span {
+        overflow-wrap: anywhere;
+      }
       select.trend-long { color: var(--success) !important; font-weight: 700; border-color: rgba(33, 152, 111, 0.55) !important; background: #f8fffb !important; }
       select.trend-short { color: var(--danger) !important; font-weight: 700; border-color: rgba(198, 81, 77, 0.55) !important; background: #fff9f9 !important; }
       select.trend-long:focus { outline: 2px solid rgba(33, 152, 111, 0.18); border-color: var(--success); }
@@ -403,7 +585,8 @@
       .dot.live { background: var(--success); }
       .mono { font-variant-numeric: tabular-nums; font-family: Consolas, Monaco, monospace; }
       @media (max-width: 1240px) {
-        .dashboard { grid-template-columns: 1fr; }
+        .dashboard,
+        .simulation-under-log-grid { grid-template-columns: 1fr; }
         .orderbook-grid, .param-grid, .calc-grid, .metric-grid, .button-row, .inline-grid { grid-template-columns: 1fr; }
         button.inline-btn { width: 100%; }
       }
@@ -414,7 +597,7 @@
     </style>
   </head>
   <body>
-    <main>
+    <main id="appRoot" class="app-view-real">
       <div class="hero-header">
         <div class="hero-title-wrap">
           <h1>双向配对开单控制台</h1>
@@ -430,10 +613,14 @@
         </div>
       </div>
       <p>步步为营，稳中求胜</p>
+      <nav class="app-nav" aria-label="交易环境切换">
+        <button id="navRealBtn" class="active" type="button">实盘</button>
+        <button id="navSimulationBtn" type="button">模拟盘</button>
+      </nav>
 
       <section class="dashboard">
         <div class="left-col">
-          <section class="card">
+          <section class="card" data-real-only>
             <div class="card-header">
               <h2 class="card-title">账户概览</h2>
               <span class="badge warn" id="connectionBadge">未连接</span>
@@ -471,6 +658,43 @@
                     </div>
                   </div>
                 </div>
+              </div>
+            </div>
+          </section>
+          <section class="card" data-simulation-only id="simulationAccountCard">
+            <div class="card-header">
+              <h2 class="card-title">模拟账户</h2>
+              <span class="badge warn" id="simulationConnectionBadge">未连接</span>
+            </div>
+            <div class="card-body">
+              <div class="simulation-banner">
+                <span>模拟盘，不会真实下单</span>
+                <button id="resetSimAccountInlineBtn" class="simulation-banner-reset" type="button">重置账户</button>
+              </div>
+              <div class="metric-grid">
+                <div class="metric">
+                  <div class="metric-label">总权益</div>
+                  <div class="metric-value mono" id="simEquity">--</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">保证金</div>
+                  <div class="metric-value mono" id="simMarginUsed">--</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">可用余额</div>
+                  <div class="metric-value mono" id="simAvailableBalance">--</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">未实现盈亏</div>
+                  <div class="metric-value mono" id="simUnrealizedPnl">--</div>
+                </div>
+              </div>
+              <div class="positions-panel">
+                <div class="positions-header">
+                  <h3 class="positions-title">模拟持仓</h3>
+                  <span class="badge warn positions-count" id="simPositionsCount">0</span>
+                </div>
+                <div class="positions-list" id="simPositionsList"></div>
               </div>
             </div>
           </section>
@@ -512,7 +736,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="executionSymbol">执行交易对</label>
-                    <input id="executionSymbol" value="BTCUSDT" readonly />
+                    <input id="executionSymbol" value="BTCUSDC" readonly />
                   </div>
                   <div>
                     <label for="trend">趋势方向</label>
@@ -539,7 +763,7 @@
                   </div>
                   <div>
                     <label for="leverage">杠杆倍数</label>
-                    <input id="leverage" type="number" value="50" min="1" />
+                    <input id="leverage" type="number" value="75" min="1" />
                   </div>
                 </div>
                 <div class="calc-grid">
@@ -557,10 +781,10 @@
                   </div>
                 </div>
                 <div id="minNotionalHint" class="validation-hint">正在加载交易对规则...</div>
-                <div class="button-row" style="grid-template-columns: 1fr;">
-                  <button id="simulateBtn">模拟执行</button>
+                <div class="button-row" style="grid-template-columns: 1fr;" data-simulation-only>
+                  <button id="simulateBtn" class="simulation-run-btn">模拟执行</button>
                 </div>
-                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;" data-real-only>
                   <button id="createBtn" class="success">创建真实开单会话</button>
                 </div>
               </div>
@@ -568,7 +792,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="closeExecutionSymbol">执行交易对</label>
-                    <input id="closeExecutionSymbol" value="BTCUSDT" readonly />
+                    <input id="closeExecutionSymbol" value="BTCUSDC" readonly />
                   </div>
                   <div>
                     <label for="closeTrend">趋势方向</label>
@@ -609,7 +833,10 @@
                   </div>
                 </div>
                 <div id="closeValidationHint" class="validation-hint">请输入平仓数量和轮次。</div>
-                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;" data-simulation-only>
+                  <button id="simulateCloseBtn" class="simulation-run-btn">模拟执行</button>
+                </div>
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;" data-real-only>
                   <button id="createCloseBtn" class="success">创建真实平仓会话</button>
                 </div>
               </div>
@@ -617,7 +844,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="singleOpenExecutionSymbol">执行交易对</label>
-                    <input id="singleOpenExecutionSymbol" value="BTCUSDT" readonly />
+                    <input id="singleOpenExecutionSymbol" value="BTCUSDC" readonly />
                   </div>
                   <div>
                     <label for="singleOpenMode">开仓模式</label>
@@ -635,7 +862,7 @@
                   </div>
                   <div>
                     <label for="singleOpenLeverage">杠杆倍数</label>
-                    <input id="singleOpenLeverage" type="number" min="1" step="1" value="1" />
+                    <input id="singleOpenLeverage" type="number" min="1" step="1" value="75" />
                   </div>
                   <div>
                     <label for="singleOpenQty">开仓数量（<span id="singleOpenQtyUnit">BTC</span> 数量）</label>
@@ -669,7 +896,10 @@
                   </div>
                 </div>
                 <div id="singleOpenValidationHint" class="validation-hint">请选择开仓模式和开仓订单。</div>
-                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;" data-simulation-only>
+                  <button id="simulateSingleOpenBtn" class="simulation-run-btn">模拟执行</button>
+                </div>
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;" data-real-only>
                   <button id="createSingleOpenBtn" class="success">创建真实单向开仓会话</button>
                 </div>
               </div>
@@ -677,7 +907,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="singleCloseExecutionSymbol">执行交易对</label>
-                    <input id="singleCloseExecutionSymbol" value="BTCUSDT" readonly />
+                    <input id="singleCloseExecutionSymbol" value="BTCUSDC" readonly />
                   </div>
                   <div>
                     <label for="singleCloseMode">平仓模式</label>
@@ -722,7 +952,10 @@
                   </div>
                 </div>
                 <div id="singleCloseValidationHint" class="validation-hint">请选择平仓模式和持仓订单。</div>
-                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;">
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;" data-simulation-only>
+                  <button id="simulateSingleCloseBtn" class="simulation-run-btn">模拟执行</button>
+                </div>
+                <div class="button-row" style="grid-template-columns: 1fr; margin-top: 14px;" data-real-only>
                   <button id="createSingleCloseBtn" class="success">创建真实单向平仓会话</button>
                 </div>
               </div>
@@ -734,20 +967,38 @@
           <section class="card">
             <div class="card-header">
               <h2 class="card-title">执行统计</h2>
-              <span class="badge success" id="statsSymbol">BTCUSDT</span>
+              <span class="badge success" id="statsSymbol">BTCUSDC</span>
             </div>
             <div class="card-body">
+              <div id="executionSummaryBanner" class="status-banner summary hidden" data-real-only>
+                <strong>执行摘要</strong>
+                <div id="executionSummaryText" class="status-banner-text"></div>
+              </div>
+              <div id="recoverableSessionBanner" class="status-banner info hidden" data-real-only>
+                <strong>恢复监控</strong>
+                <div id="recoverableSessionText" class="status-banner-text"></div>
+                <div class="status-banner-actions">
+                  <button id="recoverSessionBtn" class="success inline-btn">恢复监控</button>
+                  <button id="dismissRecoverSessionBtn" class="secondary inline-btn">暂不恢复</button>
+                </div>
+              </div>
+              <div id="activeRealSessionsPanel" class="status-banner info hidden" data-real-only>
+                <strong>实盘执行中 <span id="activeRealSessionsCount">0</span></strong>
+                <div id="activeRealSessionsList" class="active-session-list"></div>
+              </div>
               <div class="stat-list">
-                <div class="stat-item"><strong>连接状态</strong><span id="statConnection">未连接</span></div>
                 <div class="stat-item"><strong>当前功能</strong><span id="statMode">双向开仓</span></div>
-                <div class="stat-item"><strong>模拟状态</strong><span id="statSimStatus">idle</span></div>
-                <div class="stat-item"><strong>真实会话状态</strong><span id="statSessionStatus">idle</span></div>
+                <div class="stat-item" data-simulation-only><strong>模拟状态</strong><span id="statSimStatus">idle</span></div>
+                <div class="stat-item" data-real-only><strong>真实会话状态</strong><span id="statSessionStatus">idle</span></div>
                 <div class="stat-item"><strong>完成轮次</strong><span id="statRounds">0 / 0</span></div>
                 <div class="stat-item"><strong>总名义金额</strong><span id="statTotalNotional" class="mono">0</span></div>
                 <div class="stat-item"><strong>每轮名义金额</strong><span id="statPerRound" class="mono">0</span></div>
                 <div class="stat-item"><strong>最小下单金额</strong><span id="statMinNotional" class="mono">0</span></div>
-                <div class="stat-item"><strong>待结转残量</strong><span id="statCarryoverQty" class="mono">0</span></div>
+                <div class="stat-item"><strong>预检有效性</strong><span id="statPrecheckFreshness">待校验</span></div>
+                <div class="stat-item"><strong>未完成数量</strong><span id="statCarryoverQty" class="mono">0</span></div>
+                <div class="stat-item"><strong>残量归属</strong><span id="statResidualSide">--</span></div>
                 <div class="stat-item"><strong>最终对齐结果</strong><span id="statFinalAlignment">未触发</span></div>
+                <div class="stat-item"><strong>终止状态</strong><span id="statAbortState">未请求</span></div>
                 <div class="stat-item"><strong>最新估算数量</strong><span id="statLastQty" class="mono">0</span></div>
               </div>
             </div>
@@ -755,19 +1006,63 @@
         </div>
       </section>
 
-      <section class="card logs-card" style="margin-top: 18px;">
-        <div class="logs-toolbar">
-          <div class="logs-title-group">
-            <h2 class="card-title" style="margin: 0;">执行日志</h2>
-            <span class="logs-header-status"><span class="dot" id="footerDot"></span><span id="footerStatus">已断开 BTCUSDT</span></span>
+      <section class="dashboard-lower">
+        <section class="card logs-card" id="executionLogCard">
+          <div class="logs-toolbar">
+            <div class="logs-title-group">
+              <h2 class="card-title" style="margin: 0;">执行日志</h2>
+              <span class="logs-header-status"><span class="dot" id="footerDot"></span><span id="footerStatus">已断开 BTCUSDC</span></span>
+            </div>
+            <span id="streamClock">--:--:--</span>
           </div>
-          <span id="streamClock">--:--:--</span>
+          <div class="logs-body" id="logsBody"></div>
+        </section>
+
+        <div class="simulation-under-log-grid" data-simulation-only>
+          <section class="card" id="simulationSettingsCard">
+            <div class="card-header">
+              <h2 class="card-title">模拟设置</h2>
+            </div>
+            <div class="card-body">
+              <div class="simulation-settings">
+                <div>
+                  <label for="simInitialBalance">初始资金 USDC</label>
+                  <input id="simInitialBalance" type="number" min="0" step="0.01" value="7000" />
+                </div>
+                <div>
+                  <label for="simMakerFee">Maker 手续费率</label>
+                  <input id="simMakerFee" type="number" min="0" step="0.0001" value="0" />
+                </div>
+                <div>
+                  <label for="simTakerFee">Taker 手续费率</label>
+                  <input id="simTakerFee" type="number" min="0" step="0.0001" value="0.0005" />
+                </div>
+                <div class="compact-actions">
+                  <button id="saveSimSettingsBtn" class="success" type="button">保存设置</button>
+                  <button id="resetSimAccountBtn" class="secondary" type="button">重置账户</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="card" id="simulationHistoryCard">
+            <div class="card-header">
+              <h2 class="card-title">模拟历史</h2>
+              <span class="badge success" id="simHistoryCount">0</span>
+            </div>
+            <div class="card-body">
+              <div class="compact-actions" style="margin-bottom: 12px;">
+                <button id="exportSimHistoryBtn" class="secondary" type="button">导出 CSV</button>
+                <button id="clearSimHistoryBtn" class="secondary" type="button">清空历史</button>
+              </div>
+              <div class="history-list" id="simHistoryList"></div>
+            </div>
+          </section>
         </div>
-        <div class="logs-body" id="logsBody"></div>
       </section>
     </main>
 
-        <script src="/static/app.js?v=20260331-log-retention"></script>
+        <script src="/static/app.js?v=20260427-simulation-stats-log"></script>
   </body>
 </html>
 

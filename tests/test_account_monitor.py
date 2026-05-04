@@ -218,3 +218,35 @@ async def test_account_monitor_controller_filters_accounts_for_subscriber(tmp_pa
     assert refreshed["data"]["summary"]["equity"] == "1200"
     assert refreshed["data"]["accounts"][0]["account_id"] == "alpha"
 
+
+@pytest.mark.asyncio
+async def test_account_monitor_controller_uses_safe_message_for_failed_account_snapshot(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        monitor_refresh_interval_ms=50,
+        monitor_history_window_days=3,
+        active_account_file=tmp_path / "active.json",
+    )
+    settings.accounts = {
+        "alpha": AccountConfig(account_id="alpha", name="Alpha", api_key="k1", api_secret="s1"),
+        "beta": AccountConfig(account_id="beta", name="Beta", api_key="k2", api_secret="s2"),
+    }
+    settings.active_account_id = "alpha"
+    controller = AccountMonitorController(settings, gateway_factory=lambda account: FakeMonitorGateway(account))
+
+    queue = await controller.subscribe()
+    try:
+        await asyncio.wait_for(queue.get(), timeout=1)
+        refreshed = await asyncio.wait_for(queue.get(), timeout=1)
+    finally:
+        controller.unsubscribe(queue)
+        await controller.close()
+
+    failed_account = next(item for item in refreshed["data"]["accounts"] if item["account_id"] == "beta")
+
+    assert refreshed["data"]["status"] == "partial"
+    assert refreshed["data"]["message_code"] == "runtime.monitor_partial_failed"
+    assert failed_account["status"] == "error"
+    assert failed_account["message_code"] == "runtime.monitor_account_refresh_failed"
+    assert "beta unavailable" not in failed_account["message"]
+

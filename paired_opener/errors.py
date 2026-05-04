@@ -3,6 +3,7 @@
 from enum import StrEnum
 from typing import Any
 
+from app_i18n.runtime import format_reason, make_api_detail
 
 class ErrorCategory(StrEnum):
     RATE_LIMIT = "rate_limit"
@@ -44,6 +45,7 @@ class TradingError(RuntimeError):
         strategy: ErrorStrategy,
         source: str,
         code: str,
+        params: dict[str, Any] | None = None,
         raw_code: int | str | None = None,
         raw_message: str | None = None,
         operator_action: str | None = None,
@@ -54,6 +56,7 @@ class TradingError(RuntimeError):
         self.strategy = strategy
         self.source = source
         self.code = code
+        self.params = dict(params or {})
         self.raw_code = raw_code
         self.raw_message = raw_message or message
         self.operator_action = operator_action
@@ -75,20 +78,19 @@ class TradingError(RuntimeError):
         return self
 
     def to_detail(self, *, precheck: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = {
-            "message": str(self),
-            "category": self.category.value,
-            "strategy": self.strategy.value,
-            "code": self.code,
-            "raw_code": self.raw_code,
-            "retryable": self.retryable,
-            "operator_action": self.operator_action,
-            "source": self.source,
-            "context": self.context,
-        }
-        if precheck is not None:
-            payload["precheck"] = precheck
-        return payload
+        return make_api_detail(
+            code=self.code,
+            params=self.params,
+            category=self.category.value,
+            strategy=self.strategy.value,
+            source=self.source,
+            raw_code=self.raw_code,
+            raw_message=self.raw_message,
+            operator_action=self.operator_action,
+            context=self.context,
+            message=format_reason(self.code, self.params) if self.params else str(self),
+            precheck=precheck,
+        )
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
@@ -96,6 +98,7 @@ class TradingError(RuntimeError):
             "error_category": self.category.value,
             "error_strategy": self.strategy.value,
             "error_code": self.code,
+            "error_params": self.params,
             "retryable": self.retryable,
             "operator_action": self.operator_action,
             "source": self.source,
@@ -125,6 +128,7 @@ class ExchangeStateError(TradingError):
             raw_message=raw_message,
             operator_action=operator_action,
             context=context,
+            params=None,
         )
 
 
@@ -150,6 +154,7 @@ class MatchingFailureError(TradingError):
             raw_message=raw_message,
             operator_action=operator_action,
             context=context,
+            params=None,
         )
 
 
@@ -173,6 +178,7 @@ def invalid_parameter_error(
         raw_message=raw_message,
         operator_action=operator_action,
         context=context,
+        params=None,
     )
 
 
@@ -196,6 +202,7 @@ def unknown_trading_error(
         raw_message=raw_message,
         operator_action=operator_action,
         context=context,
+        params=None,
     )
 
 

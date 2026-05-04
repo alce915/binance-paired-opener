@@ -9,6 +9,7 @@ from paired_opener.config import AccountConfig, Settings
 from paired_opener.engine import PairedClosingEngine, PairedOpeningEngine
 from paired_opener.market_stream import MarketStreamController
 from paired_opener.service import OpenSessionService
+from paired_opener.simulation import SimulationService
 from paired_opener.storage import SqliteRepository
 
 
@@ -20,6 +21,7 @@ class RuntimeBundle:
     close_engine: PairedClosingEngine
     service: OpenSessionService
     market: MarketStreamController
+    simulation: SimulationService
 
 
 class AccountRuntimeManager:
@@ -44,7 +46,16 @@ class AccountRuntimeManager:
             account_name=account.name,
         )
         market = MarketStreamController(gateway, self._settings, account.account_id, account.name)
-        return RuntimeBundle(account=account, gateway=gateway, engine=engine, close_engine=close_engine, service=service, market=market)
+        simulation = SimulationService(gateway, self._repository, publisher=market.publish)
+        return RuntimeBundle(
+            account=account,
+            gateway=gateway,
+            engine=engine,
+            close_engine=close_engine,
+            service=service,
+            market=market,
+            simulation=simulation,
+        )
 
     def current(self) -> RuntimeBundle:
         return self._runtime

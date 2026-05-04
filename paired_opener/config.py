@@ -3,15 +3,20 @@
 import json
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app_i18n.runtime import DEFAULT_ACCOUNT_NAME, format_copy
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
+OPEN_AMOUNT_BALANCE_LIMIT_RATIO = Decimal("0.98")
+OPEN_AMOUNT_BALANCE_LIMIT_PERCENT = "98%"
 ENV_FILES = (
     CONFIG_DIR / "binance_api.env",
     CONFIG_DIR / "binance_api.local.env",
@@ -76,7 +81,7 @@ class Settings(BaseSettings):
     monitor_history_window_days: int = 7
     monitor_history_refresh_interval_ms: int = 60_000
     active_account_file: Path = CONFIG_DIR / "active_account.json"
-    symbol_whitelist: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
+    symbol_whitelist: list[str] = Field(default_factory=lambda: ["BTCUSDC", "ETHUSDC"])
     symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"
     session_event_retention_days: int = 30
     session_event_retention_per_session: int = 2_000
@@ -89,6 +94,18 @@ class Settings(BaseSettings):
     default_order_ttl_ms: int = 3_000
     default_max_zero_fill_retries: int = 10
     default_market_fallback_attempts: int = 3
+    default_open_execution_profile: str = "maker_first"
+    default_close_execution_profile: str = "balanced"
+    maker_first_market_fallback_max_ratio: Decimal = Decimal("0.25")
+    maker_first_market_fallback_min_residual_qty: Decimal = Decimal("0")
+    maker_first_max_reprice_ticks: int = 3
+    maker_first_max_spread_bps: int = 8
+    maker_first_max_reference_deviation_bps: int = 15
+    balanced_market_fallback_max_ratio: Decimal = Decimal("1")
+    balanced_market_fallback_min_residual_qty: Decimal = Decimal("0")
+    balanced_max_reprice_ticks: int = 8
+    balanced_max_spread_bps: int = 20
+    balanced_max_reference_deviation_bps: int = 40
 
     accounts: dict[str, AccountConfig] = Field(default_factory=dict)
     active_account_id: str = "default"
@@ -122,7 +139,7 @@ class Settings(BaseSettings):
     def persist_whitelist(self, symbols: list[str]) -> list[str]:
         normalized = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols if symbol.strip()))
         if not normalized:
-            raise ValueError("Whitelist cannot be empty")
+            raise ValueError(format_copy("reasons.whitelist_empty"))
         self.symbol_whitelist = normalized
         self.symbol_whitelist_file.parent.mkdir(parents=True, exist_ok=True)
         self.symbol_whitelist_file.write_text(
@@ -216,7 +233,7 @@ class Settings(BaseSettings):
             accounts = [
                 AccountConfig(
                     account_id="default",
-                    name=env_values.get("BINANCE_ACCOUNT_NAME", "默认账户"),
+                    name=env_values.get("BINANCE_ACCOUNT_NAME", DEFAULT_ACCOUNT_NAME),
                     api_key=self.binance_api_key,
                     api_secret=self.binance_api_secret,
                     use_testnet=self.binance_use_testnet,

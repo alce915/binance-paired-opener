@@ -6,11 +6,21 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from paired_opener.domain import FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SingleCloseMode, SingleOpenMode, TrendBias
+from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME
+from paired_opener.domain import ExecutionProfile, FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SessionStopReason, SingleCloseMode, SingleOpenMode, TrendBias
 
 
-class OpenSessionRequest(BaseModel):
-    symbol: str = Field(..., examples=["BTCUSDT"])
+class ExecutionPolicyFields(BaseModel):
+    execution_profile: ExecutionProfile | None = None
+    market_fallback_max_ratio: Decimal | None = Field(default=None, ge=0)
+    market_fallback_min_residual_qty: Decimal | None = Field(default=None, ge=0)
+    max_reprice_ticks: int | None = Field(default=None, ge=0, le=10_000)
+    max_spread_bps: int | None = Field(default=None, ge=0, le=10_000)
+    max_reference_deviation_bps: int | None = Field(default=None, ge=0, le=10_000)
+
+
+class OpenSessionRequest(ExecutionPolicyFields):
+    symbol: str = Field(..., examples=["BTCUSDC"])
     trend_bias: TrendBias
     leverage: int = Field(..., ge=1, le=125)
     round_count: int = Field(..., ge=1, le=10_000)
@@ -23,8 +33,8 @@ class OpenSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class CloseSessionRequest(BaseModel):
-    symbol: str = Field(..., examples=["BTCUSDT"])
+class CloseSessionRequest(ExecutionPolicyFields):
+    symbol: str = Field(..., examples=["BTCUSDC"])
     trend_bias: TrendBias
     close_qty: Decimal = Field(..., gt=0)
     round_count: int = Field(..., ge=1, le=10_000)
@@ -36,8 +46,8 @@ class CloseSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class SingleCloseSessionRequest(BaseModel):
-    symbol: str = Field(..., examples=["BTCUSDT"])
+class SingleCloseSessionRequest(ExecutionPolicyFields):
+    symbol: str = Field(..., examples=["BTCUSDC"])
     close_mode: SingleCloseMode
     selected_position_side: PositionSide | None = None
     close_qty: Decimal = Field(..., gt=0)
@@ -50,8 +60,8 @@ class SingleCloseSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class SingleOpenSessionRequest(BaseModel):
-    symbol: str = Field(..., examples=["BTCUSDT"])
+class SingleOpenSessionRequest(ExecutionPolicyFields):
+    symbol: str = Field(..., examples=["BTCUSDC"])
     open_mode: SingleOpenMode
     selected_position_side: PositionSide | None = None
     open_qty: Decimal = Field(..., gt=0)
@@ -65,9 +75,9 @@ class SingleOpenSessionRequest(BaseModel):
     created_by: str = "manual"
 
 
-class SessionPrecheckRequest(BaseModel):
+class SessionPrecheckRequest(ExecutionPolicyFields):
     session_kind: SessionKind
-    symbol: str = Field(..., examples=["BTCUSDT"])
+    symbol: str = Field(..., examples=["BTCUSDC"])
     trend_bias: TrendBias | None = None
     leverage: int | None = Field(default=None, ge=1, le=125)
     round_count: int = Field(default=1, ge=1, le=10_000)
@@ -85,12 +95,12 @@ class SessionPrecheckRequest(BaseModel):
 
 
 class MarketConnectRequest(BaseModel):
-    symbol: str = Field(default="BTCUSDT")
+    symbol: str = Field(default="BTCUSDC")
 
 
-class SimulationRunRequest(BaseModel):
+class SimulationRunRequest(ExecutionPolicyFields):
     session_kind: SessionKind = SessionKind.PAIRED_OPEN
-    symbol: str = Field(default="BTCUSDT")
+    symbol: str = Field(default="BTCUSDC")
     trend_bias: TrendBias | None = None
     open_mode: SingleOpenMode | None = None
     close_mode: SingleCloseMode | None = None
@@ -106,15 +116,22 @@ class SimulationRunRequest(BaseModel):
 SimulationRequest = SimulationRunRequest
 
 class PrecheckItem(BaseModel):
+    contract_version: str = CONTRACT_VERSION
     code: str
+    label_key: str | None = None
     label: str
     status: str
+    message_key: str | None = None
+    message_params: dict[str, Any] = Field(default_factory=dict)
     message: str
     details: dict[str, Any] | None = None
 
 
 class SessionPrecheckResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
     ok: bool
+    summary_code: str | None = None
+    summary_params: dict[str, Any] = Field(default_factory=dict)
     summary: str
     checks: list[PrecheckItem]
     derived: dict[str, Any] = Field(default_factory=dict)
@@ -124,7 +141,7 @@ class SessionSummary(BaseModel):
     session_id: str
     session_kind: SessionKind = SessionKind.PAIRED_OPEN
     account_id: str = "default"
-    account_name: str = "默认账户"
+    account_name: str = DEFAULT_ACCOUNT_NAME
     symbol: str
     trend_bias: TrendBias
     leverage: int
@@ -135,6 +152,17 @@ class SessionSummary(BaseModel):
     selected_position_side: PositionSide | None = None
     target_open_qty: Decimal = Decimal("0")
     target_close_qty: Decimal = Decimal("0")
+    planned_round_qtys: list[Decimal] = Field(default_factory=list)
+    final_round_qty: Decimal = Decimal("0")
+    extension_round_cap_qty: Decimal = Decimal("0")
+    max_extension_rounds: int = 5
+    max_session_duration_seconds: int = 1800
+    execution_profile: ExecutionProfile = ExecutionProfile.BALANCED
+    market_fallback_max_ratio: Decimal = Decimal("1")
+    market_fallback_min_residual_qty: Decimal = Decimal("0")
+    max_reprice_ticks: int | None = 8
+    max_spread_bps: int | None = 20
+    max_reference_deviation_bps: int | None = 40
     status: SessionStatus
     created_at: datetime
     updated_at: datetime
@@ -143,16 +171,26 @@ class SessionSummary(BaseModel):
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    last_error_params: dict[str, Any] = Field(default_factory=dict)
+    last_error_contract_version: str | None = None
     recovery_status: RecoveryStatus | None = None
     recovery_summary: str | None = None
     recovery_checked_at: datetime | None = None
+    stage2_carryover_qty: Decimal = Decimal("0")
+    final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
+    final_unaligned_qty: Decimal = Decimal("0")
+    session_deadline_at: datetime | None = None
+    extension_rounds_used: int = 0
+    remaining_extension_rounds: int = 0
+    stop_reason: SessionStopReason | None = None
+    residual_source: str | None = None
 
 
 class SessionDetail(BaseModel):
     session_id: str
     session_kind: SessionKind = SessionKind.PAIRED_OPEN
     account_id: str = "default"
-    account_name: str = "默认账户"
+    account_name: str = DEFAULT_ACCOUNT_NAME
     symbol: str
     trend_bias: TrendBias
     leverage: int
@@ -163,10 +201,21 @@ class SessionDetail(BaseModel):
     selected_position_side: PositionSide | None = None
     target_open_qty: Decimal = Decimal("0")
     target_close_qty: Decimal = Decimal("0")
+    planned_round_qtys: list[Decimal] = Field(default_factory=list)
+    final_round_qty: Decimal = Decimal("0")
+    extension_round_cap_qty: Decimal = Decimal("0")
+    max_extension_rounds: int = 5
+    max_session_duration_seconds: int = 1800
     poll_interval_ms: int
     order_ttl_ms: int
     max_zero_fill_retries: int
     market_fallback_attempts: int
+    execution_profile: ExecutionProfile = ExecutionProfile.BALANCED
+    market_fallback_max_ratio: Decimal = Decimal("1")
+    market_fallback_min_residual_qty: Decimal = Decimal("0")
+    max_reprice_ticks: int | None = 8
+    max_spread_bps: int | None = 20
+    max_reference_deviation_bps: int | None = 40
     round_interval_seconds: int | None = None
     status: SessionStatus
     created_at: datetime
@@ -176,6 +225,8 @@ class SessionDetail(BaseModel):
     last_error_strategy: str | None = None
     last_error_code: str | None = None
     last_error_operator_action: str | None = None
+    last_error_params: dict[str, Any] = Field(default_factory=dict)
+    last_error_contract_version: str | None = None
     recovery_status: RecoveryStatus | None = None
     recovery_summary: str | None = None
     recovery_checked_at: datetime | None = None
@@ -183,6 +234,11 @@ class SessionDetail(BaseModel):
     final_alignment_status: FinalAlignmentStatus = FinalAlignmentStatus.NOT_NEEDED
     final_unaligned_qty: Decimal = Decimal("0")
     completed_with_final_alignment: bool = False
+    session_deadline_at: datetime | None = None
+    extension_rounds_used: int = 0
+    remaining_extension_rounds: int = 0
+    stop_reason: SessionStopReason | None = None
+    residual_source: str | None = None
     rounds: list[dict[str, Any]]
     events: list[dict[str, Any]]
 
@@ -195,11 +251,44 @@ class SessionUpdatesResponse(BaseModel):
 
 
 class SessionActionResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
     session_id: str
     status: SessionStatus
     requested: bool = False
     requested_action: str | None = None
+    message_code: str | None = None
+    message_params: dict[str, Any] = Field(default_factory=dict)
     message: str | None = None
+
+
+class SimulationActionResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    run_id: str | None = None
+    active: bool | None = None
+    status: str
+    stage: str | None = None
+    requested: bool = False
+    requested_action: str | None = None
+    heartbeat_at: str | None = None
+    last_event_at: str | None = None
+    latest_event_id: int | None = None
+    rounds_completed: int | None = None
+    rounds_total: int | None = None
+    lock_reason: str | None = None
+    message_code: str | None = None
+    message_params: dict[str, Any] = Field(default_factory=dict)
+    message: str | None = None
+
+
+class SimulationAccountSettingsRequest(BaseModel):
+    initial_balance: Decimal | None = Field(default=None, gt=0)
+    maker_fee_rate: Decimal | None = Field(default=None, ge=0)
+    taker_fee_rate: Decimal | None = Field(default=None, ge=0)
+
+
+class SimulationTemplateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class SymbolInfoResponse(BaseModel):
