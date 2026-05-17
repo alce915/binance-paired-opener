@@ -48,7 +48,9 @@ const kanglongSide = document.getElementById("kanglongSide");
 const kanglongDetectPlanBtn = document.getElementById("kanglongDetectPlanBtn");
 const kanglongConfirmPlanBtn = document.getElementById("kanglongConfirmPlanBtn");
 const kanglongExecutePlanBtn = document.getElementById("kanglongExecutePlanBtn");
+const kanglongMainAccountCard = document.getElementById("kanglongMainAccountCard");
 const kanglongAccountPool = document.getElementById("kanglongAccountPool");
+const kanglongAddSelectedBtn = document.getElementById("kanglongAddSelectedBtn");
 const kanglongSelectedSubaccounts = document.getElementById("kanglongSelectedSubaccounts");
 const kanglongPlanSummary = document.getElementById("kanglongPlanSummary");
 const kanglongExecutionLog = document.getElementById("kanglongExecutionLog");
@@ -95,6 +97,15 @@ const APP_TIMEZONE = APP_CONFIG.timezone || APP_I18N.default_timezone || "Asia/S
 const DEFAULT_ACCOUNT_NAME = I18N_MESSAGES["common.default_account_name"] || "默认账户";
 let currentAccount = { id: "default", name: DEFAULT_ACCOUNT_NAME };
 let availableAccounts = [];
+const kanglongState = {
+  mainAccountId: "",
+  selectedSubaccountIds: new Set(),
+  checkedPoolAccountIds: new Set(),
+  plan: null,
+  confirmedPlanVersion: "",
+  latestEventId: 0,
+  logFilter: "all",
+};
 let whitelistSymbols = [];
 let temporaryCustomSymbol = null;
 let latestReferencePrice = 0;
@@ -1230,6 +1241,258 @@ function setCurrentAccount(accountId, accountName, syncSelect = true) {
   }
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function kanglongAccountId(account) {
+  if (typeof account === "string") return account.trim().toLowerCase();
+  return String(account?.id || account?.account_id || "").trim().toLowerCase();
+}
+
+function kanglongAccountLabel(account) {
+  if (!account) return DEFAULT_ACCOUNT_NAME;
+  return String(account.name || account.account_name || account.label || kanglongAccountId(account) || DEFAULT_ACCOUNT_NAME).trim() || DEFAULT_ACCOUNT_NAME;
+}
+
+function findKanglongAccount(accountId, accounts = availableAccounts) {
+  const normalizedId = kanglongAccountId(accountId);
+  return (Array.isArray(accounts) ? accounts : []).find((account) => kanglongAccountId(account) === normalizedId) || null;
+}
+
+function selectedKanglongSymbol() {
+  return normalizeSymbol(kanglongSymbol?.value || activeSymbol || DEFAULT_SYMBOL);
+}
+
+function selectedKanglongSide() {
+  return String(kanglongSide?.value || "").trim().toUpperCase();
+}
+
+function kanglongPositionForAccount(account) {
+  const positions = Array.isArray(account?.positions) ? account.positions : [];
+  const symbol = selectedKanglongSymbol();
+  const side = selectedKanglongSide();
+  return positions.find((position) => {
+    const positionSymbol = normalizeSymbol(position.symbol || position.contract || "");
+    const positionSide = String(position.position_side || position.side || "").trim().toUpperCase();
+    if (positionSymbol && positionSymbol !== symbol) return false;
+    return !side || !positionSide || positionSide === side;
+  }) || null;
+}
+
+function kanglongAccountBadges(account, role = "pool") {
+  const badges = [];
+  if (role === "main") {
+    badges.push({ tone: "success", text: copyOrDefault("console.kanglong.card.main", "主账号") });
+  } else if (role === "selected") {
+    badges.push({ tone: "success", text: copyOrDefault("console.kanglong.card.joined", "已加入") });
+  }
+  const position = kanglongPositionForAccount(account);
+  if (!position) {
+    badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.no_position", "无本方向持仓") });
+    return badges;
+  }
+  const pnl = Number(position.unrealized_pnl ?? position.unrealizedPnl ?? position.pnl ?? 0);
+  if (Number.isFinite(pnl) && pnl > 0) {
+    badges.push({ tone: "success", text: `${copyOrDefault("console.position_fields.unrealized_pnl", "未实现盈亏")} ${formatNumber(pnl, 4)}` });
+  } else {
+    badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.no_profit", "无盈利仓位") });
+  }
+  if (position.stale || position.is_stale) {
+    badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.stale", "数据过期") });
+  }
+  if (account?.risk_unknown || account?.riskUnknown) {
+    badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.risk_unknown", "风险未知") });
+  }
+  return badges;
+}
+
+function renderKanglongAccountRow(account, opts = {}) {
+  const accountId = kanglongAccountId(account);
+  const role = opts.role || "pool";
+  const row = document.createElement("div");
+  row.className = `kanglong-account-row${role === "main" ? " kanglong-account-main" : ""}`;
+  row.dataset.accountId = accountId;
+
+  if (role === "pool") {
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = kanglongState.checkedPoolAccountIds.has(accountId);
+    checkbox.setAttribute("aria-label", kanglongAccountLabel(account));
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        kanglongState.checkedPoolAccountIds.add(accountId);
+      } else {
+        kanglongState.checkedPoolAccountIds.delete(accountId);
+      }
+      renderKanglongAccountPool();
+    });
+    row.appendChild(checkbox);
+  } else {
+    const spacer = document.createElement("span");
+    spacer.className = "kanglong-account-spacer";
+    row.appendChild(spacer);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "kanglong-account-meta";
+  const name = document.createElement("div");
+  name.className = "kanglong-account-name";
+  name.textContent = kanglongAccountLabel(account);
+  const detail = document.createElement("div");
+  detail.className = "kanglong-account-detail";
+  detail.textContent = [
+    accountId || "--",
+    selectedKanglongSymbol(),
+    selectedKanglongSide() || copyOrDefault("console.kanglong.side_auto", "自动选择"),
+  ].join(" · ");
+  const badges = document.createElement("div");
+  badges.className = "kanglong-account-badges";
+  kanglongAccountBadges(account, role).forEach((badge) => {
+    const node = document.createElement("span");
+    node.className = `badge ${badge.tone || "warn"}`;
+    node.textContent = badge.text;
+    badges.appendChild(node);
+  });
+  meta.append(name, detail, badges);
+  row.appendChild(meta);
+
+  if (role === "selected") {
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "inline-btn secondary";
+    removeButton.textContent = copyOrDefault("console.kanglong.actions.remove", "移除");
+    removeButton.addEventListener("click", () => removeSelectedKanglongAccount(accountId));
+    row.appendChild(removeButton);
+  } else if (role === "pool") {
+    const mainButton = document.createElement("button");
+    mainButton.type = "button";
+    mainButton.className = "inline-btn secondary";
+    mainButton.textContent = copyOrDefault("console.kanglong.actions.set_main", "设为主账号");
+    mainButton.addEventListener("click", () => setKanglongMainAccount(accountId));
+    row.appendChild(mainButton);
+  } else {
+    const badge = document.createElement("span");
+    badge.className = "badge success";
+    badge.textContent = copyOrDefault("console.kanglong.card.main", "主账号");
+    row.appendChild(badge);
+  }
+  return row;
+}
+
+function ensureKanglongMainAccount(accounts = availableAccounts) {
+  const candidates = Array.isArray(accounts) ? accounts : [];
+  const ids = new Set(candidates.map((account) => kanglongAccountId(account)).filter(Boolean));
+  if (kanglongState.mainAccountId && ids.has(kanglongState.mainAccountId)) {
+    return kanglongState.mainAccountId;
+  }
+  const preferred = [
+    kanglongAccountId(currentAccount.id),
+    kanglongAccountId(candidates.find((account) => account?.is_active)),
+    kanglongAccountId(candidates[0]),
+  ].find((accountId) => accountId && ids.has(accountId));
+  kanglongState.mainAccountId = preferred || "";
+  return kanglongState.mainAccountId;
+}
+
+function invalidateKanglongPlan() {
+  kanglongState.plan = null;
+  kanglongState.confirmedPlanVersion = "";
+  if (kanglongConfirmPlanBtn) kanglongConfirmPlanBtn.disabled = true;
+  if (kanglongExecutePlanBtn) kanglongExecutePlanBtn.disabled = true;
+  if (kanglongPlanSummary) kanglongPlanSummary.replaceChildren();
+}
+
+function renderKanglongSelectedSubaccounts(accounts = availableAccounts) {
+  if (!kanglongSelectedSubaccounts) return;
+  const mainAccountId = ensureKanglongMainAccount(accounts);
+  if (mainAccountId) {
+    kanglongState.selectedSubaccountIds.delete(mainAccountId);
+  }
+  const selectedAccounts = [...kanglongState.selectedSubaccountIds]
+    .map((accountId) => findKanglongAccount(accountId, accounts))
+    .filter(Boolean);
+  if (!selectedAccounts.length) {
+    setEmptyState(kanglongSelectedSubaccounts, "empty-state", copyOrDefault("console.kanglong.card.selected_empty", "尚未选择子账号"));
+    return;
+  }
+  kanglongSelectedSubaccounts.replaceChildren(...selectedAccounts.map((account) => renderKanglongAccountRow(account, { role: "selected" })));
+}
+
+function renderKanglongAccountPool(accounts = availableAccounts) {
+  const sourceAccounts = Array.isArray(accounts) ? accounts : [];
+  const mainAccountId = ensureKanglongMainAccount(sourceAccounts);
+  const visibleAccountIds = new Set(sourceAccounts.map((account) => kanglongAccountId(account)).filter(Boolean));
+  kanglongState.selectedSubaccountIds.forEach((accountId) => {
+    if (!visibleAccountIds.has(accountId) || accountId === mainAccountId) {
+      kanglongState.selectedSubaccountIds.delete(accountId);
+    }
+  });
+  kanglongState.checkedPoolAccountIds.forEach((accountId) => {
+    if (!visibleAccountIds.has(accountId) || accountId === mainAccountId || kanglongState.selectedSubaccountIds.has(accountId)) {
+      kanglongState.checkedPoolAccountIds.delete(accountId);
+    }
+  });
+
+  const mainAccount = findKanglongAccount(mainAccountId, sourceAccounts);
+  if (kanglongMainAccountCard) {
+    if (mainAccount) {
+      kanglongMainAccountCard.replaceChildren(renderKanglongAccountRow(mainAccount, { role: "main" }));
+    } else {
+      setEmptyState(kanglongMainAccountCard, "empty-state", copyOrDefault("console.kanglong.card.pool_empty", "账号池为空"));
+    }
+  }
+
+  const poolAccounts = sourceAccounts.filter((account) => {
+    const accountId = kanglongAccountId(account);
+    return accountId && accountId !== mainAccountId && !kanglongState.selectedSubaccountIds.has(accountId);
+  });
+  if (kanglongAccountPool) {
+    if (poolAccounts.length) {
+      kanglongAccountPool.replaceChildren(...poolAccounts.map((account) => renderKanglongAccountRow(account, { role: "pool" })));
+    } else {
+      setEmptyState(kanglongAccountPool, "empty-state", copyOrDefault("console.kanglong.card.pool_empty", "账号池为空"));
+    }
+  }
+  if (kanglongAddSelectedBtn) {
+    kanglongAddSelectedBtn.disabled = kanglongState.checkedPoolAccountIds.size === 0;
+  }
+  renderKanglongSelectedSubaccounts(sourceAccounts);
+}
+
+function addSelectedKanglongAccounts() {
+  const mainAccountId = ensureKanglongMainAccount();
+  kanglongState.checkedPoolAccountIds.forEach((accountId) => {
+    if (accountId && accountId !== mainAccountId) {
+      kanglongState.selectedSubaccountIds.add(accountId);
+    }
+  });
+  kanglongState.checkedPoolAccountIds.clear();
+  invalidateKanglongPlan();
+  renderKanglongAccountPool();
+}
+
+function removeSelectedKanglongAccount(accountId) {
+  kanglongState.selectedSubaccountIds.delete(kanglongAccountId(accountId));
+  invalidateKanglongPlan();
+  renderKanglongAccountPool();
+}
+
+function setKanglongMainAccount(accountId) {
+  const normalizedId = kanglongAccountId(accountId);
+  if (!normalizedId || normalizedId === kanglongState.mainAccountId) return;
+  kanglongState.mainAccountId = normalizedId;
+  kanglongState.selectedSubaccountIds.delete(normalizedId);
+  kanglongState.checkedPoolAccountIds.delete(normalizedId);
+  invalidateKanglongPlan();
+  renderKanglongAccountPool();
+}
+
 function renderAccountOptions(accounts) {
   availableAccounts = Array.isArray(accounts) ? accounts : [];
   accountSelect.innerHTML = "";
@@ -1246,6 +1509,7 @@ function renderAccountOptions(accounts) {
   if (activeAccount) {
     setCurrentAccount(activeAccount.id, activeAccount.name, true);
   }
+  renderKanglongAccountPool(availableAccounts);
 }
 
 async function loadAccounts() {
@@ -2905,6 +3169,8 @@ async function applyAppPage(page) {
     refreshSimulationHistory();
   } else if (appPage === "real") {
     maybeScheduleCurrentModePrecheck("page_switch");
+  } else if (appPage === "kanglong" && typeof renderKanglongAccountPool === "function") {
+    renderKanglongAccountPool(availableAccounts);
   }
   return true;
 }
@@ -4506,6 +4772,15 @@ navKanglongBtn?.addEventListener("click", () => {
     messageCode: "runtime.symbol_switch_failed",
     messageParams: { symbol: activeSymbol, error: userVisibleErrorMessage(error) },
   }));
+});
+kanglongAddSelectedBtn?.addEventListener("click", addSelectedKanglongAccounts);
+kanglongSymbol?.addEventListener("input", () => {
+  invalidateKanglongPlan();
+  renderKanglongAccountPool();
+});
+kanglongSide?.addEventListener("change", () => {
+  invalidateKanglongPlan();
+  renderKanglongAccountPool();
 });
 
 saveSimSettingsBtn?.addEventListener("click", async () => {
