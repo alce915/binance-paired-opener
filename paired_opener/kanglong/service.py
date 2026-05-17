@@ -19,7 +19,7 @@ from paired_opener.kanglong.models import (
     decimal_text,
     payload_value,
 )
-from paired_opener.kanglong.planner import build_kanglong_plan, build_planning_accounts
+from paired_opener.kanglong.planner import KanglongGroupRoundLimitExceeded, build_kanglong_plan, build_planning_accounts
 from paired_opener.kanglong.precheck import run_static_precheck
 from paired_opener.kanglong.reporter import summarize_costs
 from paired_opener.kanglong.simulator import simulate_group
@@ -90,6 +90,29 @@ def _blocked_payload(run_id: str, precheck: KanglongPrecheckResult) -> dict[str,
     }
 
 
+def _lock_scopes(symbol: str, main_account_id: str, subaccount_ids: list[str]) -> list[str]:
+    normalized_symbol = symbol.strip().upper()
+    account_ids = [main_account_id, *subaccount_ids]
+    return [
+        f"kanglong:{normalized_symbol}:account:{account_id.strip().lower()}"
+        for account_id in account_ids
+    ]
+
+
+def _price_snapshot(close_price: Decimal, open_price: Decimal, fee_rate: Decimal) -> dict[str, str]:
+    return {
+        "close_price": decimal_text(close_price),
+        "open_price": decimal_text(open_price),
+        "fee_rate": decimal_text(fee_rate),
+    }
+
+
+def _price_drift_bps(previous: Decimal, current: Decimal) -> Decimal:
+    if previous <= Decimal("0"):
+        return Decimal("0")
+    return abs(current - previous) / previous * Decimal("10000")
+
+
 class KanglongSimulationService:
     def __init__(self, repository: SqliteRepository) -> None:
         self._repository = repository
@@ -153,6 +176,8 @@ class KanglongSimulationService:
             symbol=symbol,
             manual_side=selected_side,
             config=config,
+            reference_price=close_price,
+            fee_rate=fee_rate,
         )
         plan_version = _new_plan_version()
 
@@ -189,16 +214,88 @@ class KanglongSimulationService:
             return payload
 
         planning_accounts = build_planning_accounts(subaccount_snapshots, precheck.selected_side, config)
-        plan = build_kanglong_plan(
+        try:
+            plan = build_kanglong_plan(
+                run_id=run_id,
+                symbol=symbol,
+                selected_side=precheck.selected_side,
+                main_account_id=main_account_id,
+                first_donor_account_id=precheck.first_donor_account_id,
+                planned_release_qty=precheck.planned_release_qty,
+                accounts=planning_accounts,
+                config=config,
+            )
+        except KanglongGroupRoundLimitExceeded as exc:
+            status = (
+                KanglongRunStatus.BLOCKED_GROUP_ROUND_LIMIT_EXCEEDED
+                if exc.group_index == 1
+                else KanglongRunStatus.PAUSED_GROUP_ROUND_LIMIT_EXCEEDED
+            )
+            report = {
+                "precheck": _payloadify(precheck.details),
+                "other_side_preview": _payloadify(precheck.other_side_preview),
+                "warnings": [],
+                "blocks": [KanglongRunStatus.BLOCKED_GROUP_ROUND_LIMIT_EXCEEDED.value],
+                "round_limit": {
+                    "group_index": exc.group_index,
+                    "target_qty": decimal_text(exc.target_qty),
+                    "per_round_qty_limit": decimal_text(exc.per_round_qty_limit),
+                    "required_rounds": exc.required_rounds,
+                    "max_rounds_per_group": exc.max_rounds,
+                },
+            }
+            payload = {
+                "run_id": run_id,
+                "status": status.value,
+                "result_grade": KanglongResultGrade.UNSAFE_UNCLOSED.value,
+                "plan_version": plan_version,
+                "snapshot_bundle_id": snapshot_bundle_id,
+                "available_actions": ["refresh_plan"],
+                "report": report,
+            }
+            self._repository.update_kanglong_run(
+                run_id,
+                status=payload["status"],
+                report=report,
+                result_grade=payload["result_grade"],
+                plan_version=plan_version,
+                snapshot_bundle_id=snapshot_bundle_id,
+                available_actions=payload["available_actions"],
+            )
+            return payload
+
+        lock_conflict = self._repository.acquire_kanglong_locks(
             run_id=run_id,
-            symbol=symbol,
-            selected_side=precheck.selected_side,
-            main_account_id=main_account_id,
-            first_donor_account_id=precheck.first_donor_account_id,
-            planned_release_qty=precheck.planned_release_qty,
-            accounts=planning_accounts,
-            config=config,
+            lock_scopes=_lock_scopes(symbol, main_account_id, subaccount_ids),
+            ttl_ms=config.run_lock_ttl_ms,
         )
+        if lock_conflict is not None:
+            report = {
+                "precheck": _payloadify(precheck.details),
+                "other_side_preview": _payloadify(precheck.other_side_preview),
+                "warnings": [],
+                "blocks": [KanglongRunStatus.BLOCKED_RUN_LOCK_EXISTS.value],
+                "lock_conflict": _payloadify(lock_conflict),
+            }
+            payload = {
+                "run_id": run_id,
+                "status": KanglongRunStatus.BLOCKED_RUN_LOCK_EXISTS.value,
+                "result_grade": KanglongResultGrade.UNSAFE_UNCLOSED.value,
+                "plan_version": plan_version,
+                "snapshot_bundle_id": snapshot_bundle_id,
+                "available_actions": ["refresh_plan"],
+                "report": report,
+            }
+            self._repository.update_kanglong_run(
+                run_id,
+                status=payload["status"],
+                report=report,
+                result_grade=payload["result_grade"],
+                plan_version=plan_version,
+                snapshot_bundle_id=snapshot_bundle_id,
+                available_actions=payload["available_actions"],
+            )
+            return payload
 
         events = []
         residuals = []
@@ -236,6 +333,7 @@ class KanglongSimulationService:
             "summary": summary,
             "plan": plan_payload,
             "costs": _payloadify(costs),
+            "price_snapshot": _price_snapshot(close_price, open_price, fee_rate),
             "other_side_preview": _payloadify(precheck.other_side_preview),
             "warnings": [],
             "blocks": [],
@@ -321,6 +419,11 @@ class KanglongSimulationService:
         close_price: Decimal,
         open_price: Decimal,
         fee_rate: Decimal,
+        recheck_main_snapshot: KanglongAccountSnapshot | None = None,
+        recheck_subaccount_snapshots: list[KanglongAccountSnapshot] | None = None,
+        recheck_selected_side: PositionSide | None = None,
+        recheck_config: KanglongSymbolConfig | None = None,
+        recheck_snapshot_bundle_id: str | None = None,
     ) -> dict[str, Any]:
         request_hash = _request_hash(
             {
@@ -346,6 +449,26 @@ class KanglongSimulationService:
         if stored.get("status") != KanglongRunStatus.PLAN_CONFIRMED.value:
             return self._blocked_plan_recheck_failed(run_id, plan_version, stored)
 
+        recheck_response = self._execute_recheck(
+            run_id=run_id,
+            requested_plan_version=plan_version,
+            stored=stored,
+            close_price=close_price,
+            open_price=open_price,
+            fee_rate=fee_rate,
+            recheck_main_snapshot=recheck_main_snapshot,
+            recheck_subaccount_snapshots=recheck_subaccount_snapshots,
+            recheck_selected_side=recheck_selected_side,
+            recheck_config=recheck_config,
+            recheck_snapshot_bundle_id=recheck_snapshot_bundle_id,
+        )
+        if recheck_response is not None:
+            return recheck_response
+
+        self._repository.heartbeat_kanglong_locks(
+            run_id=run_id,
+            ttl_ms=(recheck_config or KanglongSymbolConfig()).run_lock_ttl_ms,
+        )
         self._repository.update_kanglong_run(
             run_id,
             status=KanglongRunStatus.EXECUTION_STARTING.value,
@@ -376,6 +499,7 @@ class KanglongSimulationService:
             result_grade=KanglongResultGrade.SAFE_CLOSED.value,
             available_actions=available_actions,
         )
+        self._repository.release_kanglong_locks(run_id)
         response = _response_base(
             run_id,
             KanglongRunStatus.COMPLETED.value,
@@ -387,6 +511,150 @@ class KanglongSimulationService:
             latest_event_id=self._repository.latest_kanglong_event_id(run_id),
         )
         return self._remember_idempotency(idempotency_key, request_hash, response)
+
+    def _execute_recheck(
+        self,
+        *,
+        run_id: str,
+        requested_plan_version: str,
+        stored: dict[str, Any],
+        close_price: Decimal,
+        open_price: Decimal,
+        fee_rate: Decimal,
+        recheck_main_snapshot: KanglongAccountSnapshot | None,
+        recheck_subaccount_snapshots: list[KanglongAccountSnapshot] | None,
+        recheck_selected_side: PositionSide | None,
+        recheck_config: KanglongSymbolConfig | None,
+        recheck_snapshot_bundle_id: str | None,
+    ) -> dict[str, Any] | None:
+        report = dict(stored.get("report") or {})
+        config = recheck_config or KanglongSymbolConfig()
+        previous_price_snapshot = report.get("price_snapshot")
+        if isinstance(previous_price_snapshot, dict):
+            previous_close_price = Decimal(str(previous_price_snapshot.get("close_price") or "0"))
+            previous_open_price = Decimal(str(previous_price_snapshot.get("open_price") or "0"))
+            close_drift_bps = _price_drift_bps(previous_close_price, close_price)
+            open_drift_bps = _price_drift_bps(previous_open_price, open_price)
+            max_drift_bps = max(close_drift_bps, open_drift_bps)
+            if max_drift_bps > Decimal(config.plan_recheck_price_drift_bps):
+                recheck = {
+                    "status": KanglongRunStatus.BLOCKED_PLAN_STALE.value,
+                    "reason_code": "price_drift_exceeded",
+                    "previous_price_snapshot": previous_price_snapshot,
+                    "current_price_snapshot": _price_snapshot(close_price, open_price, fee_rate),
+                    "max_drift_bps": decimal_text(max_drift_bps),
+                    "limit_bps": config.plan_recheck_price_drift_bps,
+                    "snapshot_bundle_id": recheck_snapshot_bundle_id,
+                }
+                return self._mark_execute_recheck_blocked(
+                    run_id=run_id,
+                    requested_plan_version=requested_plan_version,
+                    stored=stored,
+                    status=KanglongRunStatus.BLOCKED_PLAN_STALE,
+                    report_patch={"execute_recheck": recheck},
+                )
+
+        if recheck_main_snapshot is None or recheck_subaccount_snapshots is None:
+            return None
+
+        plan_payload = stored.get("plan") or {}
+        selected_side_value = plan_payload.get("selected_side")
+        stored_selected_side = PositionSide(selected_side_value) if selected_side_value else recheck_selected_side
+        precheck = run_static_precheck(
+            main=recheck_main_snapshot,
+            subaccounts=recheck_subaccount_snapshots,
+            symbol=stored.get("symbol") or plan_payload.get("symbol") or "",
+            manual_side=recheck_selected_side or stored_selected_side,
+            config=config,
+            reference_price=close_price,
+            fee_rate=fee_rate,
+        )
+        if not precheck.ok or precheck.selected_side is None or precheck.first_donor_account_id is None:
+            return self._mark_execute_recheck_blocked(
+                run_id=run_id,
+                requested_plan_version=requested_plan_version,
+                stored=stored,
+                status=KanglongRunStatus.BLOCKED_PLAN_RECHECK_FAILED,
+                report_patch={
+                    "execute_recheck": {
+                        "status": KanglongRunStatus.BLOCKED_PLAN_RECHECK_FAILED.value,
+                        "reason_code": precheck.reason_code,
+                        "precheck": _payloadify(precheck.details),
+                        "snapshot_bundle_id": recheck_snapshot_bundle_id,
+                    }
+                },
+            )
+        if stored_selected_side is not None and precheck.selected_side != stored_selected_side:
+            return self._mark_execute_recheck_blocked(
+                run_id=run_id,
+                requested_plan_version=requested_plan_version,
+                stored=stored,
+                status=KanglongRunStatus.BLOCKED_PLAN_STALE,
+                report_patch={
+                    "execute_recheck": {
+                        "status": KanglongRunStatus.BLOCKED_PLAN_STALE.value,
+                        "reason_code": "selected_side_changed",
+                        "previous_selected_side": stored_selected_side.value,
+                        "current_selected_side": precheck.selected_side.value,
+                        "snapshot_bundle_id": recheck_snapshot_bundle_id,
+                    }
+                },
+            )
+        previous_release_qty = Decimal(str((report.get("summary") or {}).get("planned_release_qty") or "0"))
+        if abs(precheck.planned_release_qty - previous_release_qty) > config.plan_recheck_qty_tolerance:
+            return self._mark_execute_recheck_blocked(
+                run_id=run_id,
+                requested_plan_version=requested_plan_version,
+                stored=stored,
+                status=KanglongRunStatus.BLOCKED_PLAN_STALE,
+                report_patch={
+                    "execute_recheck": {
+                        "status": KanglongRunStatus.BLOCKED_PLAN_STALE.value,
+                        "reason_code": "planned_release_qty_changed",
+                        "previous_planned_release_qty": decimal_text(previous_release_qty),
+                        "current_planned_release_qty": decimal_text(precheck.planned_release_qty),
+                        "tolerance": decimal_text(config.plan_recheck_qty_tolerance),
+                        "snapshot_bundle_id": recheck_snapshot_bundle_id,
+                    }
+                },
+            )
+        return None
+
+    def _mark_execute_recheck_blocked(
+        self,
+        *,
+        run_id: str,
+        requested_plan_version: str,
+        stored: dict[str, Any],
+        status: KanglongRunStatus,
+        report_patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        report = dict(stored.get("report") or {})
+        report.update(_payloadify(report_patch))
+        blocks = list(report.get("blocks") or [])
+        if status.value not in blocks:
+            blocks.append(status.value)
+        report["blocks"] = blocks
+        available_actions = ["refresh_plan"]
+        self._repository.update_kanglong_run(
+            run_id,
+            status=status.value,
+            report=report,
+            result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+            available_actions=available_actions,
+        )
+        self._repository.release_kanglong_locks(run_id)
+        return _response_base(
+            run_id,
+            status.value,
+            plan_version=stored.get("plan_version") or requested_plan_version,
+            snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+            available_actions=available_actions,
+            report=report,
+            error_code=status.value,
+            requested_plan_version=requested_plan_version,
+            current_status=stored.get("status"),
+        )
 
     def list_events(
         self,

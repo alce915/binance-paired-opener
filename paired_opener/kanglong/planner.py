@@ -24,6 +24,27 @@ class _CandidatePlan:
     covered_debt_count: int
 
 
+class KanglongGroupRoundLimitExceeded(ValueError):
+    def __init__(
+        self,
+        *,
+        group_index: int,
+        target_qty: Decimal,
+        per_round_qty_limit: Decimal,
+        required_rounds: int,
+        max_rounds: int,
+    ) -> None:
+        super().__init__(
+            "kanglong group "
+            f"{group_index} requires {required_rounds} rounds, exceeding max {max_rounds}"
+        )
+        self.group_index = group_index
+        self.target_qty = target_qty
+        self.per_round_qty_limit = per_round_qty_limit
+        self.required_rounds = required_rounds
+        self.max_rounds = max_rounds
+
+
 def split_round_qtys(target_qty: Decimal, per_round_qty_limit: Decimal) -> list[Decimal]:
     remaining = target_qty
     rounds: list[Decimal] = []
@@ -44,6 +65,15 @@ def _group(
     config: KanglongSymbolConfig,
     batch_id: str | None = None,
 ) -> KanglongGroupPlan:
+    round_qtys = split_round_qtys(qty, config.per_round_qty_limit)
+    if len(round_qtys) > config.max_rounds_per_group:
+        raise KanglongGroupRoundLimitExceeded(
+            group_index=group_index,
+            target_qty=qty,
+            per_round_qty_limit=config.per_round_qty_limit,
+            required_rounds=len(round_qtys),
+            max_rounds=config.max_rounds_per_group,
+        )
     return KanglongGroupPlan(
         group_id=f"group-{group_index:04d}",
         from_account_id=from_account_id,
@@ -51,7 +81,7 @@ def _group(
         symbol=symbol,
         side=side,
         target_qty=qty,
-        round_qtys=split_round_qtys(qty, config.per_round_qty_limit),
+        round_qtys=round_qtys,
         batch_id=batch_id,
     )
 

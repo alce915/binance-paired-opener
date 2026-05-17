@@ -22,6 +22,18 @@ def _price_diff_pnl(side: PositionSide, close_price: Decimal, open_price: Decima
     return (open_price - close_price) * qty
 
 
+def _below_exchange_minimums(
+    submitted_qty: Decimal,
+    *,
+    rules: SymbolRules,
+    close_price: Decimal,
+    open_price: Decimal,
+) -> bool:
+    if submitted_qty <= Decimal("0") or submitted_qty < rules.min_qty:
+        return True
+    return submitted_qty * close_price < rules.min_notional or submitted_qty * open_price < rules.min_notional
+
+
 def simulate_group(
     *,
     run_id: str,
@@ -42,6 +54,69 @@ def simulate_group(
         rounding_residual = planned_qty - submitted_qty
         round_id = f"{group.group_id}-round-{index:04d}"
         match_id = f"{round_id}-match"
+        if _below_exchange_minimums(
+            submitted_qty,
+            rules=rules,
+            close_price=close_price,
+            open_price=open_price,
+        ):
+            residuals.append(
+                ResidualLedgerEntry(
+                    account_id=group.from_account_id,
+                    side=group.side,
+                    leg_type="exchange_rule",
+                    signed_qty=planned_qty,
+                    reason="below_min_qty_or_notional",
+                    event_id=match_id,
+                )
+            )
+            close_event = KanglongEvent(
+                run_id=run_id,
+                group_id=group.group_id,
+                round_id=round_id,
+                mode="simulation",
+                account_id=group.from_account_id,
+                symbol=group.symbol,
+                position_side=group.side,
+                action_type="single_close",
+                leg_id=f"{round_id}-close",
+                paired_leg_id=f"{round_id}-open",
+                round_match_id=match_id,
+                planned_qty=planned_qty,
+                submitted_qty=submitted_qty,
+                filled_qty=Decimal("0"),
+                matched_qty=Decimal("0"),
+                close_residual_qty=planned_qty,
+                open_residual_qty=Decimal("0"),
+                avg_price=close_price,
+                status=KanglongEventStatus.REJECTED,
+                reason="below_min_qty_or_notional",
+            )
+            open_event = KanglongEvent(
+                run_id=run_id,
+                group_id=group.group_id,
+                round_id=round_id,
+                mode="simulation",
+                account_id=group.to_account_id,
+                symbol=group.symbol,
+                position_side=group.side,
+                action_type="single_open",
+                leg_id=f"{round_id}-open",
+                paired_leg_id=f"{round_id}-close",
+                round_match_id=match_id,
+                planned_qty=planned_qty,
+                submitted_qty=submitted_qty,
+                filled_qty=Decimal("0"),
+                matched_qty=Decimal("0"),
+                close_residual_qty=Decimal("0"),
+                open_residual_qty=planned_qty,
+                avg_price=open_price,
+                status=KanglongEventStatus.REJECTED,
+                reason="below_min_qty_or_notional",
+            )
+            events.extend([close_event, open_event])
+            continue
+
         matched_qty = submitted_qty
         matched_total += matched_qty
         price_diff_pnl = _price_diff_pnl(group.side, close_price, open_price, matched_qty)

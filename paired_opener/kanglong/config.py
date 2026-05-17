@@ -23,6 +23,8 @@ class KanglongSymbolConfig:
     price_ttl_ms: int = 2000
     run_lock_ttl_ms: int = 600000
     simulation_result_ttl_ms: int = 60000
+    plan_recheck_price_drift_bps: int = 5
+    plan_recheck_qty_tolerance: Decimal = Decimal("0.0001")
 
 
 def _decimal(value: Any, default: Decimal) -> Decimal:
@@ -61,6 +63,14 @@ def _apply_overrides(base: KanglongSymbolConfig, payload: dict[str, Any]) -> Kan
         simulation_result_ttl_ms=_int(
             payload.get("simulation_result_ttl_ms"),
             base.simulation_result_ttl_ms,
+        ),
+        plan_recheck_price_drift_bps=_int(
+            payload.get("plan_recheck_price_drift_bps"),
+            base.plan_recheck_price_drift_bps,
+        ),
+        plan_recheck_qty_tolerance=_decimal(
+            payload.get("plan_recheck_qty_tolerance"),
+            base.plan_recheck_qty_tolerance,
         ),
     )
 

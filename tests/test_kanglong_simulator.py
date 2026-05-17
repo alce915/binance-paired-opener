@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
-from paired_opener.kanglong.models import KanglongGroupPlan
+from paired_opener.kanglong.models import KanglongEventStatus, KanglongGroupPlan
 from paired_opener.kanglong.reporter import summarize_costs
 from paired_opener.kanglong.service import KanglongSimulationService
 from paired_opener.kanglong.simulator import simulate_group
@@ -74,6 +74,24 @@ def test_simulate_group_tracks_rounding_residual_and_transfer_costs() -> None:
     ) * Decimal("0.0005")
     assert Decimal(costs["transfer_price_diff_loss"]) == Decimal("0.00500")
     assert all(event.realized_pnl == Decimal("0") for event in result.events)
+
+
+def test_simulate_group_rejects_qty_below_exchange_minimums() -> None:
+    result = simulate_group(
+        run_id="run-1",
+        group=group([Decimal("0.0005")]),
+        rules=SymbolRules("ETHUSDC", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("5"), 125),
+        close_price=Decimal("3100.00"),
+        open_price=Decimal("3100.50"),
+        fee_rate=Decimal("0.0005"),
+        config=KanglongSymbolConfig(),
+    )
+
+    assert result.matched_qty == Decimal("0")
+    assert [event.status for event in result.events] == [KanglongEventStatus.REJECTED, KanglongEventStatus.REJECTED]
+    assert all(event.filled_qty == Decimal("0") for event in result.events)
+    assert result.residual_ledger[0].signed_qty == Decimal("0.0005")
+    assert result.residual_ledger[0].reason == "below_min_qty_or_notional"
 
 
 def test_short_transfer_costs_use_open_leg_signed_price_diff_only() -> None:

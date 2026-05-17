@@ -45,6 +45,7 @@ _ACTIVE_KANGLONG_RUN_STATUSES = (
     "plan_confirmed",
     "execution_starting",
     "group_ready",
+    "paused_group_round_limit_exceeded",
     "paused_group_not_executable",
     "paused_plan_recheck_changed",
     "needs_abort_recover",
@@ -443,6 +444,67 @@ class SqliteRepository:
             (run_id,),
         ).fetchone()
         return int(row["latest_event_id"] or 0) if row is not None else 0
+
+    def acquire_kanglong_locks(
+        self,
+        *,
+        run_id: str,
+        lock_scopes: list[str] | set[str] | tuple[str, ...],
+        ttl_ms: int,
+    ) -> dict[str, Any] | None:
+        scopes = sorted({scope for scope in lock_scopes if scope})
+        if not scopes:
+            return None
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        expires_at = (now + timedelta(milliseconds=max(int(ttl_ms), 1000))).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM kanglong_locks WHERE expires_at <= ?",
+                (now_text,),
+            )
+            for scope in scopes:
+                row = self._connection.execute(
+                    "SELECT * FROM kanglong_locks WHERE lock_scope = ?",
+                    (scope,),
+                ).fetchone()
+                if row is not None and row["run_id"] != run_id and row["status"] == "active":
+                    return dict(row)
+            for scope in scopes:
+                self._connection.execute(
+                    """
+                    INSERT INTO kanglong_locks (lock_scope, run_id, status, heartbeat_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(lock_scope) DO UPDATE SET
+                        run_id = excluded.run_id,
+                        status = excluded.status,
+                        heartbeat_at = excluded.heartbeat_at,
+                        expires_at = excluded.expires_at
+                    """,
+                    (scope, run_id, "active", now_text, expires_at),
+                )
+        return None
+
+    def heartbeat_kanglong_locks(self, *, run_id: str, ttl_ms: int) -> None:
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        expires_at = (now + timedelta(milliseconds=max(int(ttl_ms), 1000))).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE kanglong_locks
+                SET heartbeat_at = ?, expires_at = ?
+                WHERE run_id = ? AND status = 'active'
+                """,
+                (now_text, expires_at, run_id),
+            )
+
+    def release_kanglong_locks(self, run_id: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM kanglong_locks WHERE run_id = ?",
+                (run_id,),
+            )
 
     def remember_kanglong_idempotency(
         self,

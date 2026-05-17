@@ -5,7 +5,9 @@ from decimal import Decimal
 from paired_opener.domain import PositionSide
 from paired_opener.kanglong.config import KanglongSymbolConfig
 from paired_opener.kanglong.models import KanglongBatchDebtBuffer, KanglongPlanningAccount
-from paired_opener.kanglong.planner import build_kanglong_plan
+import pytest
+
+from paired_opener.kanglong.planner import KanglongGroupRoundLimitExceeded, build_kanglong_plan
 
 
 def account(account_id: str, closeable: str, profit: str, capacity: str = "10") -> KanglongPlanningAccount:
@@ -99,3 +101,20 @@ def test_planner_records_batch_debt_buffer_for_batch_groups() -> None:
     assert plan.batch_debt_buffers[0].donor_account_id == "sub3"
     assert plan.batch_debt_buffers[0].matched_qty == Decimal("0.9")
     assert plan.batch_debt_buffers[0].repair_status == "open"
+
+
+def test_planner_raises_when_group_requires_more_than_configured_rounds() -> None:
+    with pytest.raises(KanglongGroupRoundLimitExceeded) as exc:
+        build_kanglong_plan(
+            run_id="run-1",
+            symbol="ETHUSDC",
+            selected_side=PositionSide.LONG,
+            main_account_id="main",
+            first_donor_account_id="sub1",
+            planned_release_qty=Decimal("1.0"),
+            accounts=[account("sub1", "1.0", "100")],
+            config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25"), max_rounds_per_group=3),
+        )
+
+    assert exc.value.group_index == 1
+    assert exc.value.required_rounds == 4

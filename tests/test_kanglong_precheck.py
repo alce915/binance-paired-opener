@@ -44,14 +44,25 @@ def position(symbol: str, side: PositionSide, qty: str, pnl: str) -> KanglongPos
     )
 
 
-def snapshot(account_id: str, long_qty: str, short_qty: str, long_pnl: str, short_pnl: str) -> KanglongAccountSnapshot:
+def snapshot(
+    account_id: str,
+    long_qty: str,
+    short_qty: str,
+    long_pnl: str,
+    short_pnl: str,
+    *,
+    available_balance: str = "10000",
+    equity: str = "10000",
+    margin: str = "0",
+    leverage: int = 75,
+) -> KanglongAccountSnapshot:
     return KanglongAccountSnapshot(
         account_id=account_id,
         account_name=account_id,
-        available_balance=Decimal("10000"),
-        equity=Decimal("10000"),
-        margin=Decimal("0"),
-        leverage=75,
+        available_balance=Decimal(available_balance),
+        equity=Decimal(equity),
+        margin=Decimal(margin),
+        leverage=leverage,
         positions={
             PositionSide.LONG: position("ETHUSDC", PositionSide.LONG, long_qty, long_pnl),
             PositionSide.SHORT: position("ETHUSDC", PositionSide.SHORT, short_qty, short_pnl),
@@ -110,3 +121,21 @@ def test_precheck_blocks_when_main_capacity_is_below_first_release_qty() -> None
     assert result.status == KanglongRunStatus.BLOCKED_MAIN_INSUFFICIENT_CAPACITY
     assert result.details["main_receivable_qty"] == Decimal("0.50")
     assert result.details["capacity_gap_qty"] == Decimal("0.50")
+
+
+def test_precheck_blocks_when_main_margin_capacity_is_below_first_release_qty() -> None:
+    config = KanglongSymbolConfig(
+        max_main_temp_qty=Decimal("10"),
+        margin_safety_ratio=Decimal("0.20"),
+    )
+    result = run_static_precheck(
+        main=snapshot("main", "0", "0", "0", "0", available_balance="1", equity="10000", leverage=75),
+        subaccounts=[snapshot("sub1", "1", "1", "10", "0")],
+        symbol="ETHUSDC",
+        manual_side=None,
+        config=config,
+    )
+
+    assert result.status == KanglongRunStatus.BLOCKED_MAIN_INSUFFICIENT_CAPACITY
+    assert result.details["margin_capacity_qty"] < Decimal("1")
+    assert result.details["capacity_gap_qty"] > Decimal("0")

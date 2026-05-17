@@ -318,3 +318,108 @@ def test_execute_before_confirm_does_not_poison_idempotency_key(tmp_path) -> Non
     assert "execute" not in early_execute["available_actions"]
     assert confirmed["status"] == "plan_confirmed"
     assert executed["status"] == "completed"
+
+
+def test_execute_blocks_when_recheck_price_drift_exceeds_threshold(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-recheck-drift")
+        confirmed = service.confirm_plan(
+            run_id="run-recheck-drift",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-recheck-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        executed = service.execute_plan(
+            run_id="run-recheck-drift",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-recheck-0001",
+            close_price=Decimal("3200.00"),
+            open_price=Decimal("3200.50"),
+            fee_rate=Decimal("0.0005"),
+            recheck_main_snapshot=snapshot("main", "0", "0", "0", "0"),
+            recheck_subaccount_snapshots=[
+                snapshot("sub1", "1", "1", "100", "0"),
+                snapshot("sub2", "1", "1", "80", "0"),
+            ],
+            recheck_selected_side=PositionSide.LONG,
+            recheck_config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25")),
+            recheck_snapshot_bundle_id="snap-recheck-drift",
+        )
+        stored = repository.get_kanglong_run("run-recheck-drift")
+    finally:
+        repository.close()
+
+    assert confirmed["status"] == "plan_confirmed"
+    assert executed["status"] == "blocked_plan_stale"
+    assert executed["error_code"] == "blocked_plan_stale"
+    assert stored is not None
+    assert stored["status"] == "blocked_plan_stale"
+
+
+def test_service_blocks_plan_when_first_group_exceeds_round_limit(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = service.create_plan(
+            run_id="run-round-limit",
+            symbol="ETHUSDC",
+            main_snapshot=snapshot("main", "0", "0", "0", "0"),
+            subaccount_snapshots=[snapshot("sub1", "1", "1", "100", "0")],
+            main_account_id="main",
+            subaccount_ids=["sub1"],
+            selected_side=PositionSide.LONG,
+            snapshot_bundle_id="snap-round-limit",
+            config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25"), max_rounds_per_group=3),
+            rules=_rules(),
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+        )
+    finally:
+        repository.close()
+
+    assert plan["status"] == "blocked_group_round_limit_exceeded"
+    assert plan["available_actions"] == ["refresh_plan"]
+    assert plan["report"]["blocks"] == ["blocked_group_round_limit_exceeded"]
+
+
+def test_service_blocks_overlapping_ready_plan_until_lock_is_released(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        first = _create_ready_plan(service, run_id="run-lock-1")
+        blocked = _create_ready_plan(service, run_id="run-lock-2", snapshot_bundle_id="snap-lock-2")
+        service.confirm_plan(
+            run_id="run-lock-1",
+            plan_version=first["plan_version"],
+            idempotency_key="confirm-lock-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        service.execute_plan(
+            run_id="run-lock-1",
+            plan_version=first["plan_version"],
+            idempotency_key="execute-lock-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            recheck_main_snapshot=snapshot("main", "0", "0", "0", "0"),
+            recheck_subaccount_snapshots=[
+                snapshot("sub1", "1", "1", "100", "0"),
+                snapshot("sub2", "1", "1", "80", "0"),
+            ],
+            recheck_selected_side=PositionSide.LONG,
+            recheck_config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25")),
+            recheck_snapshot_bundle_id="snap-lock-execute",
+        )
+        after_release = _create_ready_plan(service, run_id="run-lock-3", snapshot_bundle_id="snap-lock-3")
+    finally:
+        repository.close()
+
+    assert first["status"] == "chain_ready"
+    assert blocked["status"] == "blocked_run_lock_exists"
+    assert blocked["available_actions"] == ["refresh_plan"]
+    assert after_release["status"] == "chain_ready"

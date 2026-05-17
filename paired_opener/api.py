@@ -398,14 +398,48 @@ async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionR
 
 @app.post("/kanglong/simulation/plan/{run_id}/execute", response_model=KanglongPlanResponse)
 async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
-    payload = app.state.kanglong_service.execute_plan(
-        run_id=run_id,
-        plan_version=request.plan_version,
-        idempotency_key=request.idempotency_key,
-        close_price=Decimal("3100.00"),
-        open_price=Decimal("3100.50"),
-        fee_rate=Decimal("0.0005"),
-    )
+    service = app.state.kanglong_service
+    stored = service.get_run(run_id)
+    execute_kwargs = {
+        "run_id": run_id,
+        "plan_version": request.plan_version,
+        "idempotency_key": request.idempotency_key,
+        "close_price": Decimal("0"),
+        "open_price": Decimal("0"),
+        "fee_rate": Decimal("0"),
+    }
+    if (
+        stored is not None
+        and stored.get("plan_version") == request.plan_version
+        and stored.get("status") == "plan_confirmed"
+    ):
+        stored_request = stored.get("request") or {}
+        if stored_request.get("main_account_id") and stored_request.get("subaccount_ids"):
+            selected_side = (stored.get("plan") or {}).get("selected_side")
+            plan_request = KanglongPlanRequest(
+                mode=stored_request.get("mode") or "simulation",
+                symbol=stored_request.get("symbol") or stored.get("symbol"),
+                main_account_id=stored_request["main_account_id"],
+                subaccount_ids=list(stored_request["subaccount_ids"]),
+                selected_side=selected_side,
+            )
+            try:
+                inputs = await _collect_kanglong_plan_inputs(plan_request)
+            except Exception as exc:
+                _raise_api_error(exc, code="kanglong_plan_failed", source="service")
+            execute_kwargs.update(
+                {
+                    "close_price": inputs["close_price"],
+                    "open_price": inputs["open_price"],
+                    "fee_rate": inputs["fee_rate"],
+                    "recheck_main_snapshot": inputs["main_snapshot"],
+                    "recheck_subaccount_snapshots": inputs["subaccount_snapshots"],
+                    "recheck_selected_side": inputs["selected_side"],
+                    "recheck_config": inputs["config"],
+                    "recheck_snapshot_bundle_id": inputs["snapshot_bundle_id"],
+                }
+            )
+    payload = service.execute_plan(**execute_kwargs)
     return KanglongPlanResponse.model_validate(payload)
 
 
