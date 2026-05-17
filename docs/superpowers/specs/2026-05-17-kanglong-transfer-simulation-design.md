@@ -101,6 +101,9 @@ planned_qty
 submitted_qty
 filled_qty
 avg_price
+entry_price
+realized_pnl
+pnl_asset
 fee
 fee_asset
 fee_rate
@@ -129,7 +132,18 @@ event_time
 
 运行锁范围按保证金模式决定。逐仓模式按 `account_id + symbol` 加锁；全仓或共享 USDC 保证金模式按 `account_id + margin_asset` 加锁；如果无法可靠识别保证金模式，则退化为整个账号加锁。
 
-运行锁在链路执行期间必须通过 heartbeat 续期，续期间隔小于 `run_lock_ttl_ms / 2`。只有 `completed`、`blocked`、`paused` 或 `unsafe` 终态可以释放运行锁；如果进程异常退出导致锁过期，下一次运行必须先进入安全恢复检查，确认没有本模块遗留挂单和未解释仓位变化后才能重新加锁。
+运行锁在链路执行期间必须通过 heartbeat 续期，续期间隔小于 `run_lock_ttl_ms / 2`。只有以下情况可以释放运行锁：
+
+```text
+completed and final ledger closed
+blocked before any side-effect event
+paused with ledger closed
+unsafe after manual abort/recover confirmed
+```
+
+如果链路中途暂停且仍存在 `pending_debt_queue`、`residual_ledger` 或本模块遗留挂单，必须继续持锁。释放这类锁只能通过人工 `abort/recover` 流程：重新读取账号快照、撤销或确认没有本模块遗留挂单、确认未解释仓位变化已处理，并写入审计记录。
+
+如果进程异常退出导致锁过期，下一次运行必须先进入安全恢复检查，确认没有本模块遗留挂单和未解释仓位变化后才能重新加锁。
 
 第一版要求所有参与子账号在运行前已经双向配平：
 
@@ -182,7 +196,7 @@ first_donor -> main
 
 其中 `first_donor` 是盈利方向可平仓数量最高的子账号。
 
-第一组完成后，系统进入确定性亏欠队列 planner。第一组会让 `first_donor` 的 `selected_side` 数量低于运行前基准，同时让主账号临时持有同方向仓位。账本推进只使用已配对数量：
+第一组完成后，系统进入确定性亏欠队列 planner。第一组会让 `first_donor` 的 `selected_side` 数量低于运行前基准，同时让主账号临时持有同方向仓位。账本推进只使用已配对数量，残差必须结构化记录：
 
 ```text
 matched_qty = min(from_actual_closed_qty, to_actual_opened_qty)
@@ -191,7 +205,8 @@ open_residual_qty = to_actual_opened_qty - matched_qty
 
 main_buffer_qty += matched_qty
 pending_debt_queue.push(first_donor, matched_qty)
-residual_ledger += close_residual_qty + open_residual_qty
+for each nonzero residual:
+  residual_ledger.append(account_id, side, leg_type, signed_qty, reason, event_id)
 ```
 
 后续每一步从候选子账号里选择新的 donor，用该 donor 平掉盈利方向，并给 `pending_debt_queue` 中的接收账号开同方向仓位。每个实际动作仍然只生成一组账号：
@@ -200,9 +215,11 @@ residual_ledger += close_residual_qty + open_residual_qty
 donor -> receiver
 ```
 
-接收账号按 FIFO 顺序从 `pending_debt_queue` 头部选择。若队首缺口大于 donor 可转移数量，则本组只填队首的一部分；若 donor 可转移数量大于队首缺口，则继续消化下一个队列项，但每个实际动作仍然拆成独立的两账号组。
+接收账号按 FIFO 顺序从 `pending_debt_queue` 头部选择。若队首缺口大于 donor 可转移数量，则本组只填队首的一部分。
 
-本组完成后，被接收账号的缺口按 `matched_qty` 减少，donor 按 `matched_qty` 新增同方向待补回缺口。`pending_debt_queue` 的总量应始终等于主账号临时持有的 `main_buffer_qty` 加上可解释残差，直到闭合阶段由主账号回填最后剩余的缺口。
+如果 donor 可转移数量大于队首缺口，planner 可以生成 `donor_batch`。`donor_batch` 由同一个 donor 对多个 receiver 的多个两账号组组成，每个组仍然只包含一个 donor 和一个 receiver。批次内先按 FIFO 消化多个 receiver 缺口；只有整个批次结束后，才把 donor 的累计 `matched_qty` 作为一个新的待补回缺口入队。
+
+本组完成后，被接收账号的缺口按 `matched_qty` 减少。非批次组中，donor 按 `matched_qty` 新增同方向待补回缺口；批次组中，donor 只在批次结束后按累计 `batch_matched_qty` 入队。`pending_debt_queue` 的总量应始终等于主账号临时持有的 `main_buffer_qty` 加上按账号和腿可解释的残差，直到闭合阶段由主账号回填最后剩余的缺口。
 
 第一版禁止已经存在未偿还缺口的账号继续作为 donor，避免链路绕圈。只有当该账号在 `pending_debt_queue` 中的缺口被完全填平后，才允许重新进入 donor 候选池。
 
@@ -223,7 +240,9 @@ no external order, lock, or snapshot conflict
 candidate_transfer_qty = min(
   donor_closeable_profitable_qty,
   total_pending_debt_qty,
-  donor_risk_executable_qty
+  donor_risk_executable_qty,
+  receiver_receivable_qty,
+  receiver_balance_capacity_qty
 )
 ```
 
@@ -312,7 +331,18 @@ abs(from_actual_closed_qty - to_actual_opened_qty) <= qty_tolerance
 
 若不满足，暂停当前组和整条链路，状态为 `paused_round_unbalanced`。
 
-若单边执行出现部分成交、拒单、超时、残差超过容忍范围，或出现平仓成功但开仓未完成等单腿异常，进入 `round_pending_repair`，不得进入下一轮。修复优先使用账号间补偿链路；如果无法通过账号间补偿闭合，只能生成市场减仓建议，并等待单独确认。
+部分成交按两类处理：
+
+```text
+双腿等量部分成交且差额 <= qty_tolerance:
+  用 matched_qty 推进账本
+  剩余未成交数量回到 group_remaining_qty
+
+单腿部分成交、拒单、超时、残差超过容忍范围，或平仓成功但开仓未完成:
+  进入 round_pending_repair
+```
+
+进入 `round_pending_repair` 后不得进入下一轮。修复优先使用账号间补偿链路；如果无法通过账号间补偿闭合，只能生成市场减仓建议，并等待单独确认。
 
 ## 配平阶段
 
@@ -400,6 +430,9 @@ fee_open
 fee_asset
 fee_rate
 liquidity_role
+entry_price
+realized_pnl
+pnl_asset
 matched_qty
 close_residual_qty
 open_residual_qty
@@ -445,6 +478,8 @@ net_profit_after_cost
 ```
 
 报告必须区分移仓阶段和配平阶段的消耗。
+
+`released_profit` 必须来自平仓腿事件的 `realized_pnl` 汇总，并保留 `pnl_asset`。如果模拟盘只能基于 `entry_price`、`close_price` 和 `matched_qty` 估算，报告必须标记为 estimated，并保留估算公式和输入价格。
 
 ## 状态机
 
@@ -532,6 +567,7 @@ live_precheck_run_id
 lock_scope
 lock_heartbeat_history
 residual_ledger
+abort_recover_history
 event_sequence
 operator_choice
 ```
@@ -559,23 +595,26 @@ operator_choice
 - 主账号承接能力同时覆盖临时数量上限、名义风险比例、保证金、手续费、价格漂移缓冲和爆仓距离。
 - 运行锁按逐仓、全仓或共享保证金模式选择正确范围。
 - 运行锁 heartbeat 正常续期，heartbeat 丢失进入 `paused_lock_heartbeat_lost`。
+- 链路中暂停且账本未闭合时不能释放运行锁，必须通过人工 abort/recover 后释放。
 - 确定性 planner 按评分规则选择后续 donor，并用 account_id 稳定排序兜底。
 - 亏欠队列按 FIFO 消化，已有未偿还缺口的账号不能作为 donor。
-- 亏欠队列链路用 `matched_qty` 推进，残差进入 `residual_ledger`。
+- donor 可一次覆盖多个 receiver 时生成 `donor_batch`，批次结束后再把 donor 累计缺口入队。
+- Planner 计算候选数量时必须同时考虑 donor 可平仓能力和 receiver 承接能力。
+- 亏欠队列链路用 `matched_qty` 推进，结构化残差进入 `residual_ledger`。
 - 亏欠队列链路保持 `pending_debt_queue` 总量等于 `main_buffer_qty` 加可解释残差。
 - Planner 到达 `max_chain_groups`、无正收益 donor 或风险阻断时进入闭合阶段。
 - 每组只能涉及两个账号。
 - 组内按交易对数量上限拆轮。
 - 第一组超过 `max_rounds_per_group` 时阻断，后续组超过时暂停。
 - 每轮不配平时暂停，不进入下一轮。
-- 单腿异常、部分成交、拒单和超时进入 `round_pending_repair`，不得继续下一轮。
+- 双腿等量部分成交用 `matched_qty` 推进，单腿部分成交、拒单和超时进入 `round_pending_repair`。
 - 中间允许子账号临时不配平，但最终必须恢复运行前基准仓位。
 - 主账号最终必须清空。
 - 子账号恢复基准、主账号最终清空和全局账本不变量必须同时成立。
 - 残差超过容忍范围但低于最小下单规则时标记 `unsafe_dust_residual`。
 - 外部挂单、手动调仓、运行锁和快照版本异常会阻断或暂停。
 - 账号间无法闭合时只生成市场减仓建议。
-- 消耗统计正确区分手续费、手续费资产、maker/taker、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
-- 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、手续费、手续费资产、残差、交易规则不可用、配对腿 ID 和订单 ID。
+- 消耗统计正确区分 released profit、手续费、手续费资产、maker/taker、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
+- 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、realized PnL、手续费、手续费资产、残差、交易规则不可用、配对腿 ID 和订单 ID。
 - 模拟和未来实盘使用同一套规划与风控接口，仅执行模式不同。
 - 实盘候选必须校验模拟结果未过期、重新预检通过，并由操作员单独确认。
