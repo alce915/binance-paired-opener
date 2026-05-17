@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+from decimal import Decimal
+
+from paired_opener.domain import PositionSide, SymbolRules
+from paired_opener.kanglong.config import KanglongSymbolConfig
+from paired_opener.kanglong.models import KanglongGroupPlan
+from paired_opener.kanglong.reporter import summarize_costs
+from paired_opener.kanglong.simulator import simulate_group
+
+
+def group(round_qtys: list[Decimal]) -> KanglongGroupPlan:
+    return KanglongGroupPlan(
+        group_id="group-0001",
+        from_account_id="sub1",
+        to_account_id="main",
+        symbol="ETHUSDC",
+        side=PositionSide.LONG,
+        target_qty=sum(round_qtys, Decimal("0")),
+        round_qtys=round_qtys,
+    )
+
+
+def rules() -> SymbolRules:
+    return SymbolRules(
+        "ETHUSDC",
+        Decimal("0.01"),
+        Decimal("0.001"),
+        Decimal("0.001"),
+        Decimal("5"),
+        125,
+    )
+
+
+def test_simulate_group_emits_matched_close_and_open_events() -> None:
+    result = simulate_group(
+        run_id="run-1",
+        group=group([Decimal("0.01"), Decimal("0.01")]),
+        rules=rules(),
+        close_price=Decimal("3100.00"),
+        open_price=Decimal("3100.50"),
+        fee_rate=Decimal("0.0005"),
+        config=KanglongSymbolConfig(),
+    )
+
+    assert result.matched_qty == Decimal("0.02")
+    assert len(result.events) == 4
+    assert result.events[0].round_match_id == result.events[1].round_match_id
+    assert result.events[0].account_id == "sub1"
+    assert result.events[1].account_id == "main"
+
+
+def test_simulate_group_tracks_rounding_residual_and_transfer_costs() -> None:
+    result = simulate_group(
+        run_id="run-1",
+        group=group([Decimal("0.0105")]),
+        rules=rules(),
+        close_price=Decimal("3100.00"),
+        open_price=Decimal("3100.50"),
+        fee_rate=Decimal("0.0005"),
+        config=KanglongSymbolConfig(),
+    )
+
+    costs = summarize_costs(result.events, result.residual_ledger)
+
+    assert result.matched_qty == Decimal("0.010")
+    assert result.residual_ledger[0].account_id == "sub1"
+    assert result.residual_ledger[0].side == PositionSide.LONG
+    assert result.residual_ledger[0].signed_qty == Decimal("0.0005")
+    assert costs["transfer_fee_cost"] == Decimal("31.00000") * Decimal("0.0005") + Decimal("31.00500") * Decimal("0.0005")
+    assert costs["transfer_price_diff_loss"] == Decimal("0.00500")

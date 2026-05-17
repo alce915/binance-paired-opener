@@ -222,3 +222,11 @@ class KanglongPlan:
     main_account_id: str
     groups: list[KanglongGroupPlan]
     batch_debt_buffers: list[KanglongBatchDebtBuffer]
+
+
+@dataclass(slots=True)
+class KanglongGroupResult:
+    group_id: str
+    matched_qty: Decimal
+    residual_ledger: list[ResidualLedgerEntry]
+    events: list[KanglongEvent]
