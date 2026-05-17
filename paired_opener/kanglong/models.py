@@ -129,3 +129,35 @@ class KanglongEvent:
         }
         payload["fills"] = [item.to_payload() for item in self.fills]
         return payload
+
+
+@dataclass(slots=True)
+class KanglongPositionSnapshot:
+    symbol: str
+    side: PositionSide
+    qty: Decimal
+    entry_price: Decimal
+    mark_price: Decimal
+    unrealized_pnl: Decimal
+
+
+@dataclass(slots=True)
+class KanglongAccountSnapshot:
+    account_id: str
+    account_name: str
+    available_balance: Decimal
+    equity: Decimal
+    margin: Decimal
+    leverage: int
+    positions: dict[PositionSide, KanglongPositionSnapshot]
+    open_orders: list[dict[str, Any]]
+    snapshot_version: str
+    captured_at: datetime = field(default_factory=utc_now)
+
+    def qty(self, side: PositionSide) -> Decimal:
+        position = self.positions.get(side)
+        return position.qty if position else Decimal("0")
+
+    def pnl(self, side: PositionSide) -> Decimal:
+        position = self.positions.get(side)
+        return position.unrealized_pnl if position else Decimal("0")

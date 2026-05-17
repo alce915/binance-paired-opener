@@ -98,6 +98,15 @@ class AccountRuntimeManager:
             for account in self._settings.accounts.values()
         ]
 
+    def get_accounts_by_ids(self, account_ids: list[str]) -> list[AccountConfig]:
+        accounts: list[AccountConfig] = []
+        for raw_id in account_ids:
+            account_id = raw_id.strip().lower()
+            if account_id not in self._settings.accounts:
+                raise ValueError(f"Unknown account {raw_id}")
+            accounts.append(self._settings.accounts[account_id])
+        return accounts
+
     async def switch_account(self, account_id: str) -> dict[str, object]:
         normalized = account_id.strip().lower()
         async with self._lock:
