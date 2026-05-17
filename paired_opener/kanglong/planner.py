@@ -6,6 +6,7 @@ from decimal import Decimal
 from paired_opener.domain import PositionSide
 from paired_opener.kanglong.config import KanglongSymbolConfig
 from paired_opener.kanglong.models import (
+    KanglongAccountSnapshot,
     KanglongBatchDebtBuffer,
     KanglongGroupPlan,
     KanglongPlan,
@@ -124,6 +125,33 @@ def _apply_segment_to_debts(debts: list[PendingDebt], receiver_account_id: str, 
     debts[0].qty -= qty
     if debts[0].qty <= tolerance:
         debts.pop(0)
+
+
+def _opposite_side(side: PositionSide) -> PositionSide:
+    return PositionSide.SHORT if side == PositionSide.LONG else PositionSide.LONG
+
+
+def build_planning_accounts(
+    snapshots: list[KanglongAccountSnapshot],
+    selected_side: PositionSide,
+    config: KanglongSymbolConfig,
+) -> list[KanglongPlanningAccount]:
+    accounts: list[KanglongPlanningAccount] = []
+    opposite_side = _opposite_side(selected_side)
+    for snapshot in snapshots:
+        closeable_qty = snapshot.qty(selected_side) if snapshot.pnl(selected_side) > Decimal("0") else Decimal("0")
+        if closeable_qty <= config.qty_tolerance:
+            closeable_qty = Decimal("0")
+        accounts.append(
+            KanglongPlanningAccount(
+                account_id=snapshot.account_id,
+                closeable_qty=closeable_qty,
+                unrealized_profit=max(snapshot.pnl(selected_side), Decimal("0")),
+                receiver_capacity_qty=max(snapshot.qty(opposite_side), Decimal("0")),
+                risk_buffer=snapshot.available_balance,
+            )
+        )
+    return accounts
 
 
 def build_kanglong_plan(
