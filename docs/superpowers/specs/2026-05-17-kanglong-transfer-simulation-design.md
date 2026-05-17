@@ -43,6 +43,8 @@
 
 自动方向报告必须同时生成 `other_side_preview`。`other_side_preview` 展示另一方向的汇总未实现盈利、可平仓数量、首选 donor、主账号承接能力是否满足和不可执行原因。第一版只做提示，不因为另一方向可执行而自动切换 `selected_side`。
 
+`other_side_preview` 不生成执行链路，不占用运行锁，不改变 `plan_version`，也不能作为后续实盘候选。用户若要切换方向，必须重新生成新的模拟计划。
+
 策略允许用户手动选择 LONG 或 SHORT。手动方向仍必须盈利，否则检测阶段阻断。
 
 手动选择只影响盈利方向，不允许绕过盈利检查、主账号承接检查、风险阻断，也不允许手动设置释放数量。
@@ -81,7 +83,7 @@
 
 `max_chain_groups` 限制完整链路最多生成多少个账号组，避免最优化策略生成过长链路。`price_buffer_bps`、`margin_safety_ratio` 和 `min_liquidation_buffer_ratio` 用于主账号承接能力和组内风险检查。`snapshot_ttl_ms`、`price_ttl_ms` 和 `simulation_result_ttl_ms` 用于判断模拟结果和实盘启动前状态是否过期。`run_lock_ttl_ms` 用于清理异常中断后残留的运行锁；锁过期前不能启动同范围的新运行。
 
-所有仓位数量、价格、费用和 PnL 计算必须使用 Decimal，不允许使用浮点数。下单数量按交易所 step size 向下取整；任何取整差额都必须写入结构化 `residual_ledger`，最终按账号、方向和腿类型聚合校验。
+所有仓位数量、价格、费用和 PnL 计算必须使用 Decimal，不允许使用浮点数。下单数量按交易所 step size 向下取整；任何取整差额都必须写入结构化 `residual_ledger`，最终按账号、方向和腿类型聚合校验。价格按交易所 tick size 归一化；价格取整差异只进入成本估算和价差统计，不进入仓位残差账本。
 
 ## 统一执行事件模型
 
@@ -98,6 +100,7 @@ position_side
 action_type
 leg_id
 paired_leg_id
+round_match_id
 client_order_id
 exchange_order_id
 order_side
@@ -105,6 +108,9 @@ reduce_only
 planned_qty
 submitted_qty
 filled_qty
+matched_qty
+close_residual_qty
+open_residual_qty
 avg_price
 entry_price
 realized_pnl
@@ -125,7 +131,21 @@ filled_at
 event_time
 ```
 
-`action_type` 包括 `single_close`、`single_open` 和 `market_reduce_proposal`。`status` 至少包括 `filled`、`partial_filled`、`rejected`、`timeout` 和 `cancelled`。`leg_id` 和 `paired_leg_id` 用于把一轮内的平仓腿和开仓腿关联起来；实盘里记录真实交易所订单号，模拟盘里生成可回放的合成订单号。`liquidity_role` 记录 `maker` 或 `taker`，用于还原真实手续费和价差统计。
+`action_type` 包括 `single_close`、`single_open` 和 `market_reduce_proposal`。`status` 至少包括 `filled`、`partial_filled`、`rejected`、`timeout` 和 `cancelled`。`leg_id` 和 `paired_leg_id` 用于把一轮内的平仓腿和开仓腿关联起来；`round_match_id` 用于把同一轮的数量对账记录关联到两条腿事件。实盘里记录真实交易所订单号，模拟盘里生成可回放的合成订单号。`liquidity_role` 记录 `maker` 或 `taker`，用于还原真实手续费和价差统计。
+
+`fills` 中每条成交明细至少包含：
+
+```text
+trade_id
+fill_qty
+fill_price
+fee
+fee_asset
+liquidity_role
+filled_at
+```
+
+`matched_qty`、`close_residual_qty` 和 `open_residual_qty` 是轮次对账字段。单腿事件可以引用同一个 `round_match_id`，报告层按 `round_match_id` 汇总出该轮的 matched 和 residual 结果。
 
 模拟盘必须能模拟部分成交、拒单、超时、手续费、成交均价、Market fallback、残差和交易规则不可用等结果。未来实盘只替换执行适配层，不替换链路规划、预检、风控、对账和消耗统计逻辑。
 
@@ -234,6 +254,18 @@ donor -> receiver
 如果 donor 可转移数量大于队首缺口，planner 可以生成 `donor_batch`。`donor_batch` 由同一个 donor 对多个 receiver 的多个两账号组组成，每个组仍然只包含一个 donor 和一个 receiver。批次内先按 FIFO 消化多个 receiver 缺口；每个成功组立即把 donor 的 `matched_qty` 累计到 `batch_debt_buffer`。只有整个批次完成后，才把 `batch_debt_buffer` 合并为 donor 的新待补回缺口并入队。
 
 如果 `donor_batch` 中途失败，`batch_debt_buffer` 不能丢弃。已成功部分转为待修复缺口，进入 `round_pending_repair` 或 `needs_abort_recover` 路径，并写入审计记录。
+
+`batch_debt_buffer` 至少包含：
+
+```text
+batch_id
+donor_account_id
+side
+matched_qty
+completed_group_ids
+failed_group_id
+repair_status
+```
 
 本组完成后，被接收账号的缺口按 `matched_qty` 减少。非批次组中，donor 按 `matched_qty` 新增同方向待补回缺口；批次组中，donor 只在批次结束后按累计 `batch_matched_qty` 入队。`pending_debt_queue` 的总量应始终等于主账号临时持有的 `main_buffer_qty` 加上按账号和腿可解释的残差、未合并的 `batch_debt_buffer`，直到闭合阶段由主账号回填最后剩余的缺口。
 
@@ -565,6 +597,8 @@ unsafe_unclosed
 
 只有 `safe_closed` 可以作为未来实盘执行候选。需要市场减仓的结果标记为 `market_reduce_required`，必须单独确认；在没有人工确认和执行前，不得使用“closed”命名。
 
+`aborted_recovered` 只表示锁、遗留挂单和可解释账本已经通过人工恢复流程处理完毕，不等于 `safe_closed`，不能作为未来实盘候选。进入 `aborted_recovered` 后若仍要继续亢龙流程，必须重新读取快照并生成新的模拟计划。
+
 ## 未来实盘准入
 
 未来实盘候选必须同时满足：
@@ -627,6 +661,7 @@ operator_choice
 - 起始账号选择：全局 `selected_side` 确定后，选择该方向可平仓数量最高的盈利子账号。
 - 自动方向先选全局 `selected_side`，后续起始账号和 donor 都只能扫描该方向。
 - 自动方向报告展示 `other_side_preview`，但第一版不自动切换到备选方向。
+- `other_side_preview` 不生成执行链路、不占用运行锁、不改变 `plan_version`。
 - 手动方向选择：只扫描指定方向，方向不盈利时阻断。
 - 手动方向选择不能绕过释放数量、主账号承接和风险阻断规则。
 - 初始子账号未双向配平时阻断为 `blocked_initial_subaccount_unbalanced`。
@@ -640,6 +675,7 @@ operator_choice
 - 亏欠队列按 FIFO 消化，已有未偿还缺口的账号不能作为 donor。
 - donor 可一次覆盖多个 receiver 时生成 `donor_batch`，每个成功 group 累计到 `batch_debt_buffer`，批次结束后再把 donor 累计缺口入队。
 - `donor_batch` 中途失败时，`batch_debt_buffer` 转为可审计待修复缺口。
+- `batch_debt_buffer` 必须记录 donor、side、batch、matched 数量、成功组、失败组和修复状态。
 - Planner 计算候选数量时必须同时考虑 donor 可平仓能力和 receiver 承接能力。
 - Batch 覆盖多个 receiver 时，每个 receiver 的承接能力单独限制对应 group 数量，且不能跳过 FIFO 队首。
 - 亏欠队列链路用 `matched_qty` 推进，结构化残差进入 `residual_ledger`。
@@ -655,10 +691,12 @@ operator_choice
 - 子账号恢复基准、主账号最终清空和全局账本不变量必须同时成立。
 - 残差超过容忍范围但低于最小下单规则时标记 `unsafe_dust_residual`。
 - 所有数量使用 Decimal，下单数量按 step size 向下取整，rounding 差额进入 `residual_ledger` 和 `rounding_ledger`。
+- 价格使用 Decimal 并按 tick size 归一化，价格取整差异只进入成本估算和价差统计。
 - 外部挂单、手动调仓、运行锁和快照版本异常会阻断或暂停。
 - 未闭合暂停进入 `needs_abort_recover`，人工恢复过程中为 `abort_recovering`，确认恢复后记录 `aborted_recovered`。
+- `aborted_recovered` 不能作为未来实盘候选，继续流程必须重新生成模拟计划。
 - 账号间无法闭合时只生成市场减仓建议。
 - 消耗统计正确区分 released profit、手续费、手续费资产、maker/taker、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
-- 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、realized PnL、手续费、手续费资产、残差、交易规则不可用、配对腿 ID 和订单 ID。
+- 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、realized PnL、手续费、手续费资产、成交明细、matched 数量、残差、交易规则不可用、配对腿 ID 和订单 ID。
 - 模拟和未来实盘使用同一套规划与风控接口，仅执行模式不同。
 - 实盘候选必须校验模拟结果未过期、重新预检通过，并由操作员单独确认。
