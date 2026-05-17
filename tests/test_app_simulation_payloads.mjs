@@ -490,6 +490,7 @@ function loadPageScopedFormStateHelpers() {
     appRoot: { classList: classListFor("appRoot") },
     navRealBtn: { classList: classListFor("navRealBtn") },
     navSimulationBtn: { classList: classListFor("navSimulationBtn") },
+    navKanglongBtn: { classList: classListFor("navKanglongBtn") },
     modeButtons: {
       paired_open: { classList: classListFor("modePairedOpen") },
       paired_close: { classList: classListFor("modePairedClose") },
@@ -784,7 +785,7 @@ this.renderSimulationAccount = renderSimulationAccount;
 }
 
 {
-  const { elements, sandbox } = loadPageScopedFormStateHelpers();
+  const { elements, events, sandbox } = loadPageScopedFormStateHelpers();
 
   elements.get("executionSymbol").value = "BTCUSDC";
   elements.get("calcMargin").value = "50";
@@ -810,6 +811,14 @@ this.renderSimulationAccount = renderSimulationAccount;
   assert.equal(elements.get("calcMargin").value, "6500");
   assert.equal(elements.get("leverage").value, "75");
   assert.equal(sandbox.executionMode, "single_open");
+
+  await sandbox.setAppPage("kanglong");
+  assert.equal(sandbox.appPage, "kanglong");
+  assert.equal(
+    events.some((event) => event.name === "class" && event.id === "navKanglongBtn" && event.className === "active" && event.enabled === true),
+    true,
+    `kanglong page should activate the Kanglong nav button; events=${JSON.stringify(events)}`,
+  );
 }
 
 {
