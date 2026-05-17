@@ -133,6 +133,59 @@ class KanglongSimulationRunResponse(BaseModel):
     report: dict[str, Any] = Field(default_factory=dict)
 
 
+class KanglongPlanRequest(BaseModel):
+    mode: str = Field(default="simulation", pattern="^simulation$")
+    symbol: str = Field(default=DEFAULT_TRADING_SYMBOL)
+    main_account_id: str
+    subaccount_ids: list[str] = Field(..., min_length=1)
+    selected_side: PositionSide | None = None
+
+
+class KanglongActionRequest(BaseModel):
+    plan_version: str
+    idempotency_key: str = Field(..., min_length=8, max_length=128)
+    operator: str = Field(default="manual")
+    confirmed_warning_codes: list[str] = Field(default_factory=list)
+
+
+class KanglongRecoverRequest(BaseModel):
+    idempotency_key: str = Field(..., min_length=8, max_length=128)
+    operator: str = Field(default="manual")
+    release_reason: str = Field(..., min_length=3, max_length=500)
+
+
+class KanglongPlanResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    run_id: str
+    status: str
+    plan_version: str
+    snapshot_bundle_id: str
+    result_grade: str | None = None
+    available_actions: list[str] = Field(default_factory=list)
+    report: dict[str, Any] = Field(default_factory=dict)
+
+
+class KanglongRunStateResponse(KanglongPlanResponse):
+    confirmed_at: str | None = None
+    selected_side: PositionSide | None = None
+    symbol: str = Field(default=DEFAULT_TRADING_SYMBOL)
+    main_account_id: str | None = None
+    subaccount_ids: list[str] = Field(default_factory=list)
+    current_group_id: str | None = None
+    current_round_id: str | None = None
+    progress: dict[str, Any] = Field(default_factory=dict)
+    latest_event_id: int = 0
+
+
+class KanglongEventsResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    run_id: str
+    events: list[dict[str, Any]]
+    next_after_event_id: int
+    latest_event_id: int
+    has_more: bool
+
+
 class PrecheckItem(BaseModel):
     contract_version: str = CONTRACT_VERSION
     code: str

@@ -29,6 +29,8 @@ def payload_value(value: Any) -> Any:
 
 class KanglongRunStatus(StrEnum):
     DRAFT_PLAN = "draft_plan"
+    PLAN_CONFIRMED = "plan_confirmed"
+    EXECUTION_STARTING = "execution_starting"
     PRECHECK = "precheck"
     CHAIN_READY = "chain_ready"
     GROUP_READY = "group_ready"
@@ -41,8 +43,11 @@ class KanglongRunStatus(StrEnum):
     BLOCKED_MAIN_NOT_FLAT = "blocked_main_not_flat"
     BLOCKED_NO_PROFITABLE_ACCOUNT = "blocked_no_profitable_account"
     BLOCKED_MANUAL_SIDE_NOT_PROFITABLE = "blocked_manual_side_not_profitable"
+    BLOCKED_PLAN_STALE = "blocked_plan_stale"
+    BLOCKED_PLAN_RECHECK_FAILED = "blocked_plan_recheck_failed"
     BLOCKED_INITIAL_SUBACCOUNT_UNBALANCED = "blocked_initial_subaccount_unbalanced"
     PAUSED_GROUP_NOT_EXECUTABLE = "paused_group_not_executable"
+    PAUSED_PLAN_RECHECK_CHANGED = "paused_plan_recheck_changed"
     NEEDS_MARKET_REDUCE_CONFIRMATION = "needs_market_reduce_confirmation"
     NEEDS_ABORT_RECOVER = "needs_abort_recover"
     ABORT_RECOVERING = "abort_recovering"
