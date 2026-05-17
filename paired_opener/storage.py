@@ -12,7 +12,7 @@ from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME, redact_debu
 from paired_opener.domain import OpenSession, RecoveryStatus, RoundExecution, SessionStatus, SessionStopReason
 
 
-def _json_dumps(payload: dict[str, Any]) -> str:
+def _json_dumps(payload: Any) -> str:
     def encode(value: Any) -> Any:
         if isinstance(value, Decimal):
             return str(value)
@@ -132,6 +132,35 @@ class SqliteRepository:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS kanglong_runs (
+                    run_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    main_account_id TEXT NOT NULL,
+                    subaccount_ids_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_grade TEXT,
+                    request_json TEXT NOT NULL,
+                    plan_json TEXT NOT NULL DEFAULT '{{}}',
+                    report_json TEXT NOT NULL DEFAULT '{{}}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS kanglong_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    group_id TEXT,
+                    round_id TEXT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS kanglong_locks (
+                    lock_scope TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column("sessions", "session_kind", "TEXT NOT NULL DEFAULT 'paired_open'")
@@ -184,6 +213,110 @@ class SqliteRepository:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    def create_kanglong_run(self, payload: dict[str, Any]) -> None:
+        now = datetime.now(UTC).isoformat()
+        created_at = payload.get("created_at") or now
+        updated_at = payload.get("updated_at") or now
+        request_payload = payload.get("request") or {
+            "mode": "simulation",
+            "symbol": payload["symbol"],
+            "main_account_id": payload["main_account_id"],
+            "subaccount_ids": payload["subaccount_ids"],
+        }
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO kanglong_runs (
+                    run_id, symbol, main_account_id, subaccount_ids_json, status,
+                    result_grade, request_json, plan_json, report_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["run_id"],
+                    payload["symbol"],
+                    payload["main_account_id"],
+                    _json_dumps(payload["subaccount_ids"]),
+                    payload["status"],
+                    payload.get("result_grade"),
+                    _json_dumps(request_payload),
+                    _json_dumps(payload.get("plan") or {}),
+                    _json_dumps(payload.get("report") or {}),
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+    def get_kanglong_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM kanglong_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._deserialize_kanglong_run_row(row)
+
+    def update_kanglong_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        plan: dict[str, Any] | None = None,
+        report: dict[str, Any] | None = None,
+        result_grade: str | None = None,
+    ) -> None:
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT plan_json, report_json, result_grade FROM kanglong_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if current is None:
+                return
+            self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET status = ?,
+                    result_grade = ?,
+                    plan_json = ?,
+                    report_json = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    status,
+                    result_grade if result_grade is not None else current["result_grade"],
+                    _json_dumps(plan) if plan is not None else current["plan_json"],
+                    _json_dumps(report) if report is not None else current["report_json"],
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                ),
+            )
+
+    def add_kanglong_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        group_id: str | None = None,
+        round_id: str | None = None,
+    ) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO kanglong_events (run_id, group_id, round_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    group_id,
+                    round_id,
+                    event_type,
+                    _json_dumps(payload),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            return int(cursor.lastrowid)
 
     def create_session(self, session: OpenSession) -> None:
         with self._lock, self._connection:
@@ -676,6 +809,14 @@ class SqliteRepository:
     def _deserialize_event_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["payload"] = _json_load(payload.pop("payload_json", "{}"), {})
+        return payload
+
+    def _deserialize_kanglong_run_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["subaccount_ids"] = _json_load(payload.pop("subaccount_ids_json", "[]"), [])
+        payload["request"] = _json_load(payload.pop("request_json", "{}"), {})
+        payload["plan"] = _json_load(payload.pop("plan_json", "{}"), {})
+        payload["report"] = _json_load(payload.pop("report_json", "{}"), {})
         return payload
 
     def _deserialize_session_row(self, row: sqlite3.Row) -> dict[str, Any]:

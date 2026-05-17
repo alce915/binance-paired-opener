@@ -6,7 +6,9 @@ from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
 from paired_opener.kanglong.models import KanglongGroupPlan
 from paired_opener.kanglong.reporter import summarize_costs
+from paired_opener.kanglong.service import KanglongSimulationService
 from paired_opener.kanglong.simulator import simulate_group
+from paired_opener.storage import SqliteRepository
 
 
 def group(round_qtys: list[Decimal]) -> KanglongGroupPlan:
@@ -69,3 +71,25 @@ def test_simulate_group_tracks_rounding_residual_and_transfer_costs() -> None:
     assert result.residual_ledger[0].signed_qty == Decimal("0.0005")
     assert costs["transfer_fee_cost"] == Decimal("31.00000") * Decimal("0.0005") + Decimal("31.00500") * Decimal("0.0005")
     assert costs["transfer_price_diff_loss"] == Decimal("0.00500")
+
+
+def test_kanglong_service_persists_run_payload(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+
+    try:
+        payload = service.create_draft_run(
+            run_id="run-1",
+            symbol="ETHUSDC",
+            main_account_id="main",
+            subaccount_ids=["sub1", "sub2"],
+        )
+
+        stored = repository.get_kanglong_run("run-1")
+    finally:
+        repository.close()
+
+    assert payload["run_id"] == "run-1"
+    assert stored is not None
+    assert stored["status"] == "draft_plan"
+    assert stored["subaccount_ids"] == ["sub1", "sub2"]
