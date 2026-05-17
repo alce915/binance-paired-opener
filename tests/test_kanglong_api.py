@@ -97,7 +97,16 @@ class FakeKanglongGateway:
         return {
             "account_id": self.account_id,
             "account_name": self.account_id.upper(),
-            "positions": [],
+            "positions": [
+                {
+                    "symbol": "ETHUSDC",
+                    "position_side": "LONG",
+                    "qty": "1.25" if self.account_id == "sub1" else "0",
+                    "entry_price": "3000",
+                    "mark_price": "3100",
+                    "unrealized_pnl": "12.5" if self.account_id == "sub1" else "0",
+                }
+            ],
             "open_orders": [],
             "totals": {
                 "available_balance": "100",
@@ -123,6 +132,13 @@ class FakeRuntimeManager:
     def __init__(self) -> None:
         self.gateways: dict[str, FakeKanglongGateway] = {}
         self.build_calls: list[str] = []
+
+    def list_accounts(self) -> list[dict[str, object]]:
+        return [
+            {"id": "main", "name": "MAIN", "is_active": True},
+            {"id": "sub1", "name": "SUB1", "is_active": False},
+            {"id": "sub2", "name": "SUB2", "is_active": False},
+        ]
 
     def build_temporary_gateway(self, account_id: str) -> FakeKanglongGateway:
         self.build_calls.append(account_id)
@@ -219,6 +235,24 @@ async def test_collect_kanglong_plan_inputs_uses_snapshots_and_closes_gateways(m
     assert all(gateway.snapshot_called for gateway in runtime_manager.gateways.values())
     assert runtime_manager.gateways["main"].rules_called is True
     assert runtime_manager.gateways["main"].quote_called is True
+    assert all(gateway.closed for gateway in runtime_manager.gateways.values())
+
+
+@pytest.mark.asyncio
+async def test_kanglong_account_snapshot_route_returns_symbol_positions(monkeypatch) -> None:
+    runtime_manager = FakeRuntimeManager()
+    api_module.app.state.runtime_manager = runtime_manager
+    api_module.app.state.settings = Settings()
+
+    response = await api_module.list_kanglong_simulation_accounts(symbol="ETHUSDC")
+
+    accounts = response["accounts"]
+    sub1 = next(account for account in accounts if account["id"] == "sub1")
+    assert runtime_manager.build_calls == ["main", "sub1", "sub2"]
+    assert sub1["positions"][0]["symbol"] == "ETHUSDC"
+    assert sub1["positions"][0]["position_side"] == "LONG"
+    assert sub1["positions"][0]["qty"] == "1.25"
+    assert all(gateway.snapshot_called for gateway in runtime_manager.gateways.values())
     assert all(gateway.closed for gateway in runtime_manager.gateways.values())
 
 

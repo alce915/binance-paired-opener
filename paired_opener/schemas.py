@@ -388,6 +388,12 @@ class AccountSummary(BaseModel):
     id: str
     name: str
     is_active: bool
+    positions: list[dict[str, Any]] = Field(default_factory=list)
+    totals: dict[str, Any] = Field(default_factory=dict)
+    snapshot_version: str | None = None
+    risk_unknown: bool = False
+    status: str | None = None
+    error: str | None = None
 
 
 class AccountListResponse(BaseModel):

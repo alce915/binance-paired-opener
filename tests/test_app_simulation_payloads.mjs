@@ -725,6 +725,82 @@ this.renderSimulationAccount = renderSimulationAccount;
   return { elements, sandbox, renderSimulationAccount: sandbox.renderSimulationAccount };
 }
 
+function loadKanglongAccountCardHelper() {
+  const start = appSource.indexOf("function kanglongAccountId");
+  const end = appSource.indexOf("\nfunction ensureKanglongMainAccount", start);
+  assert.notEqual(start, -1, "kanglong account helpers should exist");
+  assert.notEqual(end, -1, "kanglong account helpers should end before ensureKanglongMainAccount");
+  const source = appSource.slice(start, end);
+
+  function makeElement(tagName) {
+    return {
+      tagName,
+      className: "",
+      textContent: "",
+      type: "",
+      checked: false,
+      dataset: {},
+      children: [],
+      setAttribute(name, value) {
+        this[name] = value;
+      },
+      addEventListener() {},
+      appendChild(child) {
+        this.children.push(child);
+      },
+      append(...children) {
+        this.children.push(...children);
+      },
+    };
+  }
+
+  function collectText(node) {
+    if (!node || typeof node !== "object") return "";
+    return [
+      node.textContent || "",
+      ...(node.children || []).map(collectText),
+    ].filter(Boolean).join(" ");
+  }
+
+  const sandbox = {
+    activeSymbol: "ETHUSDC",
+    DEFAULT_SYMBOL: "ETHUSDC",
+    DEFAULT_ACCOUNT_NAME: "默认账户",
+    kanglongSymbol: { value: "ETHUSDC" },
+    kanglongSide: { value: "LONG" },
+    kanglongState: { checkedPoolAccountIds: new Set(), selectedSubaccountIds: new Set() },
+    document: {
+      createElement: makeElement,
+    },
+    copyOrDefault(_key, fallback, params = {}) {
+      return String(fallback).replace(/\{([^{}]+)\}/g, (_match, name) => String(params[name] ?? `{${name}}`));
+    },
+    normalizeSymbol(value) {
+      return String(value || "").trim().toUpperCase();
+    },
+    formatNumber(value, digits = 6) {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric.toFixed(digits) : "0";
+    },
+    formatDisplayPrice(value, digits = 2) {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric.toFixed(digits) : "--";
+    },
+    Set,
+    String,
+    Number,
+  };
+
+  vm.runInNewContext(
+    `
+${source}
+this.renderKanglongAccountRow = renderKanglongAccountRow;
+`,
+    sandbox,
+  );
+  return { collectText, sandbox, renderKanglongAccountRow: sandbox.renderKanglongAccountRow };
+}
+
 {
   const { events, applySimulationPayloadToForm } = loadSimulationPayloadHelpers();
 
@@ -1000,6 +1076,40 @@ this.renderSimulationAccount = renderSimulationAccount;
   assert.equal(sandbox.executionSymbol.value, "BTCUSDC");
   assert.deepEqual(optionNodes.map((option) => option.value), ["BTCUSDC", "ETHUSDC"]);
   assert.deepEqual(sandbox.executionPageFormStates, {}, "whitelist loading should not mutate page-scoped saved form state");
+}
+
+{
+  const { collectText, renderKanglongAccountRow } = loadKanglongAccountCardHelper();
+  const row = renderKanglongAccountRow({
+    id: "sub1",
+    name: "子账号 1",
+    positions: [
+      {
+        symbol: "ETHUSDC",
+        position_side: "LONG",
+        qty: "1.2345",
+        entry_price: "3000",
+        mark_price: "3100.25",
+        unrealized_pnl: "12.5",
+      },
+    ],
+  }, { role: "pool" });
+  const text = collectText(row);
+
+  assert.match(text, /数量\s*1\.234500/, "kanglong account card should display selected-side position qty");
+  assert.match(text, /开仓均价\s*3000\.00/, "kanglong account card should display entry price");
+  assert.match(text, /标记价格\s*3100\.25/, "kanglong account card should display mark price");
+  assert.match(text, /未实现盈亏\s*12\.5000/, "kanglong account card should display pnl");
+}
+
+{
+  const { collectText, sandbox, renderKanglongAccountRow } = loadKanglongAccountCardHelper();
+  sandbox.kanglongState.accountSnapshotsLoading = true;
+  const row = renderKanglongAccountRow({ id: "sub1", name: "子账号 1", positions: [] }, { role: "pool" });
+  const text = collectText(row);
+
+  assert.match(text, /持仓加载中/, "kanglong account card should not show no-position while snapshots are loading");
+  assert.doesNotMatch(text, /无本方向持仓/);
 }
 
 {

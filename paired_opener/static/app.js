@@ -108,6 +108,9 @@ const kanglongState = {
   latestEventId: 0,
   seenEventIds: new Set(),
   logFilter: "all",
+  accountSnapshotRefreshTimer: null,
+  accountSnapshotsLoading: false,
+  accountSnapshotsLoaded: false,
 };
 let kanglongActiveRunRestored = false;
 let whitelistSymbols = [];
@@ -1277,16 +1280,28 @@ function selectedKanglongSide() {
   return String(kanglongSide?.value || "").trim().toUpperCase();
 }
 
-function kanglongPositionForAccount(account) {
+function kanglongPositionsForAccount(account) {
   const positions = Array.isArray(account?.positions) ? account.positions : [];
   const symbol = selectedKanglongSymbol();
   const side = selectedKanglongSide();
-  return positions.find((position) => {
-    const positionSymbol = normalizeSymbol(position.symbol || position.contract || "");
-    const positionSide = String(position.position_side || position.side || "").trim().toUpperCase();
-    if (positionSymbol && positionSymbol !== symbol) return false;
-    return !side || !positionSide || positionSide === side;
-  }) || null;
+  return positions
+    .filter((position) => {
+      const positionSymbol = normalizeSymbol(position.symbol || position.contract || "");
+      const positionSide = String(position.position_side || position.side || "").trim().toUpperCase();
+      const qty = Number(position.qty ?? position.position_amt ?? position.positionAmt ?? 0);
+      if (positionSymbol && positionSymbol !== symbol) return false;
+      if (side && positionSide && positionSide !== side) return false;
+      return Number.isFinite(qty) && Math.abs(qty) > 0;
+    })
+    .sort((left, right) => {
+      const leftSide = String(left.position_side || left.side || "").trim().toUpperCase();
+      const rightSide = String(right.position_side || right.side || "").trim().toUpperCase();
+      return leftSide.localeCompare(rightSide);
+    });
+}
+
+function kanglongPositionForAccount(account) {
+  return kanglongPositionsForAccount(account)[0] || null;
 }
 
 function kanglongAccountBadges(account, role = "pool") {
@@ -1298,7 +1313,13 @@ function kanglongAccountBadges(account, role = "pool") {
   }
   const position = kanglongPositionForAccount(account);
   if (!position) {
-    badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.no_position", "无本方向持仓") });
+    if (account?.risk_unknown || account?.riskUnknown) {
+      badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.risk_unknown", "风险未知") });
+    } else if (kanglongState.accountSnapshotsLoading && !kanglongState.accountSnapshotsLoaded) {
+      badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.position_loading", "持仓加载中") });
+    } else {
+      badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.no_position", "无本方向持仓") });
+    }
     return badges;
   }
   const pnl = Number(position.unrealized_pnl ?? position.unrealizedPnl ?? position.pnl ?? 0);
@@ -1314,6 +1335,38 @@ function kanglongAccountBadges(account, role = "pool") {
     badges.push({ tone: "warn", text: copyOrDefault("console.kanglong.card.risk_unknown", "风险未知") });
   }
   return badges;
+}
+
+function renderKanglongPositionMetrics(account) {
+  const positions = kanglongPositionsForAccount(account);
+  if (!positions.length) return null;
+  const metrics = document.createElement("div");
+  metrics.className = "kanglong-account-position-metrics";
+  positions.slice(0, 2).forEach((position) => {
+    const side = String(position.position_side || position.side || "").trim().toUpperCase();
+    const sideLabel = side === "SHORT"
+      ? copyOrDefault("console.position_side.short", "空")
+      : copyOrDefault("console.position_side.long", "多");
+    const pnlValue = Number(position.unrealized_pnl ?? position.unrealizedPnl ?? position.pnl ?? 0);
+    const fields = [
+      [`${sideLabel} ${copyOrDefault("console.position_fields.qty", "数量")}`, formatNumber(position.qty || position.position_amt || 0, 6)],
+      [copyOrDefault("console.position_fields.entry_price", "开仓均价"), formatDisplayPrice(position.entry_price || position.entryPrice, 2)],
+      [copyOrDefault("console.position_fields.mark_price", "标记价格"), formatDisplayPrice(position.mark_price || position.markPrice, 2)],
+      [copyOrDefault("console.position_fields.unrealized_pnl", "未实现盈亏"), formatNumber(pnlValue, 4), pnlValue > 0 ? "positive" : pnlValue < 0 ? "negative" : ""],
+    ];
+    fields.forEach(([label, value, tone]) => {
+      const item = document.createElement("span");
+      item.className = `kanglong-account-position-metric${tone ? ` ${tone}` : ""}`;
+      const labelNode = document.createElement("small");
+      labelNode.textContent = label;
+      const valueNode = document.createElement("strong");
+      valueNode.className = "mono";
+      valueNode.textContent = value;
+      item.append(labelNode, valueNode);
+      metrics.appendChild(item);
+    });
+  });
+  return metrics;
 }
 
 function renderKanglongAccountRow(account, opts = {}) {
@@ -1363,7 +1416,9 @@ function renderKanglongAccountRow(account, opts = {}) {
     node.textContent = badge.text;
     badges.appendChild(node);
   });
+  const positionMetrics = renderKanglongPositionMetrics(account);
   meta.append(name, detail, badges);
+  if (positionMetrics) meta.appendChild(positionMetrics);
   row.appendChild(meta);
 
   if (role === "selected") {
@@ -1855,6 +1910,32 @@ async function loadAccounts() {
   const payload = await request("/config/accounts");
   renderAccountOptions(payload.accounts || []);
   return payload.accounts || [];
+}
+
+async function refreshKanglongAccountSnapshots() {
+  const symbol = selectedKanglongSymbol();
+  kanglongState.accountSnapshotsLoading = true;
+  kanglongState.accountSnapshotsLoaded = false;
+  renderKanglongAccountPool(availableAccounts);
+  try {
+    const payload = await request(`/kanglong/simulation/accounts?symbol=${encodeURIComponent(symbol)}`);
+    kanglongState.accountSnapshotsLoaded = true;
+    renderAccountOptions(payload.accounts || []);
+    return payload.accounts || [];
+  } finally {
+    kanglongState.accountSnapshotsLoading = false;
+    renderKanglongAccountPool(availableAccounts);
+  }
+}
+
+function refreshKanglongAccountSnapshotsSoon() {
+  window.clearTimeout(kanglongState.accountSnapshotRefreshTimer);
+  kanglongState.accountSnapshotRefreshTimer = window.setTimeout(() => {
+    refreshKanglongAccountSnapshots().catch((error) => appendLog("error", "", undefined, {
+      messageCode: "runtime.kanglong.request_failed",
+      messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+    }));
+  }, 250);
 }
 
 function rebuildSymbolOptions(selectedSymbol = activeSymbol) {
@@ -3510,6 +3591,14 @@ async function applyAppPage(page) {
     maybeScheduleCurrentModePrecheck("page_switch");
   } else if (appPage === "kanglong" && typeof renderKanglongAccountPool === "function") {
     renderKanglongAccountPool(availableAccounts);
+    try {
+      await refreshKanglongAccountSnapshots();
+    } catch (error) {
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.kanglong.request_failed",
+        messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+      });
+    }
     await restoreActiveKanglongRun();
   }
   return true;
@@ -5135,6 +5224,7 @@ kanglongExecutePlanBtn?.addEventListener("click", () => runKanglongWorkflowActio
 kanglongSymbol?.addEventListener("input", () => {
   invalidateKanglongPlan();
   renderKanglongAccountPool();
+  if (appPage === "kanglong") refreshKanglongAccountSnapshotsSoon();
 });
 kanglongSide?.addEventListener("change", () => {
   invalidateKanglongPlan();

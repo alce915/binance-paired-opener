@@ -352,6 +352,7 @@
   "console.kanglong.actions.add_selected": "加入子账号",
   "console.kanglong.actions.remove": "移除",
   "console.kanglong.actions.set_main": "设为主账号",
+  "console.kanglong.card.position_loading": "持仓加载中",
   "console.kanglong.card.no_position": "无本方向持仓",
   "console.kanglong.card.no_profit": "无盈利仓位",
   "console.kanglong.card.stale": "数据过期",

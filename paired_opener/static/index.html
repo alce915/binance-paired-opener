@@ -155,6 +155,35 @@
         gap: 6px;
         flex-wrap: wrap;
       }
+      .kanglong-account-position-metrics {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(84px, 1fr));
+        gap: 5px;
+        margin-top: 2px;
+      }
+      .kanglong-account-position-metric {
+        min-width: 0;
+        padding: 4px 6px;
+        border-radius: 6px;
+        background: rgba(255, 240, 215, 0.5);
+        color: #44382b;
+        line-height: 1.2;
+      }
+      .kanglong-account-position-metric small {
+        display: block;
+        color: #7a6b58;
+        font-size: 0.7rem;
+        white-space: nowrap;
+      }
+      .kanglong-account-position-metric strong {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.82rem;
+      }
+      .kanglong-account-position-metric.positive strong { color: #11664b; }
+      .kanglong-account-position-metric.negative strong { color: #8d302d; }
       .kanglong-account-row .inline-btn {
         min-width: 96px;
         padding: 8px 10px;

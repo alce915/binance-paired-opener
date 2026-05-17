@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app_i18n.runtime import DEFAULT_LOCALE, DEFAULT_TIMEZONE, format_copy, frontend_bootstrap_payload, make_api_detail
 from paired_opener.account_runtime import AccountRuntimeManager
-from paired_opener.config import DEFAULT_LEVERAGE, Settings, settings
+from paired_opener.config import DEFAULT_LEVERAGE, DEFAULT_TRADING_SYMBOL, Settings, settings
 from paired_opener.domain import ExchangeStateError, SessionConflictError
 from paired_opener.errors import TradingError, ensure_trading_error, http_status_for_error, invalid_parameter_error
 from paired_opener.kanglong.config import load_kanglong_symbol_config
@@ -105,6 +105,65 @@ def _validate_kanglong_account_ids(request: KanglongPlanRequest) -> None:
                 detail={"code": "kanglong_duplicate_account", "account_id": subaccount_id},
             )
         seen_subaccounts.add(normalized)
+
+
+def _api_text(value: object) -> str:
+    if isinstance(value, Decimal):
+        return str(value)
+    return str(value or "")
+
+
+def _position_side_from_payload(position: dict, qty: Decimal) -> str:
+    raw = str(position.get("position_side") or position.get("side") or "").strip().upper()
+    if raw in {"LONG", "SHORT"}:
+        return raw
+    return "SHORT" if qty < Decimal("0") else "LONG"
+
+
+def _kanglong_account_positions_payload(snapshot: dict, symbol: str) -> list[dict]:
+    normalized_symbol = symbol.strip().upper()
+    positions: list[dict] = []
+    for raw_position in snapshot.get("positions") or []:
+        if not isinstance(raw_position, dict):
+            continue
+        position_symbol = str(raw_position.get("symbol") or raw_position.get("contract") or "").strip().upper()
+        if position_symbol and position_symbol != normalized_symbol:
+            continue
+        try:
+            signed_qty = Decimal(str(raw_position.get("position_amt") or raw_position.get("positionAmt") or raw_position.get("qty") or "0"))
+        except Exception:
+            signed_qty = Decimal("0")
+        side = _position_side_from_payload(raw_position, signed_qty)
+        qty = abs(signed_qty)
+        notional = raw_position.get("notional")
+        if notional is None:
+            try:
+                mark_price = Decimal(str(raw_position.get("mark_price") or raw_position.get("markPrice") or "0"))
+                notional = qty * mark_price
+            except Exception:
+                notional = "0"
+        positions.append(
+            {
+                "symbol": position_symbol or normalized_symbol,
+                "position_side": side,
+                "qty": _api_text(qty),
+                "entry_price": _api_text(raw_position.get("entry_price") or raw_position.get("entryPrice")),
+                "mark_price": _api_text(raw_position.get("mark_price") or raw_position.get("markPrice")),
+                "unrealized_pnl": _api_text(raw_position.get("unrealized_pnl") or raw_position.get("unrealizedPnl")),
+                "liquidation_price": _api_text(raw_position.get("liquidation_price") or raw_position.get("liquidationPrice")),
+                "notional": _api_text(notional),
+                "leverage": raw_position.get("leverage"),
+                "margin": _api_text(raw_position.get("margin")),
+            }
+        )
+    return positions
+
+
+def _kanglong_account_totals_payload(snapshot: dict) -> dict:
+    totals = snapshot.get("totals") or {}
+    if not isinstance(totals, dict):
+        return {}
+    return {str(key): _api_text(value) for key, value in totals.items()}
 
 
 async def _collect_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
@@ -382,6 +441,46 @@ async def create_kanglong_simulation_plan(request: KanglongPlanRequest) -> Kangl
     except Exception as exc:
         _raise_api_error(exc, code="kanglong_plan_failed", source="service")
     return KanglongPlanResponse.model_validate(payload)
+
+
+@app.get("/kanglong/simulation/accounts", response_model=AccountListResponse)
+async def list_kanglong_simulation_accounts(symbol: str = Query(default=DEFAULT_TRADING_SYMBOL)) -> dict:
+    normalized_symbol = symbol.strip().upper() or DEFAULT_TRADING_SYMBOL
+    runtime_manager: AccountRuntimeManager = app.state.runtime_manager
+    accounts = []
+    for account in runtime_manager.list_accounts():
+        account_id = str(account.get("id") or account.get("account_id") or "").strip().lower()
+        payload = {
+            "id": account_id,
+            "name": account.get("name") or account.get("account_name") or account_id,
+            "is_active": bool(account.get("is_active")),
+            "positions": [],
+            "totals": {},
+            "snapshot_version": None,
+            "risk_unknown": False,
+            "status": "ok",
+        }
+        gateway = None
+        try:
+            gateway = runtime_manager.build_temporary_gateway(account_id)
+            snapshot = await gateway.get_unified_account_snapshot()
+            payload["positions"] = _kanglong_account_positions_payload(snapshot, normalized_symbol)
+            payload["totals"] = _kanglong_account_totals_payload(snapshot)
+            payload["snapshot_version"] = str(snapshot.get("updated_at") or snapshot.get("snapshot_version") or "")
+            payload["name"] = snapshot.get("account_name") or payload["name"]
+        except Exception as exc:
+            payload["risk_unknown"] = True
+            payload["status"] = "snapshot_failed"
+            payload["error"] = str(exc)
+        finally:
+            if gateway is not None:
+                try:
+                    await gateway.close()
+                except Exception:
+                    payload["risk_unknown"] = True
+                    payload["status"] = "snapshot_close_failed"
+        accounts.append(payload)
+    return {"accounts": accounts}
 
 
 @app.post("/kanglong/simulation/plan/{run_id}/confirm", response_model=KanglongPlanResponse)
