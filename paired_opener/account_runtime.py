@@ -107,6 +107,14 @@ class AccountRuntimeManager:
             accounts.append(self._settings.accounts[account_id])
         return accounts
 
+    def build_temporary_gateway(self, account_id: str) -> ClassifiedExchangeGateway:
+        normalized = account_id.strip().lower()
+        if normalized not in self._settings.accounts:
+            raise ValueError(f"Unknown account {account_id}")
+        return ClassifiedExchangeGateway(
+            BinanceFuturesGateway(self._settings, self._settings.accounts[normalized])
+        )
+
     async def switch_account(self, account_id: str) -> dict[str, object]:
         normalized = account_id.strip().lower()
         async with self._lock:
