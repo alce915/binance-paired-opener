@@ -415,13 +415,15 @@ function makeKanglongHarness(requestImpl) {
 }
 
 {
+  const calls = [];
   const api = makeKanglongHarness(async (requestPath) => {
+    calls.push(requestPath);
     if (requestPath === "/kanglong/simulation/run/active") {
       return {
         run_id: "active-run",
         status: "plan_confirmed",
         plan_version: "plan-active",
-        latest_event_id: 0,
+        latest_event_id: 5,
         available_actions: ["execute"],
         report: { summary: { group_count: 1 } },
       };
@@ -430,8 +432,16 @@ function makeKanglongHarness(requestImpl) {
   });
 
   await api.restoreActiveKanglongRun();
+  await api.restoreActiveKanglongRun();
 
   assert.equal(api.state.plan.run_id, "active-run", "restore should keep the active plan when event polling fails");
-  assert.equal(api.logs.length, 1, "event polling failure should be logged once");
+  assert.equal(api.state.latestEventId, 0, "failed restore polling should not seed the cursor from active latest_event_id");
+  assert.deepEqual(calls, [
+    "/kanglong/simulation/run/active",
+    "/kanglong/simulation/run/active-run/events?after_event_id=0",
+    "/kanglong/simulation/run/active",
+    "/kanglong/simulation/run/active-run/events?after_event_id=0",
+  ], "failed restore polling should leave active restore retryable from the beginning");
+  assert.equal(api.logs.length, 2, "each failed restore polling attempt should be logged");
   assert.equal(api.logs[0].options.messageCode, "runtime.kanglong.request_failed", "restore polling failure should use Kanglong request error copy");
 }

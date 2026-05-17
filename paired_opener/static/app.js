@@ -1639,8 +1639,7 @@ async function restoreActiveKanglongRun() {
   kanglongState.confirmedPlanVersion = (
     payload.status === "plan_confirmed" || (actions.includes("execute") && planVersion)
   ) ? planVersion : "";
-  const latestEventId = Number(payload.latest_event_id || 0);
-  kanglongState.latestEventId = Number.isFinite(latestEventId) && latestEventId > 0 ? latestEventId : 0;
+  kanglongState.latestEventId = 0;
   kanglongState.seenEventIds.clear();
   restoreKanglongSelectionFromPayload(payload);
   renderKanglongAccountPool(availableAccounts);
@@ -1652,6 +1651,8 @@ async function restoreActiveKanglongRun() {
   try {
     await pollKanglongEvents({ afterEventId: 0 });
   } catch (error) {
+    kanglongActiveRunRestored = false;
+    kanglongState.latestEventId = 0;
     appendLog("error", "", undefined, {
       messageCode: "runtime.kanglong.request_failed",
       messageParams: { error: userVisibleErrorMessage(error, error?.message) },
