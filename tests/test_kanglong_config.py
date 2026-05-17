@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from paired_opener.config import Settings
 from paired_opener.domain import PositionSide
+from paired_opener.kanglong.config import load_kanglong_symbol_config
 from paired_opener.kanglong.models import KanglongEvent, KanglongEventStatus, KanglongRunStatus, ResidualLedgerEntry
 
 
@@ -54,3 +56,27 @@ def test_residual_ledger_keeps_account_side_and_leg_type() -> None:
     assert payload["side"] == "LONG"
     assert payload["leg_type"] == "close"
     assert payload["signed_qty"] == "0.001"
+
+
+def test_ethusdc_kanglong_config_defaults() -> None:
+    config = load_kanglong_symbol_config(Settings(_env_file=None), "ETHUSDC")
+
+    assert config.per_round_qty_limit == Decimal("0.05")
+    assert config.qty_tolerance == Decimal("0.0001")
+    assert config.max_rounds_per_group == 30
+    assert config.max_chain_groups == 100
+
+
+def test_symbol_config_file_overrides_defaults(tmp_path) -> None:
+    config_file = tmp_path / "kanglong_symbol_configs.json"
+    config_file.write_text(
+        '{"ETHUSDC":{"per_round_qty_limit":"0.02","qty_tolerance":"0.0002","max_rounds_per_group":10}}',
+        encoding="utf-8",
+    )
+    settings = Settings(_env_file=None, kanglong_symbol_configs_file=config_file)
+
+    config = load_kanglong_symbol_config(settings, "ETHUSDC")
+
+    assert config.per_round_qty_limit == Decimal("0.02")
+    assert config.qty_tolerance == Decimal("0.0002")
+    assert config.max_rounds_per_group == 10

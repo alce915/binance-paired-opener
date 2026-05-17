@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     active_account_file: Path = CONFIG_DIR / "active_account.json"
     symbol_whitelist: list[str] = Field(default_factory=lambda: ["ETHUSDC", "BTCUSDC"])
     symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"
+    kanglong_symbol_configs_file: Path = CONFIG_DIR / "kanglong_symbol_configs.json"
     session_event_retention_days: int = 30
     session_event_retention_per_session: int = 2_000
     runtime_log_max_bytes: int = 20 * 1024 * 1024
