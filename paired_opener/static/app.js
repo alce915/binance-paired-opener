@@ -1398,16 +1398,11 @@ function renderKanglongAccountRow(account, opts = {}) {
 
   const meta = document.createElement("div");
   meta.className = "kanglong-account-meta";
+  const heading = document.createElement("div");
+  heading.className = "kanglong-account-heading";
   const name = document.createElement("div");
   name.className = "kanglong-account-name";
   name.textContent = kanglongAccountLabel(account);
-  const detail = document.createElement("div");
-  detail.className = "kanglong-account-detail";
-  detail.textContent = [
-    accountId || "--",
-    selectedKanglongSymbol(),
-    selectedKanglongSide() || copyOrDefault("console.kanglong.side_auto", "自动选择"),
-  ].join(" · ");
   const badges = document.createElement("div");
   badges.className = "kanglong-account-badges";
   kanglongAccountBadges(account, role).forEach((badge) => {
@@ -1416,8 +1411,16 @@ function renderKanglongAccountRow(account, opts = {}) {
     node.textContent = badge.text;
     badges.appendChild(node);
   });
+  heading.append(name, badges);
+  const detail = document.createElement("div");
+  detail.className = "kanglong-account-detail";
+  detail.textContent = [
+    accountId || "--",
+    selectedKanglongSymbol(),
+    selectedKanglongSide() || copyOrDefault("console.kanglong.side_auto", "自动选择"),
+  ].join(" · ");
   const positionMetrics = renderKanglongPositionMetrics(account);
-  meta.append(name, detail, badges);
+  meta.append(heading, detail);
   if (positionMetrics) meta.appendChild(positionMetrics);
   row.appendChild(meta);
 
@@ -1435,11 +1438,6 @@ function renderKanglongAccountRow(account, opts = {}) {
     mainButton.textContent = copyOrDefault("console.kanglong.actions.set_main", "设为主账号");
     mainButton.addEventListener("click", () => setKanglongMainAccount(accountId));
     row.appendChild(mainButton);
-  } else {
-    const badge = document.createElement("span");
-    badge.className = "badge success";
-    badge.textContent = copyOrDefault("console.kanglong.card.main", "主账号");
-    row.appendChild(badge);
   }
   return row;
 }

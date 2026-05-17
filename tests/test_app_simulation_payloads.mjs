@@ -762,6 +762,16 @@ function loadKanglongAccountCardHelper() {
     ].filter(Boolean).join(" ");
   }
 
+  function findByClass(node, className) {
+    if (!node || typeof node !== "object") return null;
+    if (String(node.className || "").split(/\s+/).includes(className)) return node;
+    for (const child of node.children || []) {
+      const found = findByClass(child, className);
+      if (found) return found;
+    }
+    return null;
+  }
+
   const sandbox = {
     activeSymbol: "ETHUSDC",
     DEFAULT_SYMBOL: "ETHUSDC",
@@ -798,7 +808,7 @@ this.renderKanglongAccountRow = renderKanglongAccountRow;
 `,
     sandbox,
   );
-  return { collectText, sandbox, renderKanglongAccountRow: sandbox.renderKanglongAccountRow };
+  return { collectText, findByClass, sandbox, renderKanglongAccountRow: sandbox.renderKanglongAccountRow };
 }
 
 {
@@ -1079,7 +1089,7 @@ this.renderKanglongAccountRow = renderKanglongAccountRow;
 }
 
 {
-  const { collectText, renderKanglongAccountRow } = loadKanglongAccountCardHelper();
+  const { collectText, findByClass, renderKanglongAccountRow } = loadKanglongAccountCardHelper();
   const row = renderKanglongAccountRow({
     id: "sub1",
     name: "子账号 1",
@@ -1100,6 +1110,9 @@ this.renderKanglongAccountRow = renderKanglongAccountRow;
   assert.match(text, /开仓均价\s*3000\.00/, "kanglong account card should display entry price");
   assert.match(text, /标记价格\s*3100\.25/, "kanglong account card should display mark price");
   assert.match(text, /未实现盈亏\s*12\.5000/, "kanglong account card should display pnl");
+  const heading = findByClass(row, "kanglong-account-heading");
+  assert.ok(heading, "kanglong account status badges should live in the title heading row");
+  assert.ok(findByClass(heading, "kanglong-account-badges"), "status badges should move beside the account title");
 }
 
 {
@@ -1110,6 +1123,16 @@ this.renderKanglongAccountRow = renderKanglongAccountRow;
 
   assert.match(text, /持仓加载中/, "kanglong account card should not show no-position while snapshots are loading");
   assert.doesNotMatch(text, /无本方向持仓/);
+}
+
+{
+  const { collectText, findByClass, renderKanglongAccountRow } = loadKanglongAccountCardHelper();
+  const row = renderKanglongAccountRow({ id: "main", name: "主账号", positions: [] }, { role: "main" });
+  const text = collectText(row);
+  const heading = findByClass(row, "kanglong-account-heading");
+
+  assert.ok(heading, "main account status badge should live in the title heading row");
+  assert.equal((text.match(/主账号/g) || []).length, 2, "main account card should show account name plus one inline role badge");
 }
 
 {
