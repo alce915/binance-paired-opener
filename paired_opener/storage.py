@@ -32,6 +32,13 @@ def _json_load(payload: str, default: Any) -> Any:
         return default
 
 
+def _kanglong_report_summary(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    if "report_summary" in payload:
+        return payload.get("report_summary") or {}
+    summary = report.get("summary") if isinstance(report, dict) else None
+    return summary if isinstance(summary, dict) else {}
+
+
 class SqliteRepository:
     def __init__(
         self,
@@ -142,6 +149,12 @@ class SqliteRepository:
                     request_json TEXT NOT NULL,
                     plan_json TEXT NOT NULL DEFAULT '{{}}',
                     report_json TEXT NOT NULL DEFAULT '{{}}',
+                    plan_version TEXT,
+                    snapshot_bundle_id TEXT,
+                    confirmed_at TEXT,
+                    available_actions_json TEXT NOT NULL DEFAULT '[]',
+                    progress_json TEXT NOT NULL DEFAULT '{{}}',
+                    report_summary_json TEXT NOT NULL DEFAULT '{{}}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -159,6 +172,13 @@ class SqliteRepository:
                     run_id TEXT NOT NULL,
                     status TEXT NOT NULL,
                     heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS kanglong_idempotency (
+                    idempotency_key TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
                 """
@@ -203,6 +223,12 @@ class SqliteRepository:
             self._ensure_column("sessions", "recovery_summary", "TEXT")
             self._ensure_column("sessions", "recovery_checked_at", "TEXT")
             self._ensure_column("sessions", "recovery_details_json", "TEXT")
+            self._ensure_column("kanglong_runs", "plan_version", "TEXT")
+            self._ensure_column("kanglong_runs", "snapshot_bundle_id", "TEXT")
+            self._ensure_column("kanglong_runs", "confirmed_at", "TEXT")
+            self._ensure_column("kanglong_runs", "available_actions_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column("kanglong_runs", "progress_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("kanglong_runs", "report_summary_json", "TEXT NOT NULL DEFAULT '{}'")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -224,13 +250,17 @@ class SqliteRepository:
             "main_account_id": payload["main_account_id"],
             "subaccount_ids": payload["subaccount_ids"],
         }
+        report_payload = payload.get("report") or {}
+        report_summary = _kanglong_report_summary(payload, report_payload)
         with self._lock, self._connection:
             self._connection.execute(
                 """
                 INSERT INTO kanglong_runs (
                     run_id, symbol, main_account_id, subaccount_ids_json, status,
-                    result_grade, request_json, plan_json, report_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    result_grade, request_json, plan_json, report_json, plan_version,
+                    snapshot_bundle_id, confirmed_at, available_actions_json, progress_json,
+                    report_summary_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["run_id"],
@@ -241,7 +271,13 @@ class SqliteRepository:
                     payload.get("result_grade"),
                     _json_dumps(request_payload),
                     _json_dumps(payload.get("plan") or {}),
-                    _json_dumps(payload.get("report") or {}),
+                    _json_dumps(report_payload),
+                    payload.get("plan_version"),
+                    payload.get("snapshot_bundle_id"),
+                    payload.get("confirmed_at"),
+                    _json_dumps(payload.get("available_actions") or []),
+                    _json_dumps(payload.get("progress") or {}),
+                    _json_dumps(report_summary),
                     created_at,
                     updated_at,
                 ),
@@ -264,14 +300,31 @@ class SqliteRepository:
         plan: dict[str, Any] | None = None,
         report: dict[str, Any] | None = None,
         result_grade: str | None = None,
+        plan_version: str | None = None,
+        snapshot_bundle_id: str | None = None,
+        confirmed_at: str | None = None,
+        available_actions: list[str] | None = None,
+        progress: dict[str, Any] | None = None,
+        report_summary: dict[str, Any] | None = None,
     ) -> None:
         with self._lock, self._connection:
             current = self._connection.execute(
-                "SELECT plan_json, report_json, result_grade FROM kanglong_runs WHERE run_id = ?",
+                """
+                SELECT plan_json, report_json, result_grade, plan_version,
+                       snapshot_bundle_id, confirmed_at, available_actions_json,
+                       progress_json, report_summary_json
+                FROM kanglong_runs
+                WHERE run_id = ?
+                """,
                 (run_id,),
             ).fetchone()
             if current is None:
                 return
+            next_report_summary_json = current["report_summary_json"]
+            if report_summary is not None:
+                next_report_summary_json = _json_dumps(report_summary)
+            elif report is not None:
+                next_report_summary_json = _json_dumps(_kanglong_report_summary({}, report))
             self._connection.execute(
                 """
                 UPDATE kanglong_runs
@@ -279,6 +332,12 @@ class SqliteRepository:
                     result_grade = ?,
                     plan_json = ?,
                     report_json = ?,
+                    plan_version = ?,
+                    snapshot_bundle_id = ?,
+                    confirmed_at = ?,
+                    available_actions_json = ?,
+                    progress_json = ?,
+                    report_summary_json = ?,
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -287,6 +346,12 @@ class SqliteRepository:
                     result_grade if result_grade is not None else current["result_grade"],
                     _json_dumps(plan) if plan is not None else current["plan_json"],
                     _json_dumps(report) if report is not None else current["report_json"],
+                    plan_version if plan_version is not None else current["plan_version"],
+                    snapshot_bundle_id if snapshot_bundle_id is not None else current["snapshot_bundle_id"],
+                    confirmed_at if confirmed_at is not None else current["confirmed_at"],
+                    _json_dumps(available_actions) if available_actions is not None else current["available_actions_json"],
+                    _json_dumps(progress) if progress is not None else current["progress_json"],
+                    next_report_summary_json,
                     datetime.now(UTC).isoformat(),
                     run_id,
                 ),
@@ -317,6 +382,81 @@ class SqliteRepository:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def list_kanglong_events(
+        self,
+        run_id: str,
+        after_event_id: int | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        bounded_limit = max(1, min(int(limit), 1000))
+        rows = self._connection.execute(
+            """
+            SELECT * FROM kanglong_events
+            WHERE run_id = ? AND event_id > ?
+            ORDER BY event_id ASC
+            LIMIT ?
+            """,
+            (run_id, int(after_event_id or 0), bounded_limit + 1),
+        ).fetchall()
+        visible_rows = rows[:bounded_limit]
+        events = [self._deserialize_kanglong_event_row(row) for row in visible_rows]
+        next_after_event_id = events[-1]["event_id"] if events else int(after_event_id or 0)
+        return {
+            "events": events,
+            "next_after_event_id": next_after_event_id,
+            "latest_event_id": self.latest_kanglong_event_id(run_id),
+            "has_more": len(rows) > bounded_limit,
+        }
+
+    def latest_kanglong_event_id(self, run_id: str) -> int:
+        row = self._connection.execute(
+            "SELECT COALESCE(MAX(event_id), 0) AS latest_event_id FROM kanglong_events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return int(row["latest_event_id"] or 0) if row is not None else 0
+
+    def remember_kanglong_idempotency(
+        self,
+        *,
+        key: str,
+        request_hash: str,
+        response: dict[str, Any],
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                "SELECT * FROM kanglong_idempotency WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                stored_response = _json_load(existing["response_json"], {})
+                return {
+                    "conflict": existing["request_hash"] != request_hash,
+                    "response": stored_response,
+                }
+            now = datetime.now(UTC).isoformat()
+            expiry = expires_at or now
+            self._connection.execute(
+                """
+                INSERT INTO kanglong_idempotency (idempotency_key, request_hash, response_json, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (key, request_hash, _json_dumps(response), now, expiry),
+            )
+        return {"conflict": False, "response": response}
+
+    def get_kanglong_idempotency(self, key: str, request_hash: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM kanglong_idempotency WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "conflict": row["request_hash"] != request_hash,
+            "response": _json_load(row["response_json"], {}),
+        }
 
     def create_session(self, session: OpenSession) -> None:
         with self._lock, self._connection:
@@ -811,12 +951,21 @@ class SqliteRepository:
         payload["payload"] = _json_load(payload.pop("payload_json", "{}"), {})
         return payload
 
+    def _deserialize_kanglong_event_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return self._deserialize_event_row(row)
+
     def _deserialize_kanglong_run_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["subaccount_ids"] = _json_load(payload.pop("subaccount_ids_json", "[]"), [])
         payload["request"] = _json_load(payload.pop("request_json", "{}"), {})
         payload["plan"] = _json_load(payload.pop("plan_json", "{}"), {})
         payload["report"] = _json_load(payload.pop("report_json", "{}"), {})
+        payload["available_actions"] = _json_load(payload.pop("available_actions_json", "[]"), [])
+        payload["progress"] = _json_load(payload.pop("progress_json", "{}"), {})
+        report_summary = _json_load(payload.pop("report_summary_json", "{}"), {})
+        if not report_summary:
+            report_summary = _kanglong_report_summary({}, payload["report"])
+        payload["report_summary"] = report_summary
         return payload
 
     def _deserialize_session_row(self, row: sqlite3.Row) -> dict[str, Any]:
