@@ -36,6 +36,7 @@ def test_kanglong_request_defaults_to_ethusdc_and_auto_side() -> None:
 class StubKanglongService:
     def __init__(self) -> None:
         self.plans: dict[str, dict] = {}
+        self.list_events_calls: list[tuple[str, int | None, int]] = []
 
     def create_plan(self, **kwargs) -> dict:
         payload = {
@@ -73,6 +74,7 @@ class StubKanglongService:
         return self.plans.get(run_id)
 
     def list_events(self, run_id: str, after_event_id: int | None = None, limit: int = 200) -> dict:
+        self.list_events_calls.append((run_id, after_event_id, limit))
         return {
             "run_id": run_id,
             "events": [],
@@ -350,6 +352,22 @@ def test_active_kanglong_run_route_is_not_captured_as_run_id() -> None:
     assert response.json()["run_id"] == "active-run"
     assert service.active_calls == 1
     assert service.get_run_calls == []
+
+
+def test_missing_kanglong_run_events_returns_404_without_listing_events() -> None:
+    service = StubKanglongService()
+    original_service = getattr(api_module.app.state, "kanglong_service", None)
+    api_module.app.state.kanglong_service = service
+    try:
+        response = TestClient(api_module.app).get("/kanglong/simulation/run/missing-run/events")
+    finally:
+        if original_service is not None:
+            api_module.app.state.kanglong_service = original_service
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "kanglong_run_not_found"
+    assert response.json()["detail"]["run_id"] == "missing-run"
+    assert service.list_events_calls == []
 
 
 def test_kanglong_service_report_contains_plan_events_and_costs(tmp_path) -> None:

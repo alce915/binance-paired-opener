@@ -415,6 +415,8 @@ async def get_kanglong_simulation_events(
     after_event_id: int = 0,
     limit: int = 200,
 ) -> KanglongEventsResponse:
+    if app.state.kanglong_service.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail={"code": "kanglong_run_not_found", "run_id": run_id})
     payload = app.state.kanglong_service.list_events(run_id, after_event_id=after_event_id, limit=limit)
     return KanglongEventsResponse.model_validate(payload)
 

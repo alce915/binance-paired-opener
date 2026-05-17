@@ -15,6 +15,7 @@ for (const id of [
   "kanglongAddSelectedBtn",
   "kanglongSelectedSubaccounts",
   "kanglongPlanSummary",
+  "kanglongLogFilters",
   "kanglongExecutionLog",
 ]) {
   assert.ok(indexSource.includes(`id="${id}"`), `${id} should exist in index.html`);
@@ -40,6 +41,9 @@ for (const symbol of [
   "pollKanglongEvents",
   "restoreActiveKanglongRun",
   "renderKanglongPlanSummary",
+  "renderKanglongLogFilters",
+  "setKanglongLogFilter",
+  "formatKanglongStatus",
   "appendKanglongExecutionEvent",
   "newKanglongIdempotencyKey",
 ]) {
@@ -65,12 +69,24 @@ for (const key of [
 }
 
 const zhMessages = JSON.parse(zhSource);
+const kanglongStatusLabels = {
+  blocked_initial_subaccount_unbalanced: "子账号初始仓位未配平",
+  blocked_no_profitable_account: "未找到可释放盈利的账号",
+  blocked_manual_side_not_profitable: "手动方向不可释放盈利",
+  blocked_main_insufficient_capacity: "主账号承接能力不足",
+  blocked_plan_recheck_failed: "执行前复检未通过",
+};
 for (const [key, expected] of Object.entries({
   "console.kanglong.plan.status": "状态：{status}",
   "console.kanglong.plan.groups": "组数：{count}",
   "console.kanglong.plan.rounds": "轮次：{count}",
   "console.kanglong.plan.release_qty": "计划释放：{qty}",
   "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
+  "runtime.kanglong.status.plan_confirmed": "链路已确认",
+  "runtime.kanglong.status.blocked_plan_stale": "检测链路已过期",
+  "runtime.kanglong.status.idempotency_conflict": "重复请求冲突",
+  "runtime.kanglong.status.kanglong_run_not_found": "运行不存在",
+  ...Object.fromEntries(Object.entries(kanglongStatusLabels).map(([status, label]) => [`runtime.kanglong.status.${status}`, label])),
 })) {
   assert.equal(zhMessages[key], expected, `${key} should use proper UTF-8 Chinese text`);
 }
@@ -128,6 +144,7 @@ function makeKanglongHarness(requestImpl) {
   const script = `
     const DEFAULT_SYMBOL = "ETHUSDC";
     const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
+    const KANGLONG_LOG_FILTERS = ["all", "warning", "error", "current_group", "cost", "ledger"];
     const APP_LOCALE = "zh-CN";
     const APP_TIMEZONE = "Asia/Shanghai";
     const I18N_MESSAGES = {
@@ -136,7 +153,23 @@ function makeKanglongHarness(requestImpl) {
       "console.kanglong.plan.rounds": "轮次：{count}",
       "console.kanglong.plan.release_qty": "计划释放：{qty}",
       "console.kanglong.log.empty": "暂无执行日志",
+      "console.kanglong.logs.filter.all": "全部",
+      "console.kanglong.logs.filter.warning": "警告",
+      "console.kanglong.logs.filter.error": "错误",
+      "console.kanglong.logs.filter.current_group": "当前组",
+      "console.kanglong.logs.filter.cost": "成本事件",
+      "console.kanglong.logs.filter.ledger": "账本事件",
       "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
+      "runtime.kanglong.status.plan_confirmed": "链路已确认",
+      "runtime.kanglong.status.chain_ready": "链路可确认",
+      "runtime.kanglong.status.blocked_plan_stale": "检测链路已过期",
+      "runtime.kanglong.status.idempotency_conflict": "重复请求冲突",
+      "runtime.kanglong.status.kanglong_run_not_found": "运行不存在",
+      "runtime.kanglong.status.blocked_initial_subaccount_unbalanced": "子账号初始仓位未配平",
+      "runtime.kanglong.status.blocked_no_profitable_account": "未找到可释放盈利的账号",
+      "runtime.kanglong.status.blocked_manual_side_not_profitable": "手动方向不可释放盈利",
+      "runtime.kanglong.status.blocked_main_insufficient_capacity": "主账号承接能力不足",
+      "runtime.kanglong.status.blocked_plan_recheck_failed": "执行前复检未通过",
       "runtime.execution_message_unavailable": "日志信息暂不可用",
       "runtime.kanglong.account_selection_required": "请选择主账号和至少一个子账号。",
     };
@@ -168,6 +201,7 @@ function makeKanglongHarness(requestImpl) {
     function makeContainer() {
       return {
         children: [],
+        hidden: false,
         textContent: "",
         replaceChildren(...nodes) {
           this.children = nodes;
@@ -183,16 +217,23 @@ function makeKanglongHarness(requestImpl) {
       };
     }
     const kanglongPlanSummary = makeContainer();
+    const kanglongLogFilters = makeContainer();
     const kanglongExecutionLog = makeContainer();
     const document = {
       createElement(tagName) {
         return {
           tagName,
           className: "",
+          dataset: {},
+          hidden: false,
           textContent: "",
           children: [],
+          addEventListener(eventName, handler) {
+            this["on" + eventName] = handler;
+          },
           appendChild(child) {
             this.children.push(child);
+            this.textContent = this.children.map((node) => node.textContent || "").join("");
           },
         };
       },
@@ -254,11 +295,14 @@ function makeKanglongHarness(requestImpl) {
       detectButton: kanglongDetectPlanBtn,
       executeButton: kanglongExecutePlanBtn,
       executionLog: kanglongExecutionLog,
+      logFilters: kanglongLogFilters,
       planSummary: kanglongPlanSummary,
       pollKanglongEvents,
       renderKanglongPlanSummary,
+      renderKanglongLogFilters,
       restoreActiveKanglongRun,
       runKanglongWorkflowAction,
+      setKanglongLogFilter,
       state: kanglongState,
       logs: appendLogEntries,
       renderAccountPoolCalls,
@@ -285,8 +329,60 @@ function makeKanglongHarness(requestImpl) {
     status: "plan_confirmed",
     report: { summary: { status: "chain_ready", group_count: 2, round_count: 4, planned_release_qty: "1.5" } },
   });
-  assert.ok(api.planSummary.textContent.includes("状态：plan_confirmed"), "summary status should prefer top-level response status");
-  assert.equal(api.planSummary.textContent.includes("状态：chain_ready"), false, "summary should not show stale report summary status");
+  assert.ok(api.planSummary.textContent.includes("状态：链路已确认"), "summary status should localize the top-level response status");
+  assert.equal(api.planSummary.textContent.includes("plan_confirmed"), false, "summary should not expose raw status codes");
+  assert.equal(api.planSummary.textContent.includes("状态：链路可确认"), false, "summary should not show stale report summary status");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.renderKanglongPlanSummary({ status: "blocked_plan_stale" });
+  assert.ok(api.planSummary.textContent.includes("状态：检测链路已过期"), "stale plan status should render through i18n");
+  assert.equal(api.planSummary.textContent.includes("blocked_plan_stale"), false, "blocked status codes should stay out of user-visible summary text");
+}
+
+for (const [status, label] of Object.entries(kanglongStatusLabels)) {
+  const api = makeKanglongHarness(async () => ({}));
+  api.renderKanglongPlanSummary({ status });
+  assert.ok(api.planSummary.textContent.includes(`状态：${label}`), `${status} should render localized summary status`);
+  assert.equal(api.planSummary.textContent.includes(status), false, `${status} should not leak into summary text`);
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.renderKanglongLogFilters();
+  assert.equal(api.logFilters.children.length >= 6, true, "log filter controls should render in the scaffolded container");
+
+  api.appendKanglongExecutionEvent({
+    event_id: 21,
+    event_type: "kanglong_group_simulated",
+    payload: { message_key: "events.kanglong.group_simulated", message_params: { group_id: "G1" } },
+  });
+  api.appendKanglongExecutionEvent({
+    event_id: 22,
+    event_type: "kanglong_cost_recorded",
+    payload: { status: "fee_recorded", fee_cost: "0.12" },
+  });
+  api.appendKanglongExecutionEvent({
+    event_id: 23,
+    event_type: "kanglong_execute_failed",
+    payload: { status: "error", error_code: "kanglong_run_not_found" },
+  });
+
+  api.setKanglongLogFilter("current_group");
+  assert.equal(api.executionLog.children[0].hidden, false, "current-group filter should keep group rows visible");
+  assert.equal(api.executionLog.children[1].hidden, true, "current-group filter should hide non-group rows");
+
+  api.setKanglongLogFilter("cost");
+  assert.equal(api.executionLog.children[1].hidden, false, "cost filter should keep cost rows visible");
+  assert.equal(api.executionLog.children[2].hidden, true, "cost filter should hide error-only rows");
+
+  api.setKanglongLogFilter("error");
+  assert.equal(api.executionLog.children[2].hidden, false, "error filter should keep error rows visible");
+  assert.equal(api.executionLog.children[0].hidden, true, "error filter should hide informational rows");
+
+  api.setKanglongLogFilter("all");
+  assert.equal(api.executionLog.children.every((row) => row.hidden === false), true, "all filter should restore all rows");
 }
 
 {
@@ -406,7 +502,8 @@ function makeKanglongHarness(requestImpl) {
   assert.equal(api.state.latestEventId, 5, "event polling should advance to the restored latest event cursor");
   assert.equal(api.executeButton.disabled, false, "execute should be enabled for a restored executable plan");
   assert.equal(api.confirmButton.disabled, true, "confirm should be disabled when only execute is available");
-  assert.ok(api.planSummary.textContent.includes("plan_confirmed"), "restored plan summary should render active status");
+  assert.ok(api.planSummary.textContent.includes("链路已确认"), "restored plan summary should render localized active status");
+  assert.equal(api.planSummary.textContent.includes("plan_confirmed"), false, "restored plan summary should not expose raw status");
   assert.equal(api.executionLog.children.length, 3, "restored active run should render existing events without duplicates");
   assert.equal(api.renderAccountPoolCalls.length, 1, "restored selection should rerender the account pool");
   assert.equal(JSON.stringify(api.renderAccountPoolCalls[0].selectedSubaccountIds), JSON.stringify(["sub-active"]), "account pool rerender should see restored subaccounts");

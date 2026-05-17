@@ -53,6 +53,7 @@ const kanglongAccountPool = document.getElementById("kanglongAccountPool");
 const kanglongAddSelectedBtn = document.getElementById("kanglongAddSelectedBtn");
 const kanglongSelectedSubaccounts = document.getElementById("kanglongSelectedSubaccounts");
 const kanglongPlanSummary = document.getElementById("kanglongPlanSummary");
+const kanglongLogFilters = document.getElementById("kanglongLogFilters");
 const kanglongExecutionLog = document.getElementById("kanglongExecutionLog");
 const executionSummaryBanner = document.getElementById("executionSummaryBanner");
 const executionSummaryText = document.getElementById("executionSummaryText");
@@ -84,6 +85,7 @@ const modePanels = {
 };
 const DEFAULT_SYMBOL = "ETHUSDC";
 const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
+const KANGLONG_LOG_FILTERS = ["all", "warning", "error", "current_group", "cost", "ledger"];
 let eventSource = null;
 let executionMode = "paired_open";
 let appPage = "real";
@@ -1430,6 +1432,21 @@ function kanglongPlanVersion(payload = kanglongState.plan) {
   return String(payload?.plan_version || payload?.plan?.plan_version || payload?.report?.plan_version || "");
 }
 
+function formatKanglongStatus(status) {
+  const rawStatus = String(status || "").trim();
+  if (!rawStatus || rawStatus === "--") return "--";
+  const candidates = [
+    `runtime.kanglong.status.${rawStatus}`,
+    `runtime.kanglong.${rawStatus}`,
+    `reasons.kanglong.${rawStatus}`,
+  ];
+  for (const key of candidates) {
+    const rendered = copyOrDefault(key, key);
+    if (rendered && rendered !== key) return rendered;
+  }
+  return rawStatus;
+}
+
 function syncKanglongWorkflowButtons(payload = kanglongState.plan, options = {}) {
   const actions = kanglongAvailableActions(payload);
   if (kanglongConfirmPlanBtn) {
@@ -1444,16 +1461,83 @@ function renderKanglongPlanSummary(payload = {}) {
   if (!kanglongPlanSummary) return;
   const summary = payload?.report?.summary || payload?.summary || {};
   const status = payload.status ?? payload?.report?.status ?? summary.status ?? "--";
+  const statusLabel = formatKanglongStatus(status);
   const groupCount = summary.group_count ?? summary.groups ?? payload.group_count ?? "--";
   const roundCount = summary.round_count ?? summary.rounds ?? payload.round_count ?? "--";
   const releaseQty = summary.planned_release_qty ?? summary.release_qty ?? payload.planned_release_qty ?? "--";
   const segments = [
-    copyOrDefault("console.kanglong.plan.status", "状态：{status}", { status }),
+    copyOrDefault("console.kanglong.plan.status", "状态：{status}", { status: statusLabel }),
     copyOrDefault("console.kanglong.plan.groups", "组数：{count}", { count: groupCount }),
     copyOrDefault("console.kanglong.plan.rounds", "轮次：{count}", { count: roundCount }),
     copyOrDefault("console.kanglong.plan.release_qty", "计划释放：{qty}", { qty: releaseQty }),
   ];
   kanglongPlanSummary.textContent = segments.join(" | ");
+}
+
+function kanglongExecutionEventTags(event = {}, payload = {}) {
+  const tags = new Set(["all"]);
+  const messageParams = payload.message_params || payload.messageParams || event.message_params || event.messageParams || {};
+  if (event.group_id || payload.group_id || messageParams.group_id || event.group_index || payload.group_index) {
+    tags.add("current_group");
+  }
+  const text = [
+    event.event_type,
+    payload.event_type,
+    event.status,
+    payload.status,
+    event.level,
+    payload.level,
+    event.error_code,
+    payload.error_code,
+    event.message_key,
+    payload.message_key,
+    event.messageCode,
+    payload.messageCode,
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (/(warn|warning|blocked|stale|needs_|abort|recover)/.test(text)) tags.add("warning");
+  if (/(error|failed|exception|not_found|conflict)/.test(text)) tags.add("error");
+  if (/(cost|fee|price|slippage|loss|spread|commission)/.test(text)) tags.add("cost");
+  if (/(ledger|debt|residual|buffer|queue)/.test(text)) tags.add("ledger");
+  return Array.from(tags);
+}
+
+function applyKanglongLogFilter() {
+  if (!kanglongExecutionLog) return;
+  const activeFilter = KANGLONG_LOG_FILTERS.includes(kanglongState.logFilter) ? kanglongState.logFilter : "all";
+  Array.from(kanglongExecutionLog.children || []).forEach((row) => {
+    if (String(row.className || "").includes("empty-state")) {
+      row.hidden = false;
+      return;
+    }
+    const tags = String(row.dataset?.kanglongFilterTags || "all").split(/\s+/).filter(Boolean);
+    row.hidden = activeFilter !== "all" && !tags.includes(activeFilter);
+  });
+}
+
+function setKanglongLogFilter(filterName) {
+  const nextFilter = KANGLONG_LOG_FILTERS.includes(filterName) ? filterName : "all";
+  kanglongState.logFilter = nextFilter;
+  if (kanglongLogFilters) {
+    Array.from(kanglongLogFilters.children || []).forEach((button) => {
+      const active = button.dataset?.kanglongLogFilter === nextFilter;
+      button.className = active ? "inline-btn kanglong-log-filter active" : "inline-btn kanglong-log-filter secondary";
+    });
+  }
+  applyKanglongLogFilter();
+}
+
+function renderKanglongLogFilters() {
+  if (!kanglongLogFilters) return;
+  const buttons = KANGLONG_LOG_FILTERS.map((filterName) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.kanglongLogFilter = filterName;
+    button.textContent = copyOrDefault(`console.kanglong.logs.filter.${filterName}`, filterName);
+    button.addEventListener("click", () => setKanglongLogFilter(filterName));
+    return button;
+  });
+  kanglongLogFilters.replaceChildren(...buttons);
+  setKanglongLogFilter(kanglongState.logFilter);
 }
 
 function kanglongFallbackEventMessage(event = {}, payload = {}) {
@@ -1472,6 +1556,7 @@ function appendKanglongExecutionEvent(event = {}) {
   const fallbackMessage = kanglongFallbackEventMessage(event, payload);
   const row = document.createElement("div");
   row.className = "kanglong-log-row";
+  row.dataset.kanglongFilterTags = kanglongExecutionEventTags(event, payload).join(" ");
   const createdAt = event.created_at || payload.created_at;
   const time = createdAt ? new Date(createdAt).toLocaleTimeString(APP_LOCALE, { hour12: false, timeZone: APP_TIMEZONE }) : nowTime();
   const eventId = Number(event.event_id || payload.event_id || 0);
@@ -1489,6 +1574,7 @@ function appendKanglongExecutionEvent(event = {}) {
     kanglongExecutionLog.replaceChildren();
   }
   kanglongExecutionLog.appendChild(row);
+  applyKanglongLogFilter();
 }
 
 async function createKanglongPlan() {
@@ -5129,6 +5215,7 @@ simHistoryList?.addEventListener("click", async (event) => {
 });
 
 applyStaticI18n();
+renderKanglongLogFilters();
 setEmptyState(asksContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_asks"] || "开启连接后加载卖盘");
 setEmptyState(bidsContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_bids"] || "开启连接后加载买盘");
 setActiveSymbol(activeSymbol, false);

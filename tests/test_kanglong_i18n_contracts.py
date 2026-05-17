@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from app_i18n.runtime import event_registry, log_registry, messages, precheck_registry, reason_registry
+from paired_opener.kanglong.models import KanglongRunStatus
 
 
 def load_messages() -> dict[str, str]:
@@ -76,3 +77,14 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
     assert group_simulated["level"] == "info"
     assert reason_registry()["kanglong.blocked_plan_stale"]["key"] == "reasons.kanglong.blocked_plan_stale"
     assert reason_registry()["kanglong.idempotency_conflict"]["key"] == "reasons.kanglong.idempotency_conflict"
+
+
+def test_all_kanglong_run_statuses_have_display_copy() -> None:
+    catalog = load_messages()
+    missing = [
+        f"runtime.kanglong.status.{status.value}"
+        for status in KanglongRunStatus
+        if f"runtime.kanglong.status.{status.value}" not in catalog
+    ]
+
+    assert missing == []
