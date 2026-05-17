@@ -80,7 +80,9 @@
     "run_lock_ttl_ms": 600000,
     "simulation_result_ttl_ms": 60000,
     "plan_recheck_price_drift_bps": 5,
-    "plan_recheck_qty_tolerance": "0.0001"
+    "plan_recheck_qty_tolerance": "0.0001",
+    "idempotency_key_ttl_ms": 600000,
+    "events_page_size": 200
   }
 }
 ```
@@ -91,6 +93,8 @@
 
 `plan_recheck_price_drift_bps` 和 `plan_recheck_qty_tolerance` 用于确认后的轻量复检。只要价格漂移、账号仓位、可平仓数量、主账号容量或风险等级变化超过这些阈值，就不能直接使用旧链路继续执行。
 
+`idempotency_key_ttl_ms` 用于保留用户重复点击、网络重试和浏览器重发请求的幂等记录。`events_page_size` 是日志增量读取的默认分页大小，避免长链路事件过多导致页面一次性加载卡顿。
+
 所有仓位数量、价格、费用和 PnL 计算必须使用 Decimal，不允许使用浮点数。下单数量按交易所 step size 向下取整；任何取整差额都必须写入结构化 `residual_ledger`，最终按账号、方向和腿类型聚合校验。价格按交易所 tick size 归一化；价格取整差异只进入成本估算和价差统计，不进入仓位残差账本。
 
 ## 统一执行事件模型
@@ -98,10 +102,13 @@
 所有模拟执行结果必须产出和未来实盘一致的事件结构：
 
 ```text
+event_id
+event_sequence
 run_id
 group_id
 round_id
 mode
+snapshot_bundle_id
 account_id
 symbol
 position_side
@@ -133,11 +140,15 @@ status
 reason
 market_fallback_used
 residual_qty
-snapshot_version
+account_snapshot_version
 submitted_at
 filled_at
 event_time
 ```
+
+`event_id` 是 run 内严格递增的事件游标，用于 SSE 断线续传、轮询补齐和审计顺序恢复；`event_sequence` 是同一 run 内的数字序号，用于排序和断言。前端或外部消费者只允许用 `event_id`/`after_event_id` 增量读取，不得依赖事件到达顺序等于实际保存顺序。
+
+`snapshot_bundle_id` 表示同一次检测、计划、复检或执行事件引用的一组一致快照。`account_snapshot_version` 是单账号快照版本；同一个 `snapshot_bundle_id` 下会包含主账号、子账号、价格、交易对规则和配置版本。账号卡片、检测报告、链路计划、确认记录和复检结果必须展示或携带同一个 `snapshot_bundle_id`，避免 UI 显示的快照和后端计划快照不一致。
 
 `action_type` 包括 `single_close`、`single_open` 和 `market_reduce_proposal`。`status` 至少包括 `filled`、`partial_filled`、`rejected`、`timeout` 和 `cancelled`。`leg_id` 和 `paired_leg_id` 用于把一轮内的平仓腿和开仓腿关联起来；`round_match_id` 用于把同一轮的数量对账记录关联到两条腿事件。实盘里记录真实交易所订单号，模拟盘里生成可回放的合成订单号。`liquidity_role` 记录 `maker` 或 `taker`，用于还原真实手续费和价差统计。
 
@@ -542,6 +553,33 @@ price_diff_loss = max(-price_diff_pnl, 0)
 
 `price_diff_pnl` 保留方向和正负号；`price_diff_loss` 只统计不利价差。若价差有利，报告中作为价差收益展示，但不抵消手续费字段。
 
+成本和 PnL 符号规则必须固定：
+
+```text
+fee_cost >= 0
+price_diff_pnl > 0 表示对本策略有利
+price_diff_pnl < 0 表示对本策略不利
+price_diff_loss = max(-price_diff_pnl, 0)
+released_profit > 0 表示已释放盈利
+*_cost 和 *_loss 字段永远非负
+*_pnl 字段必须保留正负号
+```
+
+最终净值按签名 PnL 计算，成本展示按非负损耗计算：
+
+```text
+total_fee_cost = transfer_fee_cost + rebalance_fee_cost
+total_price_diff_loss = transfer_price_diff_loss + rebalance_price_diff_loss
+total_cost = total_fee_cost + total_price_diff_loss
+net_profit_after_cost =
+  released_profit
+  + transfer_price_diff_pnl
+  + rebalance_price_diff_pnl
+  - total_fee_cost
+```
+
+报告 UI 不能把 `price_diff_loss` 与 `price_diff_pnl` 混用。摘要中展示的“损耗”使用非负 `*_loss`；明细中展示的“价差 PnL”使用带正负号的 `*_pnl`。
+
 最终汇总：
 
 ```text
@@ -649,6 +687,7 @@ operator_live_confirmation == true
 run_id
 plan_version
 config_version
+snapshot_bundle_id
 account_snapshot_version
 symbol_rule_version
 price_source
@@ -665,11 +704,12 @@ event_sequence
 operator_choice
 operator_confirmations
 available_actions_history
+idempotency_keys
 ```
 
 每个组和每轮都引用同一个 `run_id`，并记录输入快照版本和输出事件。报告必须能从最终结果追溯到每一轮的计划数量、实际成交数量、成交均价、手续费、残差、配对订单、锁续期、暂停原因和实盘准入判断。
 
-`batch_debt_buffer_history` 记录每个 donor batch 的成功 group、失败点和转入待修复缺口的数量。`abort_recover_history` 必须记录操作者、恢复前快照、恢复后快照、处理动作、释放锁原因和确认时间。`operator_confirmations` 记录链路确认、警告确认、市场减仓确认和恢复确认。`available_actions_history` 记录每次状态变化后后端允许的下一步动作。`rounding_ledger` 是 `residual_ledger` 的子集，用于专门追踪 step size 向下取整产生的数量差额。
+`snapshot_bundle_id` 记录一次检测或复检引用的一致快照集合，必须能追溯到账号快照、价格快照、交易对规则版本和配置版本。`batch_debt_buffer_history` 记录每个 donor batch 的成功 group、失败点和转入待修复缺口的数量。`abort_recover_history` 必须记录操作者、恢复前快照、恢复后快照、处理动作、释放锁原因和确认时间。`operator_confirmations` 记录链路确认、警告确认、市场减仓确认和恢复确认。`available_actions_history` 记录每次状态变化后后端允许的下一步动作。`idempotency_keys` 记录草案生成、确认、执行和恢复动作的幂等键、请求摘要、响应摘要和过期时间。`rounding_ledger` 是 `residual_ledger` 的子集，用于专门追踪 step size 向下取整产生的数量差额。
 
 ## 前端工作台与交互设计
 
@@ -750,6 +790,12 @@ POST /kanglong/simulation/run/{run_id}/recover
 
 `plan` 只读取快照、运行预检、生成链路草案和预计成本，不产生交易副作用。`confirm` 只确认某个 `plan_version` 和警告集合，并记录操作者。`execute` 只接受已确认且复检通过的计划；如果计划过期或复检失败，必须返回结构化状态和可用下一步动作。`events` 返回执行日志、进度、成本事件、账本事件和恢复事件，支持按 `after_event_id` 增量读取。
 
+`plan`、`confirm`、`execute` 和 `recover` 都必须支持幂等键。客户端每次用户动作生成 `idempotency_key`，后端在 `idempotency_key_ttl_ms` 内保存请求摘要和响应摘要。同一个 key 携带相同请求时返回第一次响应；同一个 key 携带不同请求时返回冲突错误，不得重复确认、重复执行或重复恢复。`execute` 必须同时校验 `run_id`、`plan_version`、`confirmed_at` 和 `idempotency_key`，防止双击或网络重试启动两次执行。
+
+事件读取必须支持分页和断线续传。`events` 响应包含 `events`、`next_after_event_id`、`has_more` 和 `latest_event_id`；前端 SSE 断线后用最后成功处理的 `event_id` 作为 `after_event_id` 补齐缺口。若客户端请求的 `after_event_id` 已被日志保留策略清理，后端必须返回结构化错误并提示重新加载完整报告摘要。
+
+现有 `/kanglong/simulation/run` 旧入口在拆分接口落地时必须明确处理：要么改为只读兼容包装并内部转向 `plan -> confirm -> execute` 的模拟流程，要么返回明确的废弃错误码。第一版推荐前端完全迁移到拆分接口，并把旧入口标记为 deprecated，测试必须覆盖前端不再调用旧入口。
+
 页面刷新后必须能恢复当前运行。`active` 接口返回当前账号集合和交易对范围内的活跃亢龙运行，包括草案、已确认、执行中、暂停、需要恢复、已完成但报告未查看等状态。前端根据状态恢复到对应阶段，不能因为刷新丢失确认状态、执行日志、暂停原因或账本摘要。
 
 运行恢复数据至少包含：
@@ -759,6 +805,7 @@ run_id
 status
 result_grade
 plan_version
+snapshot_bundle_id
 confirmed_at
 selected_side
 symbol
@@ -891,10 +938,18 @@ message_params:
 - `confirm` 接口必须校验 `plan_version`，并记录操作者、警告确认和确认快照摘要。
 - `execute` 接口只接受已确认且复检通过的计划，过期计划返回结构化阻断状态和可用动作。
 - `events` 接口支持按 `after_event_id` 增量读取，页面刷新后不会丢失执行日志。
+- `plan`、`confirm`、`execute` 和 `recover` 的幂等键重复请求返回同一响应，不同请求复用同一 key 返回冲突。
+- `execute` 双击或网络重试不能启动第二个执行实例。
+- 事件流使用严格递增 `event_id`，SSE 断线后按 `after_event_id` 补齐缺口。
+- `events` 接口支持分页，长链路报告不会一次性加载全部原始事件。
+- 账号卡片、检测计划、确认记录、复检结果和执行事件使用同一个 `snapshot_bundle_id` 追踪快照一致性。
+- 旧 `/kanglong/simulation/run` 入口必须被显式废弃或兼容包装，前端测试确认新页面不再调用旧入口。
 - 暂停状态的按钮由后端 `available_actions` 决定，前端不能自行推断继续或恢复能力。
 - 执行日志过滤覆盖全部、警告、错误、当前组、成本事件和账本事件，过滤不改变审计顺序。
 - 检测摘要展示总释放数量、参与账号数、预计组数、预计轮次、预计手续费和预计价差损耗。
 - 账号池轻量状态标签覆盖无本方向持仓、无盈利、数据过期、已加入、主账号冲突和风险未知。
+- 成本统计符号规则固定：`*_cost`/`*_loss` 非负，`*_pnl` 保留正负号，`net_profit_after_cost` 使用签名 PnL 计算。
+- Golden plan 测试使用固定账号快照生成固定链路，断言 group 顺序、数量、预计成本和摘要不被无意改变。
 - 新增 UI、报告、日志、预检和阻断原因的用户可见文案必须通过 i18n key 渲染，不能硬编码中文。
 - 新增状态、原因、事件和日志 key 必须写入 `zh-CN` 语言包和对应 registry，参数占位符与事件数据保持一致。
 - 中文开发环境下保持 UTF-8，语言包使用完整模板和具名参数，不允许运行时拼接中文片段。
