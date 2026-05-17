@@ -1403,9 +1403,169 @@ function ensureKanglongMainAccount(accounts = availableAccounts) {
 function invalidateKanglongPlan() {
   kanglongState.plan = null;
   kanglongState.confirmedPlanVersion = "";
+  kanglongState.latestEventId = 0;
   if (kanglongConfirmPlanBtn) kanglongConfirmPlanBtn.disabled = true;
   if (kanglongExecutePlanBtn) kanglongExecutePlanBtn.disabled = true;
   if (kanglongPlanSummary) kanglongPlanSummary.replaceChildren();
+}
+
+function newKanglongIdempotencyKey(prefix) {
+  const random = Math.random().toString(16).slice(2);
+  return `${prefix}-${Date.now()}-${random}`;
+}
+
+function kanglongAvailableActions(payload = kanglongState.plan) {
+  const actions = payload?.available_actions || payload?.plan?.available_actions || payload?.report?.available_actions || [];
+  return Array.isArray(actions) ? actions.map((action) => String(action)) : [];
+}
+
+function kanglongRunId(payload = kanglongState.plan) {
+  return String(payload?.run_id || payload?.plan?.run_id || payload?.report?.run_id || "");
+}
+
+function kanglongPlanVersion(payload = kanglongState.plan) {
+  return String(payload?.plan_version || payload?.plan?.plan_version || payload?.report?.plan_version || "");
+}
+
+function syncKanglongWorkflowButtons(payload = kanglongState.plan, options = {}) {
+  const actions = kanglongAvailableActions(payload);
+  if (kanglongConfirmPlanBtn) {
+    kanglongConfirmPlanBtn.disabled = !actions.includes("confirm");
+  }
+  if (kanglongExecutePlanBtn) {
+    kanglongExecutePlanBtn.disabled = options.disableExecute === true || !actions.includes("execute");
+  }
+}
+
+function renderKanglongPlanSummary(payload = {}) {
+  if (!kanglongPlanSummary) return;
+  const summary = payload?.report?.summary || payload?.summary || {};
+  const status = summary.status ?? payload.status ?? payload?.report?.status ?? "--";
+  const groupCount = summary.group_count ?? summary.groups ?? payload.group_count ?? "--";
+  const roundCount = summary.round_count ?? summary.rounds ?? payload.round_count ?? "--";
+  const releaseQty = summary.planned_release_qty ?? summary.release_qty ?? payload.planned_release_qty ?? "--";
+  const segments = [
+    copyOrDefault("console.kanglong.plan.status", "状态：{status}", { status }),
+    copyOrDefault("console.kanglong.plan.groups", "组数：{count}", { count: groupCount }),
+    copyOrDefault("console.kanglong.plan.rounds", "轮次：{count}", { count: roundCount }),
+    copyOrDefault("console.kanglong.plan.release_qty", "计划释放：{qty}", { qty: releaseQty }),
+  ];
+  kanglongPlanSummary.textContent = segments.join(" | ");
+}
+
+function kanglongFallbackEventMessage(event = {}, payload = {}) {
+  const pieces = [
+    event.event_type || payload.event_type,
+    payload.status || event.status,
+    payload.run_id || event.run_id,
+  ].filter(Boolean);
+  return pieces.length ? pieces.join(" | ") : copyOrDefault("runtime.execution_message_unavailable", "日志信息暂不可用");
+}
+
+function appendKanglongExecutionEvent(event = {}) {
+  if (!kanglongExecutionLog) return;
+  const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+  const source = Object.keys(payload).length ? payload : event;
+  const fallbackMessage = kanglongFallbackEventMessage(event, payload);
+  const row = document.createElement("div");
+  row.className = "kanglong-log-row";
+  const createdAt = event.created_at || payload.created_at;
+  const time = createdAt ? new Date(createdAt).toLocaleTimeString(APP_LOCALE, { hour12: false, timeZone: APP_TIMEZONE }) : nowTime();
+  const eventId = Number(event.event_id || payload.event_id || 0);
+  if (eventId > 0) {
+    kanglongState.latestEventId = Math.max(kanglongState.latestEventId || 0, eventId);
+  }
+  row.textContent = [
+    time,
+    resolveLogMessage({ ...source, fallbackMessage }, fallbackMessage),
+  ].filter(Boolean).join(" | ");
+  if (kanglongExecutionLog.querySelector(".empty-state")) {
+    kanglongExecutionLog.replaceChildren();
+  }
+  kanglongExecutionLog.appendChild(row);
+}
+
+async function createKanglongPlan() {
+  const mainAccountId = kanglongState.mainAccountId || currentAccount.id || "";
+  const subaccountIds = Array.from(kanglongState.selectedSubaccountIds);
+  if (!mainAccountId || subaccountIds.length === 0) {
+    throw new Error(copyOrDefault("runtime.kanglong.account_selection_required", "请选择主账号和至少一个子账号。"));
+  }
+  const payload = await request(KANGLONG_PLAN_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      mode: "simulation",
+      symbol: kanglongSymbol?.value || DEFAULT_SYMBOL,
+      main_account_id: mainAccountId,
+      subaccount_ids: subaccountIds,
+      selected_side: kanglongSide?.value || null,
+    }),
+  });
+  kanglongState.plan = payload;
+  kanglongState.confirmedPlanVersion = "";
+  kanglongState.latestEventId = 0;
+  if (kanglongExecutionLog) {
+    setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
+  }
+  renderKanglongPlanSummary(payload);
+  syncKanglongWorkflowButtons(payload, { disableExecute: true });
+  return payload;
+}
+
+async function confirmKanglongPlan() {
+  const runId = kanglongRunId();
+  const planVersion = kanglongPlanVersion();
+  if (!runId || !planVersion) return null;
+  const payload = await request(`${KANGLONG_PLAN_ENDPOINT}/${encodeURIComponent(runId)}/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      plan_version: planVersion,
+      idempotency_key: newKanglongIdempotencyKey("confirm"),
+      operator: "manual",
+      confirmed_warning_codes: [],
+    }),
+  });
+  kanglongState.plan = payload;
+  kanglongState.confirmedPlanVersion = kanglongPlanVersion(payload) || planVersion;
+  renderKanglongPlanSummary(payload);
+  syncKanglongWorkflowButtons(payload);
+  return payload;
+}
+
+async function executeKanglongPlan() {
+  const runId = kanglongRunId();
+  const planVersion = kanglongState.confirmedPlanVersion;
+  if (!runId || !planVersion) return null;
+  const payload = await request(`${KANGLONG_PLAN_ENDPOINT}/${encodeURIComponent(runId)}/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      plan_version: planVersion,
+      idempotency_key: newKanglongIdempotencyKey("execute"),
+      operator: "manual",
+      confirmed_warning_codes: [],
+    }),
+  });
+  kanglongState.plan = payload;
+  renderKanglongPlanSummary(payload);
+  syncKanglongWorkflowButtons(payload);
+  await pollKanglongEvents();
+  return payload;
+}
+
+async function pollKanglongEvents() {
+  const runId = kanglongRunId();
+  if (!runId) return null;
+  const afterEventId = kanglongState.latestEventId || 0;
+  const payload = await request(`/kanglong/simulation/run/${encodeURIComponent(runId)}/events?after_event_id=${afterEventId}`);
+  (payload.events || []).forEach(appendKanglongExecutionEvent);
+  const nextEventId = Number(payload.next_after_event_id || payload.latest_event_id || 0);
+  if (nextEventId > 0) {
+    kanglongState.latestEventId = nextEventId;
+  }
+  return payload;
 }
 
 function renderKanglongSelectedSubaccounts(accounts = availableAccounts) {
@@ -4773,7 +4933,25 @@ navKanglongBtn?.addEventListener("click", () => {
     messageParams: { symbol: activeSymbol, error: userVisibleErrorMessage(error) },
   }));
 });
+async function runKanglongWorkflowAction(button, action) {
+  if (button) button.disabled = true;
+  try {
+    await action();
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.kanglong.request_failed",
+      messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+    });
+  } finally {
+    if (button === kanglongDetectPlanBtn && button) button.disabled = false;
+    if (button !== kanglongDetectPlanBtn) syncKanglongWorkflowButtons(kanglongState.plan);
+  }
+}
+
 kanglongAddSelectedBtn?.addEventListener("click", addSelectedKanglongAccounts);
+kanglongDetectPlanBtn?.addEventListener("click", () => runKanglongWorkflowAction(kanglongDetectPlanBtn, createKanglongPlan));
+kanglongConfirmPlanBtn?.addEventListener("click", () => runKanglongWorkflowAction(kanglongConfirmPlanBtn, confirmKanglongPlan));
+kanglongExecutePlanBtn?.addEventListener("click", () => runKanglongWorkflowAction(kanglongExecutePlanBtn, executeKanglongPlan));
 kanglongSymbol?.addEventListener("input", () => {
   invalidateKanglongPlan();
   renderKanglongAccountPool();

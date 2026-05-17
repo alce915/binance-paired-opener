@@ -22,7 +22,7 @@ for (const id of [
 assert.equal(indexSource.includes(`id="kanglongPanel"`), false, "old simulation Kanglong panel should be removed");
 assert.ok(appSource.includes(`"kanglong"`), "app.js should recognize kanglong as an app page");
 assert.ok(appSource.includes(`KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan"`), "app.js should declare the split plan endpoint reference");
-assert.equal(appSource.includes("/kanglong/simulation/run\""), false, "frontend should not call deprecated Kanglong run endpoint");
+assert.equal(/request\(\s*["']\/kanglong\/simulation\/run["']/.test(appSource), false, "frontend should not POST to the deprecated Kanglong run endpoint");
 
 for (const symbol of [
   "kanglongState",
@@ -32,8 +32,23 @@ for (const symbol of [
   "renderKanglongAccountRow",
   "setKanglongMainAccount",
   "invalidateKanglongPlan",
+  "createKanglongPlan",
+  "confirmKanglongPlan",
+  "executeKanglongPlan",
+  "pollKanglongEvents",
+  "renderKanglongPlanSummary",
+  "appendKanglongExecutionEvent",
+  "newKanglongIdempotencyKey",
 ]) {
   assert.ok(appSource.includes(symbol), `${symbol} should be implemented in app.js`);
+}
+
+for (const fragment of [
+  "/confirm",
+  "/execute",
+  "/events?after_event_id=",
+]) {
+  assert.ok(appSource.includes(fragment), `${fragment} endpoint fragment should be wired in app.js`);
 }
 
 for (const key of [
@@ -47,6 +62,15 @@ for (const key of [
 }
 
 const zhMessages = JSON.parse(zhSource);
+for (const [key, expected] of Object.entries({
+  "console.kanglong.plan.status": "状态：{status}",
+  "console.kanglong.plan.groups": "组数：{count}",
+  "console.kanglong.plan.rounds": "轮次：{count}",
+  "console.kanglong.plan.release_qty": "计划释放：{qty}",
+})) {
+  assert.equal(zhMessages[key], expected, `${key} should use proper UTF-8 Chinese text`);
+}
+
 for (const [key, expected] of Object.entries({
   "console.kanglong.actions.add_selected": "加入子账号",
   "console.kanglong.actions.remove": "移除",
