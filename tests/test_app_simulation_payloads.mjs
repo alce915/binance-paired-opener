@@ -8,6 +8,13 @@ const appSource = fs.readFileSync(appPath, "utf8");
 const indexPath = path.join(process.cwd(), "paired_opener", "static", "index.html");
 const indexSource = fs.readFileSync(indexPath, "utf8");
 
+function indexInputValue(id) {
+  const pattern = new RegExp(`<input[^>]*id="${id}"[^>]*value="([^"]*)"`, "i");
+  const match = indexSource.match(pattern);
+  assert.ok(match, `${id} should have an initial value in index.html`);
+  return match[1];
+}
+
 function extract(pattern, label) {
   const match = appSource.match(pattern);
   assert.ok(match, `${label} should exist in app.js`);
@@ -934,6 +941,45 @@ this.renderSimulationAccount = renderSimulationAccount;
   );
   assert.ok(!indexSource.includes('value="BTCUSDT"'), "static execution form defaults should not prefer non-whitelisted BTCUSDT");
   assert.ok(!indexSource.includes(">BTCUSDT<"), "static status/footer defaults should not display BTCUSDT");
+}
+
+{
+  const defaultSymbolFields = [
+    "executionSymbol",
+    "closeExecutionSymbol",
+    "singleOpenExecutionSymbol",
+    "singleCloseExecutionSymbol",
+  ];
+  for (const fieldId of defaultSymbolFields) {
+    assert.equal(indexInputValue(fieldId), "ETHUSDC", `${fieldId} should default to ETHUSDC`);
+  }
+
+  const defaultRoundFields = ["calcRounds", "closeRounds", "singleOpenRounds", "singleCloseRounds"];
+  for (const fieldId of defaultRoundFields) {
+    assert.equal(indexInputValue(fieldId), "30", `${fieldId} should default to 30 rounds`);
+  }
+
+  assert.equal(indexInputValue("leverage"), "75");
+  assert.equal(indexInputValue("singleOpenLeverage"), "75");
+  assert.match(indexSource, /id="statsSymbol">ETHUSDC<\/span>/);
+  assert.match(indexSource, /id="footerStatus">[^<]*ETHUSDC<\/span>/);
+  for (const unitId of [
+    "openRoundQtyUnit",
+    "closeQtyUnit",
+    "closeRoundQtyUnit",
+    "singleOpenQtyUnit",
+    "singleOpenRoundQtyUnit",
+    "singleCloseQtyUnit",
+    "singleCloseRoundQtyUnit",
+  ]) {
+    assert.match(indexSource, new RegExp(`id="${unitId}">ETH<\\/span>`), `${unitId} should default to ETH units`);
+  }
+
+  const defaultSymbolSource = extract(/const DEFAULT_SYMBOL = "ETHUSDC";/, "DEFAULT_SYMBOL");
+  const normalizeSource = extract(/function normalizeSymbol\(value\) \{[\s\S]*?\n\}/, "normalizeSymbol");
+  const sandbox = { String };
+  vm.runInNewContext(`${defaultSymbolSource}\n${normalizeSource}; this.normalizeSymbol = normalizeSymbol;`, sandbox);
+  assert.equal(sandbox.normalizeSymbol(""), "ETHUSDC");
 }
 
 {

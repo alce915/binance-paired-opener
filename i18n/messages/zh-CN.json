@@ -218,6 +218,7 @@
   "precheck.labels.system_open_orders": "系统挂单冲突",
   "precheck.system_open_orders.fail_read_error": "系统挂单状态读取失败：{error}",
   "reasons.invalid_parameter": "参数无效。",
+  "reasons.round_count_must_be_positive": "轮次数必须大于 0。",
   "reasons.session_not_found": "未找到会话 {session_id}。",
   "reasons.session_precheck_failed": "预检未通过。",
   "reasons.session_resume_invalid_status": "当前会话不处于可恢复状态。",

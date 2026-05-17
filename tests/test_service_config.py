@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app_i18n.runtime import CONTRACT_VERSION
+from app_i18n.runtime import CONTRACT_VERSION, format_copy
 from paired_opener.config import Settings
 from paired_opener.domain import (
     ExecutionProfile,
@@ -36,7 +36,7 @@ from paired_opener.engine import PairedOpeningEngine, SessionControl
 from paired_opener.errors import ErrorCategory, ErrorStrategy, TradingError
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.service import ManagedSession, OpenSessionService, SessionPrecheckFailed
-from paired_opener.schemas import CloseSessionRequest, OpenSessionRequest, SessionPrecheckRequest, SessionSummary, SingleCloseSessionRequest, SingleOpenSessionRequest
+from paired_opener.schemas import CloseSessionRequest, MarketConnectRequest, OpenSessionRequest, SessionPrecheckRequest, SessionSummary, SimulationRunRequest, SingleCloseSessionRequest, SingleOpenSessionRequest
 from paired_opener.storage import SqliteRepository
 
 class SimpleGateway(ExchangeGateway):
@@ -267,6 +267,22 @@ class ResidualEngine:
         session.final_unaligned_qty = self.residual_qty
         session.final_alignment_status = FinalAlignmentStatus.NOT_NEEDED
         return 1, 0
+
+
+def test_settings_default_symbol_whitelist_prefers_eth_usdc() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.symbol_whitelist[:2] == ["ETHUSDC", "BTCUSDC"]
+
+
+def test_default_trading_inputs_are_eth_usdc_75x_30_rounds() -> None:
+    request = SimulationRunRequest()
+
+    assert MarketConnectRequest().symbol == "ETHUSDC"
+    assert request.symbol == "ETHUSDC"
+    assert request.leverage == 75
+    assert request.round_count == 30
+
 
 @pytest.mark.asyncio
 async def test_update_whitelist_persists_symbols(tmp_path: Path) -> None:
@@ -746,6 +762,79 @@ async def test_create_close_session_rejects_qty_above_max_closeable(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_create_sessions_reject_non_positive_round_count_before_division(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    expected_message = format_copy("reasons.round_count_must_be_positive")
+
+    def make_service(name: str, gateway: SimpleGateway) -> OpenSessionService:
+        repository = SqliteRepository(tmp_path / f"{name}.db")
+        return OpenSessionService(settings, repository, gateway, PairedOpeningEngine(gateway, repository))
+
+    paired_open_gateway = SimpleGateway()
+    paired_open_service = make_service("paired-open-round-count", paired_open_gateway)
+    paired_open_request = OpenSessionRequest(
+        symbol="BTCUSDT",
+        trend_bias=TrendBias.LONG,
+        leverage=50,
+        round_count=1,
+        round_qty=Decimal("0.1"),
+    )
+    paired_open_request.round_count = 0
+    with pytest.raises(ValueError) as paired_open_error:
+        await paired_open_service.create_open_session(paired_open_request)
+    assert str(paired_open_error.value) == expected_message
+
+    paired_close_gateway = SimpleGateway()
+    paired_close_gateway.positions = [
+        {"symbol": "BTCUSDT", "position_side": "LONG", "qty": Decimal("0.100")},
+        {"symbol": "BTCUSDT", "position_side": "SHORT", "qty": Decimal("0.100")},
+    ]
+    paired_close_service = make_service("paired-close-round-count", paired_close_gateway)
+    paired_close_request = CloseSessionRequest(
+        symbol="BTCUSDT",
+        trend_bias=TrendBias.LONG,
+        close_qty=Decimal("0.050"),
+        round_count=1,
+    )
+    paired_close_request.round_count = 0
+    with pytest.raises(ValueError) as paired_close_error:
+        await paired_close_service.create_close_session(paired_close_request)
+    assert str(paired_close_error.value) == expected_message
+
+    single_open_gateway = SimpleGateway()
+    single_open_service = make_service("single-open-round-count", single_open_gateway)
+    single_open_request = SingleOpenSessionRequest(
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        open_qty=Decimal("0.050"),
+        leverage=50,
+        round_count=1,
+    )
+    single_open_request.round_count = 0
+    with pytest.raises(ValueError) as single_open_error:
+        await single_open_service.create_single_open_session(single_open_request)
+    assert str(single_open_error.value) == expected_message
+
+    single_close_gateway = SimpleGateway()
+    single_close_gateway.positions = [
+        {"symbol": "BTCUSDT", "position_side": "LONG", "qty": Decimal("0.100")},
+    ]
+    single_close_service = make_service("single-close-round-count", single_close_gateway)
+    single_close_request = SingleCloseSessionRequest(
+        symbol="BTCUSDT",
+        close_mode=SingleCloseMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        close_qty=Decimal("0.050"),
+        round_count=1,
+    )
+    single_close_request.round_count = 0
+    with pytest.raises(ValueError) as single_close_error:
+        await single_close_service.create_single_close_session(single_close_request)
+    assert str(single_close_error.value) == expected_message
+
+
+@pytest.mark.asyncio
 async def test_create_close_session_long_closes_short_then_long(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
     repository = SqliteRepository(tmp_path / "close-success.db")
@@ -1177,6 +1266,59 @@ async def test_precheck_fails_when_system_open_orders_cannot_be_loaded(tmp_path:
     assert failure["label_key"] == "precheck.labels.system_open_orders"
     assert failure["message_key"] == "precheck.system_open_orders.fail_read_error"
     assert "系统挂单状态读取失败" in failure["message"]
+
+
+@pytest.mark.asyncio
+async def test_precheck_rejects_non_positive_round_count_before_division(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, symbol_whitelist=["BTCUSDT"])
+    repository = SqliteRepository(tmp_path / "precheck-round-count.db")
+    gateway = SimpleGateway()
+    engine = PairedOpeningEngine(gateway, repository)
+    service = OpenSessionService(settings, repository, gateway, engine)
+    expected_message = format_copy("reasons.round_count_must_be_positive")
+    requests = [
+        SessionPrecheckRequest(
+            session_kind=SessionKind.PAIRED_OPEN,
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            leverage=50,
+            round_count=1,
+            round_qty=Decimal("0.1"),
+        ),
+        SessionPrecheckRequest(
+            session_kind=SessionKind.PAIRED_CLOSE,
+            symbol="BTCUSDT",
+            trend_bias=TrendBias.LONG,
+            close_qty=Decimal("0.1"),
+            round_count=1,
+        ),
+        SessionPrecheckRequest(
+            session_kind=SessionKind.SINGLE_OPEN,
+            symbol="BTCUSDT",
+            open_mode=SingleOpenMode.REGULAR,
+            selected_position_side=PositionSide.LONG,
+            open_qty=Decimal("0.1"),
+            leverage=50,
+            round_count=1,
+        ),
+        SessionPrecheckRequest(
+            session_kind=SessionKind.SINGLE_CLOSE,
+            symbol="BTCUSDT",
+            close_mode=SingleCloseMode.REGULAR,
+            selected_position_side=PositionSide.LONG,
+            close_qty=Decimal("0.1"),
+            round_count=1,
+        ),
+    ]
+
+    for request in requests:
+        request.round_count = 0
+        precheck = await service.precheck_request(request)
+        failure = next(item for item in precheck["checks"] if item["code"] == "request")
+
+        assert precheck["ok"] is False
+        assert failure["status"] == "fail"
+        assert failure["message"] == expected_message
 
 
 @pytest.mark.asyncio

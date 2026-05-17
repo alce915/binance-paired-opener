@@ -69,10 +69,11 @@ const modePanels = {
   single_open: document.getElementById("singleOpenPanel"),
   single_close: document.getElementById("singleClosePanel"),
 };
+const DEFAULT_SYMBOL = "ETHUSDC";
 let eventSource = null;
 let executionMode = "paired_open";
 let appPage = "real";
-let activeSymbol = executionSymbol.value || "BTCUSDC";
+let activeSymbol = executionSymbol.value || DEFAULT_SYMBOL;
 const APP_CONFIG = window.__APP_CONFIG__ || {};
 const APP_I18N = window.__APP_I18N__ || {};
 const I18N_MESSAGES = APP_I18N.messages || {};
@@ -961,7 +962,7 @@ function resolveResidualQty(source = {}) {
 }
 
 function normalizeSymbol(value) {
-  return (value || "BTCUSDC").trim().toUpperCase();
+  return (value || DEFAULT_SYMBOL).trim().toUpperCase();
 }
 
 function payloadMatchesActiveSymbol(payload = {}) {
@@ -3441,7 +3442,7 @@ async function switchSymbol(nextSymbol, shouldReconnect = connectionToggle.check
 }
 
 connectionToggle.addEventListener("change", async (event) => {
-  const symbol = executionSymbol.value || activeSymbol || "BTCUSDC";
+  const symbol = executionSymbol.value || activeSymbol || DEFAULT_SYMBOL;
   try {
     if (event.target.checked) {
       await refreshSymbolInfo(symbol);

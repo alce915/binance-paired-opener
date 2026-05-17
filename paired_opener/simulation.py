@@ -639,7 +639,12 @@ class SimulationService:
         rerun_source_run_id: str | None,
     ) -> dict[str, Any]:
         try:
-            result = await self._run_with_id(run_id, request, rerun_source_run_id=rerun_source_run_id)
+            result = await self._run_with_id(
+                run_id,
+                request,
+                rerun_source_run_id=rerun_source_run_id,
+                timeout_seconds=None,
+            )
         finally:
             self._abort_requested = False
             self._abort_event.clear()
@@ -658,17 +663,25 @@ class SimulationService:
             raise SimulationError(format_copy("runtime.simulation_busy"))
         return await self._run_with_id(str(uuid4()), request, rerun_source_run_id=rerun_source_run_id)
 
-    async def _run_with_id(self, run_id: str, request: SimulationRunRequest, *, rerun_source_run_id: str | None = None) -> dict[str, Any]:
+    async def _run_with_id(
+        self,
+        run_id: str,
+        request: SimulationRunRequest,
+        *,
+        rerun_source_run_id: str | None = None,
+        timeout_seconds: float | None = MAX_SIMULATION_DURATION_SECONDS,
+    ) -> dict[str, Any]:
         async with self._lock:
             if not self._abort_requested:
                 self._abort_event.clear()
             before = await self.get_account()
             started_at = _utc_now()
             try:
-                result = await asyncio.wait_for(
-                    self._execute_run(run_id, request, before=before, rerun_source_run_id=rerun_source_run_id),
-                    timeout=MAX_SIMULATION_DURATION_SECONDS,
-                )
+                execution = self._execute_run(run_id, request, before=before, rerun_source_run_id=rerun_source_run_id)
+                if timeout_seconds is None:
+                    result = await execution
+                else:
+                    result = await asyncio.wait_for(execution, timeout=timeout_seconds)
             except TimeoutError:
                 finished_at = _utc_now()
                 result = self._blocked_result(
@@ -1957,6 +1970,11 @@ class SimulationService:
         log_payload = {
             "contract_version": CONTRACT_VERSION,
             "catalog_version": CATALOG_VERSION,
+            "event_type": "simulation_round_progress",
+            "run_id": run_id,
+            "status": "running",
+            "session_kind": request.session_kind.value,
+            "symbol": symbol,
             "level": "success" if latest_residual <= Decimal("0") else "warn",
             "created_at": now,
             "message_code": message_code,

@@ -736,7 +736,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="executionSymbol">执行交易对</label>
-                    <input id="executionSymbol" value="BTCUSDC" readonly />
+                    <input id="executionSymbol" value="ETHUSDC" readonly />
                   </div>
                   <div>
                     <label for="trend">趋势方向</label>
@@ -751,10 +751,10 @@
                   </div>
                   <div>
                     <label for="calcRounds">开单轮次</label>
-                    <input id="calcRounds" type="number" min="1" step="1" value="10" />
+                    <input id="calcRounds" type="number" min="1" step="1" value="30" />
                   </div>
                   <div>
-                    <label for="roundQty">每轮数量（自动计算，<span id="openRoundQtyUnit">BTC</span> 数量）</label>
+                    <label for="roundQty">每轮数量（自动计算，<span id="openRoundQtyUnit">ETH</span> 数量）</label>
                     <input id="roundQty" value="0" readonly />
                   </div>
                   <div>
@@ -792,7 +792,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="closeExecutionSymbol">执行交易对</label>
-                    <input id="closeExecutionSymbol" value="BTCUSDC" readonly />
+                    <input id="closeExecutionSymbol" value="ETHUSDC" readonly />
                   </div>
                   <div>
                     <label for="closeTrend">趋势方向</label>
@@ -802,15 +802,15 @@
                     </select>
                   </div>
                   <div>
-                    <label for="closeQty">平仓数量（<span id="closeQtyUnit">BTC</span> 数量）</label>
+                    <label for="closeQty">平仓数量（<span id="closeQtyUnit">ETH</span> 数量）</label>
                     <input id="closeQty" type="number" min="0" step="0.000001" value="0" />
                   </div>
                   <div>
                     <label for="closeRounds">开单轮次</label>
-                    <input id="closeRounds" type="number" min="1" step="1" value="10" />
+                    <input id="closeRounds" type="number" min="1" step="1" value="30" />
                   </div>
                   <div>
-                    <label for="closeRoundQty">每轮数量（自动计算，<span id="closeRoundQtyUnit">BTC</span> 数量）</label>
+                    <label for="closeRoundQty">每轮数量（自动计算，<span id="closeRoundQtyUnit">ETH</span> 数量）</label>
                     <input id="closeRoundQty" value="0" readonly />
                   </div>
                   <div>
@@ -844,7 +844,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="singleOpenExecutionSymbol">执行交易对</label>
-                    <input id="singleOpenExecutionSymbol" value="BTCUSDC" readonly />
+                    <input id="singleOpenExecutionSymbol" value="ETHUSDC" readonly />
                   </div>
                   <div>
                     <label for="singleOpenMode">开仓模式</label>
@@ -865,15 +865,15 @@
                     <input id="singleOpenLeverage" type="number" min="1" step="1" value="75" />
                   </div>
                   <div>
-                    <label for="singleOpenQty">开仓数量（<span id="singleOpenQtyUnit">BTC</span> 数量）</label>
+                    <label for="singleOpenQty">开仓数量（<span id="singleOpenQtyUnit">ETH</span> 数量）</label>
                     <input id="singleOpenQty" type="number" min="0" step="0.000001" value="0" />
                   </div>
                   <div>
                     <label for="singleOpenRounds">开单轮次</label>
-                    <input id="singleOpenRounds" type="number" min="1" step="1" value="10" />
+                    <input id="singleOpenRounds" type="number" min="1" step="1" value="30" />
                   </div>
                   <div>
-                    <label for="singleOpenRoundQty">每轮数量（自动计算，<span id="singleOpenRoundQtyUnit">BTC</span> 数量）</label>
+                    <label for="singleOpenRoundQty">每轮数量（自动计算，<span id="singleOpenRoundQtyUnit">ETH</span> 数量）</label>
                     <input id="singleOpenRoundQty" value="0" readonly />
                   </div>
                   <div>
@@ -907,7 +907,7 @@
                 <div class="param-grid">
                   <div>
                     <label for="singleCloseExecutionSymbol">执行交易对</label>
-                    <input id="singleCloseExecutionSymbol" value="BTCUSDC" readonly />
+                    <input id="singleCloseExecutionSymbol" value="ETHUSDC" readonly />
                   </div>
                   <div>
                     <label for="singleCloseMode">平仓模式</label>
@@ -921,15 +921,15 @@
                     <select id="singleCloseOrder"></select>
                   </div>
                   <div>
-                    <label for="singleCloseQty">平仓数量（<span id="singleCloseQtyUnit">BTC</span> 数量）</label>
+                    <label for="singleCloseQty">平仓数量（<span id="singleCloseQtyUnit">ETH</span> 数量）</label>
                     <input id="singleCloseQty" type="number" min="0" step="0.000001" value="0" />
                   </div>
                   <div>
                     <label for="singleCloseRounds">开单轮次</label>
-                    <input id="singleCloseRounds" type="number" min="1" step="1" value="10" />
+                    <input id="singleCloseRounds" type="number" min="1" step="1" value="30" />
                   </div>
                   <div>
-                    <label for="singleCloseRoundQty">每轮数量（自动计算，<span id="singleCloseRoundQtyUnit">BTC</span> 数量）</label>
+                    <label for="singleCloseRoundQty">每轮数量（自动计算，<span id="singleCloseRoundQtyUnit">ETH</span> 数量）</label>
                     <input id="singleCloseRoundQty" value="0" readonly />
                   </div>
                   <div>
@@ -967,7 +967,7 @@
           <section class="card">
             <div class="card-header">
               <h2 class="card-title">执行统计</h2>
-              <span class="badge success" id="statsSymbol">BTCUSDC</span>
+              <span class="badge success" id="statsSymbol">ETHUSDC</span>
             </div>
             <div class="card-body">
               <div id="executionSummaryBanner" class="status-banner summary hidden" data-real-only>
@@ -1011,7 +1011,7 @@
           <div class="logs-toolbar">
             <div class="logs-title-group">
               <h2 class="card-title" style="margin: 0;">执行日志</h2>
-              <span class="logs-header-status"><span class="dot" id="footerDot"></span><span id="footerStatus">已断开 BTCUSDC</span></span>
+              <span class="logs-header-status"><span class="dot" id="footerDot"></span><span id="footerStatus">已断开 ETHUSDC</span></span>
             </div>
             <span id="streamClock">--:--:--</span>
           </div>

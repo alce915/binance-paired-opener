@@ -17,7 +17,7 @@ from paired_opener.rounding import min_qty_for_notional, normalize_price, normal
 
 SYSTEM_ORDER_ID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-', re.IGNORECASE)
 
-DEFAULT_MARKET_SYMBOL = "BTCUSDC"
+DEFAULT_MARKET_SYMBOL = "ETHUSDC"
 
 
 def _default_symbol(settings: Settings) -> str:

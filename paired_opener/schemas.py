@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME
+from paired_opener.config import DEFAULT_LEVERAGE, DEFAULT_ROUND_COUNT, DEFAULT_TRADING_SYMBOL
 from paired_opener.domain import ExecutionProfile, FinalAlignmentStatus, PositionSide, RecoveryStatus, SessionKind, SessionStatus, SessionStopReason, SingleCloseMode, SingleOpenMode, TrendBias
 
 
@@ -95,12 +96,12 @@ class SessionPrecheckRequest(ExecutionPolicyFields):
 
 
 class MarketConnectRequest(BaseModel):
-    symbol: str = Field(default="BTCUSDC")
+    symbol: str = Field(default=DEFAULT_TRADING_SYMBOL)
 
 
 class SimulationRunRequest(ExecutionPolicyFields):
     session_kind: SessionKind = SessionKind.PAIRED_OPEN
-    symbol: str = Field(default="BTCUSDC")
+    symbol: str = Field(default=DEFAULT_TRADING_SYMBOL)
     trend_bias: TrendBias | None = None
     open_mode: SingleOpenMode | None = None
     close_mode: SingleCloseMode | None = None
@@ -108,8 +109,8 @@ class SimulationRunRequest(ExecutionPolicyFields):
     open_amount: Decimal | None = Field(default=None, gt=0)
     open_qty: Decimal | None = Field(default=None, gt=0)
     close_qty: Decimal | None = Field(default=None, gt=0)
-    leverage: int | None = Field(default=None, ge=1, le=125)
-    round_count: int = Field(..., ge=1, le=10_000)
+    leverage: int | None = Field(default=DEFAULT_LEVERAGE, ge=1, le=125)
+    round_count: int = Field(default=DEFAULT_ROUND_COUNT, ge=1, le=10_000)
     round_interval_seconds: int | None = Field(default=3, ge=0, le=3600)
 
 

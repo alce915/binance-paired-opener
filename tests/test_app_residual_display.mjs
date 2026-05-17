@@ -23,6 +23,7 @@ function loadStatsFunctions() {
   const resolveSource = extract(/function resolveResidualQty\(source = \{\}\) \{[\s\S]*?\n\}/, "resolveResidualQty");
   const renderSnapshotSource = extract(/function renderExecutionStatsSnapshot\(snapshot = \{\}\) \{[\s\S]*?\n\}/, "renderExecutionStatsSnapshot");
   const renderCurrentSource = extract(/function renderCurrentPageExecutionStats\(\) \{[\s\S]*?\n\}/, "renderCurrentPageExecutionStats");
+  const roundsLabelSource = extract(/function buildRoundsLabelFromStats\(stats = \{\}, roundsCompleted = 0, roundsTotal = 0\) \{[\s\S]*?\n\}/, "buildRoundsLabelFromStats");
   const executionSource = extract(/function updateExecutionStats\(stats\) \{[\s\S]*?\n\}/, "updateExecutionStats");
   const sessionSource = extract(/function updateRealSessionStats\(session\) \{[\s\S]*?\n\}/, "updateRealSessionStats");
 
@@ -55,6 +56,9 @@ function loadStatsFunctions() {
     },
     formatAlignmentStatus(value) {
       return `alignment:${value}`;
+    },
+    copyOrDefault(_key, fallback) {
+      return fallback;
     },
     updateAbortStateLabel() {},
     buildExecutionSummary(source, overrides = {}) {
@@ -92,6 +96,7 @@ function loadStatsFunctions() {
 ${resolveSource}
 ${renderSnapshotSource}
 ${renderCurrentSource}
+${roundsLabelSource}
 ${executionSource}
 ${sessionSource}
 this.resolveResidualQty = resolveResidualQty;

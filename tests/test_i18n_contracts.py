@@ -28,8 +28,10 @@ def test_root_catalog_bootstrap_payload_exposes_shared_contract() -> None:
     assert payload["messages"]["console.mode_labels.paired_open"] == "双向开仓"
     assert payload["messages"]["runtime.connection_disconnected"] == "已断开"
     assert payload["registries"]["reasons"]["session_not_found"]["key"] == "reasons.session_not_found"
+    assert payload["registries"]["reasons"]["round_count_must_be_positive"]["key"] == "reasons.round_count_must_be_positive"
     assert format_copy("common.default_account_name") == "默认账户"
     assert format_reason("session_not_found", {"session_id": "session-1"}) == "未找到会话 session-1。"
+    assert format_reason("round_count_must_be_positive") == format_copy("reasons.round_count_must_be_positive")
     assert "榛樿" not in joined_messages
     assert "鍙屽悜" not in joined_messages
     assert "宸叉柇寮€" not in joined_messages

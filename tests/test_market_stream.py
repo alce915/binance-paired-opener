@@ -82,6 +82,12 @@ class SlowGateway(ExchangeGateway):
         raise NotImplementedError
 
 
+def test_market_stream_fallback_default_symbol_is_eth_usdc() -> None:
+    settings = api_module.Settings(_env_file=None, symbol_whitelist=[])
+
+    assert market_stream_module._default_symbol(settings) == "ETHUSDC"
+
+
 @pytest.mark.asyncio
 async def test_run_simulation_rejects_concurrent_execution() -> None:
     gateway = SlowGateway()

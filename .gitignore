@@ -30,6 +30,7 @@ config/binance_api.local.env
 .codex-backups/
 .codex_tmp/
 .tmp/
+.tmp-python-dir/
 .codex-submit-*/
 pytest-cache-files-*/
 tmp_pytest*/

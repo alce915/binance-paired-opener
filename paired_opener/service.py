@@ -772,6 +772,8 @@ class OpenSessionService:
         round_count: int,
         rules,
     ) -> tuple[Decimal, Decimal, list[Decimal], Decimal]:
+        if round_count <= 0:
+            raise ValueError(format_copy("reasons.round_count_must_be_positive"))
         round_qty = normalize_qty(normalized_target_qty / Decimal(round_count), rules)
         if round_qty <= Decimal("0"):
             raise ValueError("每轮数量归一化后为 0，无法执行")
@@ -1045,6 +1047,9 @@ class OpenSessionService:
         if request.round_qty is None or request.trend_bias is None:
             checks.append(self._precheck_item("request", "参数完整性", "fail", "缺少双向开仓必要参数"))
             return self._finalize_precheck(checks, derived, default_summary="双向开仓预检完成")
+        if request.round_count <= 0:
+            checks.append(self._precheck_item("request", "参数完整性", "fail", format_copy("reasons.round_count_must_be_positive")))
+            return self._finalize_precheck(checks, derived, default_summary="双向开仓预检完成")
         if rules and quote:
             requested_round_qty = Decimal(request.round_qty)
             normalized_round_qty = normalize_qty(requested_round_qty, rules)
@@ -1081,6 +1086,9 @@ class OpenSessionService:
         checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request, strict_hedge_mode=strict_hedge_mode)
         if request.close_qty is None or request.trend_bias is None:
             checks.append(self._precheck_item("request", "参数完整性", "fail", "缺少双向平仓必要参数"))
+            return self._finalize_precheck(checks, derived, default_summary="双向平仓预检完成")
+        if request.round_count <= 0:
+            checks.append(self._precheck_item("request", "参数完整性", "fail", format_copy("reasons.round_count_must_be_positive")))
             return self._finalize_precheck(checks, derived, default_summary="双向平仓预检完成")
         if rules and quote:
             normalized_round_qty = normalize_qty(request.close_qty / Decimal(request.round_count), rules)
@@ -1123,6 +1131,9 @@ class OpenSessionService:
         checks.append(self._precheck_item("whitelist", "白名单", "pass" if allowed else "fail", "交易对白名单校验通过" if allowed else f"{symbol} 不在白名单中，无法真实开仓"))
         if request.open_qty is None or request.open_mode is None:
             checks.append(self._precheck_item("request", "参数完整性", "fail", "缺少单向开仓必要参数"))
+            return self._finalize_precheck(checks, derived, default_summary="单向开仓预检完成")
+        if request.round_count <= 0:
+            checks.append(self._precheck_item("request", "参数完整性", "fail", format_copy("reasons.round_count_must_be_positive")))
             return self._finalize_precheck(checks, derived, default_summary="单向开仓预检完成")
         long_qty = Decimal(derived["long_qty"])
         short_qty = Decimal(derived["short_qty"])
@@ -1183,6 +1194,9 @@ class OpenSessionService:
         checks, derived, overview, rules, current_leverage, quote = await self._common_precheck_context(request, strict_hedge_mode=strict_hedge_mode)
         if request.close_qty is None or request.close_mode is None:
             checks.append(self._precheck_item("request", "参数完整性", "fail", "缺少单向平仓必要参数"))
+            return self._finalize_precheck(checks, derived, default_summary="单向平仓预检完成")
+        if request.round_count <= 0:
+            checks.append(self._precheck_item("request", "参数完整性", "fail", format_copy("reasons.round_count_must_be_positive")))
             return self._finalize_precheck(checks, derived, default_summary="单向平仓预检完成")
         long_qty = Decimal(derived["long_qty"])
         short_qty = Decimal(derived["short_qty"])
@@ -1257,6 +1271,8 @@ class OpenSessionService:
             if symbol not in self._settings.normalized_whitelist:
                 raise ValueError(f"Symbol {symbol} is not in whitelist")
             self._ensure_no_active_symbol_session(symbol)
+            if request.round_count <= 0:
+                raise ValueError(format_copy("reasons.round_count_must_be_positive"))
             rules = await self._gateway.get_symbol_rules(symbol)
             if request.leverage > rules.max_leverage:
                 raise ValueError(f"Leverage {request.leverage} exceeds max {rules.max_leverage} for {symbol}")
@@ -1523,6 +1539,8 @@ class OpenSessionService:
                     f"平仓数量 {normalized_close_qty} 超过当前可双向平仓数量 {max_closeable_qty}，无法平仓"
                 )
 
+            if request.round_count <= 0:
+                raise ValueError(format_copy("reasons.round_count_must_be_positive"))
             round_qty = normalize_qty(normalized_close_qty / Decimal(request.round_count), rules)
             if round_qty <= Decimal("0"):
                 raise ValueError("每轮数量归一化后为 0，无法平仓")

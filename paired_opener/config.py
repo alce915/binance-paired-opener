@@ -17,6 +17,9 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
 OPEN_AMOUNT_BALANCE_LIMIT_RATIO = Decimal("0.98")
 OPEN_AMOUNT_BALANCE_LIMIT_PERCENT = "98%"
+DEFAULT_TRADING_SYMBOL = "ETHUSDC"
+DEFAULT_LEVERAGE = 75
+DEFAULT_ROUND_COUNT = 30
 ENV_FILES = (
     CONFIG_DIR / "binance_api.env",
     CONFIG_DIR / "binance_api.local.env",
@@ -81,7 +84,7 @@ class Settings(BaseSettings):
     monitor_history_window_days: int = 7
     monitor_history_refresh_interval_ms: int = 60_000
     active_account_file: Path = CONFIG_DIR / "active_account.json"
-    symbol_whitelist: list[str] = Field(default_factory=lambda: ["BTCUSDC", "ETHUSDC"])
+    symbol_whitelist: list[str] = Field(default_factory=lambda: ["ETHUSDC", "BTCUSDC"])
     symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"
     session_event_retention_days: int = 30
     session_event_retention_per_session: int = 2_000

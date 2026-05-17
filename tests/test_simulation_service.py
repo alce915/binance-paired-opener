@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from paired_opener import simulation as simulation_module
 from paired_opener.domain import ExchangeOrder, OrderSide, PositionSide, Quote, SessionKind, SingleCloseMode, SingleOpenMode, SymbolRules
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.schemas import SimulationRunRequest
@@ -122,6 +123,25 @@ class ShortOrderWaitSimulationService(SimulationService):
         return Decimal("1")
 
 
+class SlowCompletingSimulationService(SimulationService):
+    async def _execute_run(self, run_id, request, *, before, rerun_source_run_id):
+        await asyncio.sleep(0.05)
+        return self._result_payload(
+            run_id,
+            request,
+            "completed",
+            "filled",
+            rerun_source_run_id,
+            filled_qty=Decimal("0.010"),
+            avg_fill_price=Decimal("10000"),
+            fee=Decimal("0"),
+            residual_qty=Decimal("0"),
+            realized_pnl=Decimal("0"),
+            rounds_completed=1,
+            rounds_total=1,
+        )
+
+
 def make_fast_order_wait_service(tmp_path: Path, gateway: SimulationGateway | None = None) -> SimulationService:
     repository = SqliteRepository(tmp_path / "simulation.sqlite3")
     return FastOrderWaitSimulationService(gateway or SimulationGateway(), repository)
@@ -130,6 +150,11 @@ def make_fast_order_wait_service(tmp_path: Path, gateway: SimulationGateway | No
 def make_short_order_wait_service(tmp_path: Path, gateway: SimulationGateway | None = None) -> SimulationService:
     repository = SqliteRepository(tmp_path / "simulation.sqlite3")
     return ShortOrderWaitSimulationService(gateway or SimulationGateway(), repository)
+
+
+def make_slow_completing_service(tmp_path: Path, gateway: SimulationGateway | None = None) -> SimulationService:
+    repository = SqliteRepository(tmp_path / "simulation.sqlite3")
+    return SlowCompletingSimulationService(gateway or SimulationGateway(), repository)
 
 
 def test_order_wait_seconds_is_fixed_ten_seconds(tmp_path: Path) -> None:
@@ -624,6 +649,102 @@ async def test_paired_open_zero_passive_fill_keeps_extending_until_abort(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_background_simulation_is_not_cut_off_by_hard_duration_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(simulation_module, "MAX_SIMULATION_DURATION_SECONDS", 0.001)
+    service = make_slow_completing_service(tmp_path)
+
+    await service.start_run(
+        SimulationRunRequest(
+            session_kind=SessionKind.SINGLE_OPEN,
+            symbol="BTCUSDT",
+            open_mode=SingleOpenMode.REGULAR,
+            selected_position_side=PositionSide.LONG,
+            open_qty=Decimal("0.010"),
+            leverage=10,
+            round_count=1,
+            round_interval_seconds=0,
+        )
+    )
+    task = service._active_task
+    assert task is not None
+
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result["status"] == "completed"
+    assert result["stop_reason"] == "filled"
+
+
+@pytest.mark.asyncio
+async def test_round_progress_execution_log_carries_run_id_for_polling_dedupe(tmp_path: Path) -> None:
+    published: list[tuple[str, dict]] = []
+
+    async def capture(event_type: str, payload: dict) -> None:
+        published.append((event_type, payload))
+
+    repository = SqliteRepository(tmp_path / "simulation.sqlite3")
+    gateway = SimulationGateway()
+    service = SimulationService(gateway, repository, publisher=capture)
+    request = SimulationRunRequest(
+        session_kind=SessionKind.SINGLE_OPEN,
+        symbol="BTCUSDT",
+        open_mode=SingleOpenMode.REGULAR,
+        selected_position_side=PositionSide.LONG,
+        open_qty=Decimal("0.010"),
+        leverage=10,
+        round_count=1,
+        round_interval_seconds=0,
+    )
+    run_id = "run-progress-dedupe"
+    now = datetime.now(UTC)
+    with repository._lock, repository._connection:
+        service._insert_run_locked(
+            run_id=run_id,
+            event_type="simulation_run",
+            request=service._request_payload(request),
+            result={},
+            status="running",
+            stop_reason="running",
+            created_at=now,
+            stage="running",
+            heartbeat_at=now,
+            last_event_at=now,
+            lock_reason="simulation_running",
+        )
+    result = service._result_payload(
+        run_id,
+        request,
+        "completed",
+        "filled",
+        None,
+        filled_qty=Decimal("0.010"),
+        avg_fill_price=Decimal("10000"),
+        fee=Decimal("0"),
+        residual_qty=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        rounds_completed=1,
+        rounds_total=1,
+    )
+
+    await service._publish_round_progress(
+        run_id=run_id,
+        request=request,
+        symbol="BTCUSDT",
+        planned_qtys=[Decimal("0.010")],
+        results=[result],
+        rules=await gateway.get_symbol_rules("BTCUSDT"),
+        round_index=1,
+    )
+
+    execution_logs = [payload for event_type, payload in published if event_type == "execution_log"]
+    assert execution_logs
+    assert execution_logs[0]["run_id"] == run_id
+    assert execution_logs[0]["event_id"] > 0
+
+
+@pytest.mark.asyncio
 async def test_account_marks_open_positions_to_current_quote(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     gateway = SimulationGateway(
@@ -961,7 +1082,7 @@ async def test_paired_open_rolls_back_first_leg_when_second_leg_blocks(tmp_path:
             {
                 "symbol": "BTCUSDT",
                 "bids": [{"price": Decimal("9990"), "qty": Decimal("1")}],
-                "asks": [{"price": Decimal("10000"), "qty": Decimal("1")}],
+                "asks": [{"price": Decimal("9990"), "qty": Decimal("1")}],
                 "event_time": fresh_time,
             },
             {"symbol": "BTCUSDT", "bids": [], "asks": [], "event_time": stale_time},

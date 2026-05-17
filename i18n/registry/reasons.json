@@ -11,6 +11,10 @@
     "key": "reasons.invalid_parameter",
     "params": []
   },
+  "round_count_must_be_positive": {
+    "key": "reasons.round_count_must_be_positive",
+    "params": []
+  },
   "trading_request_failed": {
     "key": "reasons.trading_request_failed",
     "params": []
