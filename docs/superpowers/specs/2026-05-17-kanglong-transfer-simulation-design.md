@@ -646,6 +646,32 @@ operator_choice
 
 `batch_debt_buffer_history` 记录每个 donor batch 的成功 group、失败点和转入待修复缺口的数量。`abort_recover_history` 必须记录操作者、恢复前快照、恢复后快照、处理动作、释放锁原因和确认时间。`rounding_ledger` 是 `residual_ledger` 的子集，用于专门追踪 step size 向下取整产生的数量差额。
 
+## 展示文案与语言包
+
+亢龙模块新增的用户可见文本必须从语言包渲染，不允许在前端、后端报告、日志适配层或预检响应里硬编码中文展示文案。第一版默认语言为 `zh-CN`，但事件、状态、阻断原因和报告字段必须保留稳定的机器码，方便后续扩展其他语言。
+
+语言包沿用现有 i18n 结构：
+
+- 页面、控制台、按钮、表格列名、状态标签和报告标题写入 `i18n/messages/zh-CN.json`，建议使用 `console.kanglong.*` 命名空间。
+- 执行事件展示文案在 `i18n/registry/events.json` 注册，事件 payload 只携带 key 和参数。
+- 审计日志、恢复日志和操作日志展示文案在 `i18n/registry/logs.json` 注册。
+- 预检项和阻断原因分别在 `i18n/registry/precheck.json`、`i18n/registry/reasons.json` 注册。
+
+状态码和原因码必须作为结构化字段保存，例如 `blocked_main_not_flat`、`blocked_main_insufficient_capacity`、`blocked_initial_subaccount_unbalanced`、`paused_group_not_executable`、`needs_abort_recover`、`market_reduce_required` 和 `unsafe_dust_residual`。报告层展示时通过语言包 key 渲染，不能只保存已经渲染好的中文。
+
+报告、事件和日志建议同时保留以下结构：
+
+```text
+reason_code: blocked_main_not_flat
+message_key: reasons.kanglong.blocked_main_not_flat
+message_params:
+  long_qty
+  short_qty
+  qty_tolerance
+```
+
+中文开发环境要求所有新增语言包、报告快照和审计导出使用 UTF-8。占位符必须使用具名参数，不允许运行时拼接中文片段，例如不能用 `"主账号" + side + "不为空"` 这类方式组合展示文案；应使用完整模板和参数渲染，避免中文语序、标点和编码问题。
+
 ## 复用现有规则
 
 亢龙模块只负责跨账号规划、调度、对账和统计。底层交易规则复用现有能力：
@@ -698,5 +724,8 @@ operator_choice
 - 账号间无法闭合时只生成市场减仓建议。
 - 消耗统计正确区分 released profit、手续费、手续费资产、maker/taker、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
 - 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、realized PnL、手续费、手续费资产、成交明细、matched 数量、残差、交易规则不可用、配对腿 ID 和订单 ID。
+- 新增 UI、报告、日志、预检和阻断原因的用户可见文案必须通过 i18n key 渲染，不能硬编码中文。
+- 新增状态、原因、事件和日志 key 必须写入 `zh-CN` 语言包和对应 registry，参数占位符与事件数据保持一致。
+- 中文开发环境下保持 UTF-8，语言包使用完整模板和具名参数，不允许运行时拼接中文片段。
 - 模拟和未来实盘使用同一套规划与风控接口，仅执行模式不同。
 - 实盘候选必须校验模拟结果未过期、重新预检通过，并由操作员单独确认。
