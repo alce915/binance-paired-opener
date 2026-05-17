@@ -44,6 +44,7 @@ def simulate_group(
         match_id = f"{round_id}-match"
         matched_qty = submitted_qty
         matched_total += matched_qty
+        price_diff_pnl = _price_diff_pnl(group.side, close_price, open_price, matched_qty)
 
         if rounding_residual > Decimal("0"):
             residuals.append(
@@ -80,7 +81,8 @@ def simulate_group(
             avg_price=close_price,
             status=KanglongEventStatus.FILLED,
             fee=close_fee,
-            realized_pnl=_price_diff_pnl(group.side, close_price, open_price, matched_qty),
+            realized_pnl=Decimal("0"),
+            price_diff_pnl=Decimal("0"),
             fills=[
                 KanglongFill(
                     trade_id=f"{round_id}-close-fill",
@@ -114,6 +116,7 @@ def simulate_group(
             avg_price=open_price,
             status=KanglongEventStatus.FILLED,
             fee=open_fee,
+            price_diff_pnl=price_diff_pnl,
             fills=[
                 KanglongFill(
                     trade_id=f"{round_id}-open-fill",

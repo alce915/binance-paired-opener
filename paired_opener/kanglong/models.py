@@ -123,6 +123,7 @@ class KanglongEvent:
     fee: Decimal = Decimal("0")
     fee_asset: str = "USDC"
     realized_pnl: Decimal = Decimal("0")
+    price_diff_pnl: Decimal = Decimal("0")
     pnl_asset: str = "USDC"
     event_time: datetime = field(default_factory=utc_now)
 
