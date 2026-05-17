@@ -7,8 +7,14 @@ def test_kanglong_i18n_messages_and_registries_exist() -> None:
     catalog = messages()
     required_message_keys = {
         "console.kanglong.title",
+        "console.kanglong.main_account",
+        "console.kanglong.subaccounts",
+        "console.kanglong.selected_side",
         "console.kanglong.run_simulation",
         "console.kanglong.report.result_grade",
+        "console.kanglong.report.status",
+        "runtime.kanglong.account_selection_required",
+        "runtime.kanglong.request_failed",
         "runtime.kanglong.status.blocked_main_not_flat",
         "reasons.kanglong.blocked_main_not_flat",
         "events.kanglong.round_completed",

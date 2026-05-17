@@ -91,6 +91,21 @@
         display: grid;
         gap: 12px;
       }
+      .kanglong-panel .form-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: 1fr;
+      }
+      .kanglong-report {
+        min-height: 44px;
+        margin-top: 12px;
+        padding: 12px 14px;
+        border: 1px solid rgba(216, 197, 170, 0.8);
+        border-radius: 8px;
+        background: #fffaf5;
+        color: var(--ink);
+        font-weight: 800;
+      }
       .compact-actions {
         display: grid;
         gap: 10px;
@@ -1019,6 +1034,36 @@
         </section>
 
         <div class="simulation-under-log-grid" data-simulation-only>
+          <section class="card kanglong-panel" id="kanglongPanel">
+            <div class="card-header">
+              <h2 class="card-title" data-i18n="console.kanglong.title"></h2>
+            </div>
+            <div class="card-body">
+              <div class="form-grid">
+                <div>
+                  <label for="kanglongMainAccount" data-i18n="console.kanglong.main_account"></label>
+                  <select id="kanglongMainAccount"></select>
+                </div>
+                <div>
+                  <label for="kanglongSubaccounts" data-i18n="console.kanglong.subaccounts"></label>
+                  <select id="kanglongSubaccounts" multiple></select>
+                </div>
+                <div>
+                  <label for="kanglongSelectedSide" data-i18n="console.kanglong.selected_side"></label>
+                  <select id="kanglongSelectedSide">
+                    <option value="" data-i18n="console.kanglong.side_auto"></option>
+                    <option value="LONG" data-i18n="console.position_side.long"></option>
+                    <option value="SHORT" data-i18n="console.position_side.short"></option>
+                  </select>
+                </div>
+              </div>
+              <div class="compact-actions" style="margin-top: 12px;">
+                <button id="kanglongRunSimulation" class="simulation-run-btn" type="button" data-i18n="console.kanglong.run_simulation"></button>
+              </div>
+              <div id="kanglongReport" class="kanglong-report"></div>
+            </div>
+          </section>
+
           <section class="card" id="simulationSettingsCard">
             <div class="card-header">
               <h2 class="card-title">模拟设置</h2>

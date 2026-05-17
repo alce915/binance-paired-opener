@@ -41,6 +41,11 @@ const exportSimHistoryBtn = document.getElementById("exportSimHistoryBtn");
 const clearSimHistoryBtn = document.getElementById("clearSimHistoryBtn");
 const simHistoryList = document.getElementById("simHistoryList");
 const simHistoryCount = document.getElementById("simHistoryCount");
+const kanglongMainAccount = document.getElementById("kanglongMainAccount");
+const kanglongSubaccounts = document.getElementById("kanglongSubaccounts");
+const kanglongSelectedSide = document.getElementById("kanglongSelectedSide");
+const kanglongRunSimulation = document.getElementById("kanglongRunSimulation");
+const kanglongReport = document.getElementById("kanglongReport");
 const executionSummaryBanner = document.getElementById("executionSummaryBanner");
 const executionSummaryText = document.getElementById("executionSummaryText");
 const executionRiskBanner = document.getElementById("executionRiskBanner");
@@ -766,6 +771,14 @@ function copyOrDefault(key, fallback, params = {}) {
   });
 }
 
+function applyStaticI18n(root = document) {
+  root.querySelectorAll("[data-i18n]").forEach((element) => {
+    const key = element.dataset.i18n;
+    if (!key) return;
+    element.textContent = copyOrDefault(key, key);
+  });
+}
+
 function statusLabel(status) {
   return CONNECTION_STATUS_LABELS[String(status || "idle")] || String(status || "idle");
 }
@@ -1222,12 +1235,81 @@ function renderAccountOptions(accounts) {
   if (activeAccount) {
     setCurrentAccount(activeAccount.id, activeAccount.name, true);
   }
+  renderKanglongAccountOptions(availableAccounts);
 }
 
 async function loadAccounts() {
   const payload = await request("/config/accounts");
   renderAccountOptions(payload.accounts || []);
   return payload.accounts || [];
+}
+
+function renderKanglongAccountOptions(accounts = availableAccounts) {
+  if (!kanglongMainAccount || !kanglongSubaccounts) return;
+  const normalizedAccounts = Array.isArray(accounts) ? accounts : [];
+  const selectedMain = kanglongMainAccount.value
+    || currentAccount.id
+    || normalizedAccounts.find((account) => account.is_active)?.id
+    || normalizedAccounts[0]?.id
+    || "";
+  const selectedSubs = new Set(
+    Array.from(kanglongSubaccounts.selectedOptions || []).map((option) => option.value)
+  );
+
+  kanglongMainAccount.innerHTML = "";
+  kanglongSubaccounts.innerHTML = "";
+  normalizedAccounts.forEach((account) => {
+    const mainOption = document.createElement("option");
+    mainOption.value = account.id;
+    mainOption.textContent = account.name || account.id;
+    kanglongMainAccount.appendChild(mainOption);
+  });
+  if (normalizedAccounts.some((account) => account.id === selectedMain)) {
+    kanglongMainAccount.value = selectedMain;
+  }
+  const activeMain = kanglongMainAccount.value || selectedMain;
+  normalizedAccounts.forEach((account) => {
+    if (account.id === activeMain) return;
+    const subOption = document.createElement("option");
+    subOption.value = account.id;
+    subOption.textContent = account.name || account.id;
+    subOption.selected = selectedSubs.has(account.id);
+    kanglongSubaccounts.appendChild(subOption);
+  });
+}
+
+function renderKanglongReport(payload = {}) {
+  if (!kanglongReport) return;
+  const resultGrade = payload.result_grade || "--";
+  const status = payload.status || "--";
+  kanglongReport.textContent = [
+    copyOrDefault("console.kanglong.report.result_grade", "{result_grade}", { result_grade: resultGrade }),
+    copyOrDefault("console.kanglong.report.status", "{status}", { status }),
+  ].join(" | ");
+}
+
+async function runKanglongSimulation() {
+  const mainAccountId = kanglongMainAccount?.value || "";
+  const subaccountIds = Array.from(kanglongSubaccounts?.selectedOptions || [])
+    .map((option) => option.value)
+    .filter(Boolean);
+  if (!mainAccountId || subaccountIds.length === 0) {
+    throw new Error(copyOrDefault("runtime.kanglong.account_selection_required", "runtime.kanglong.account_selection_required"));
+  }
+  const payload = {
+    mode: "simulation",
+    symbol: executionSymbol?.value || DEFAULT_SYMBOL,
+    main_account_id: mainAccountId,
+    subaccount_ids: subaccountIds,
+    selected_side: kanglongSelectedSide?.value || null,
+  };
+  const response = await request("/kanglong/simulation/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  renderKanglongReport(response);
+  return response;
 }
 
 function rebuildSymbolOptions(selectedSymbol = activeSymbol) {
@@ -4530,6 +4612,25 @@ exportSimHistoryBtn?.addEventListener("click", () => {
   window.location.href = "/simulation/history/export.csv";
 });
 
+kanglongMainAccount?.addEventListener("change", () => {
+  renderKanglongAccountOptions(availableAccounts);
+});
+
+kanglongRunSimulation?.addEventListener("click", async () => {
+  try {
+    const payload = await runKanglongSimulation();
+    appendLog("success", "", undefined, {
+      messageCode: "console.kanglong.report.status",
+      messageParams: { status: payload.status || "--" },
+    });
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.kanglong.request_failed",
+      messageParams: { error: userVisibleErrorMessage(error) },
+    });
+  }
+});
+
 simHistoryList?.addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
@@ -4549,6 +4650,8 @@ simHistoryList?.addEventListener("click", async (event) => {
   }
 });
 
+applyStaticI18n();
+renderKanglongReport();
 setEmptyState(asksContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_asks"] || "开启连接后加载卖盘");
 setEmptyState(bidsContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_bids"] || "开启连接后加载买盘");
 setActiveSymbol(activeSymbol, false);
