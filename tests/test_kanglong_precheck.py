@@ -95,3 +95,18 @@ def test_precheck_blocks_when_initial_subaccount_is_unbalanced() -> None:
     )
 
     assert result.status == KanglongRunStatus.BLOCKED_INITIAL_SUBACCOUNT_UNBALANCED
+
+
+def test_precheck_blocks_when_main_capacity_is_below_first_release_qty() -> None:
+    config = KanglongSymbolConfig(max_main_temp_qty=Decimal("0.50"))
+    result = run_static_precheck(
+        main=snapshot("main", "0", "0", "0", "0"),
+        subaccounts=[snapshot("sub1", "1", "1", "10", "0")],
+        symbol="ETHUSDC",
+        manual_side=None,
+        config=config,
+    )
+
+    assert result.status == KanglongRunStatus.BLOCKED_MAIN_INSUFFICIENT_CAPACITY
+    assert result.details["main_receivable_qty"] == Decimal("0.50")
+    assert result.details["capacity_gap_qty"] == Decimal("0.50")

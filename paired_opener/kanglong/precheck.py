@@ -21,6 +21,15 @@ def closeable_profitable_qty(
     return qty
 
 
+def estimate_main_receivable_qty(
+    main: KanglongAccountSnapshot,
+    selected_side: PositionSide,
+    config: KanglongSymbolConfig,
+) -> Decimal:
+    current_temp_qty = main.qty(selected_side)
+    return max(config.max_main_temp_qty - current_temp_qty, Decimal("0"))
+
+
 def _side_summary(
     subaccounts: list[KanglongAccountSnapshot],
     side: PositionSide,
@@ -149,6 +158,21 @@ def run_static_precheck(
     )
     first = donors[0]
     planned_release_qty = closeable_profitable_qty(first, selected_side, config)
+    main_receivable_qty = estimate_main_receivable_qty(main, selected_side, config)
+    if main_receivable_qty + config.qty_tolerance < planned_release_qty:
+        return KanglongPrecheckResult(
+            ok=False,
+            status=KanglongRunStatus.BLOCKED_MAIN_INSUFFICIENT_CAPACITY,
+            reason_code="blocked_main_insufficient_capacity",
+            selected_side=selected_side,
+            first_donor_account_id=first.account_id,
+            planned_release_qty=planned_release_qty,
+            other_side_preview=other_side_preview,
+            details={
+                "main_receivable_qty": main_receivable_qty,
+                "capacity_gap_qty": planned_release_qty - main_receivable_qty,
+            },
+        )
     return KanglongPrecheckResult(
         True,
         KanglongRunStatus.CHAIN_READY,
