@@ -46,5 +46,13 @@
   "kanglong.blocked_main_not_flat": {
     "key": "reasons.kanglong.blocked_main_not_flat",
     "params": ["symbol", "long_qty", "short_qty", "qty_tolerance"]
+  },
+  "kanglong.blocked_plan_stale": {
+    "key": "reasons.kanglong.blocked_plan_stale",
+    "params": []
+  },
+  "kanglong.idempotency_conflict": {
+    "key": "reasons.kanglong.idempotency_conflict",
+    "params": []
   }
 }
