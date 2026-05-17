@@ -107,6 +107,7 @@ const kanglongState = {
   seenEventIds: new Set(),
   logFilter: "all",
 };
+let kanglongActiveRunRestored = false;
 let whitelistSymbols = [];
 let temporaryCustomSymbol = null;
 let latestReferencePrice = 0;
@@ -1512,6 +1513,7 @@ async function createKanglongPlan() {
   kanglongState.confirmedPlanVersion = "";
   kanglongState.latestEventId = 0;
   kanglongState.seenEventIds.clear();
+  kanglongActiveRunRestored = true;
   if (kanglongExecutionLog) {
     setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
   }
@@ -1581,6 +1583,79 @@ async function pollKanglongEvents() {
     afterEventId = nextEventId;
     pageCount += 1;
   } while (pageCount < 20);
+  return payload;
+}
+
+function restoreKanglongSelectionFromPayload(payload = {}) {
+  const requestPayload = payload.request && typeof payload.request === "object" ? payload.request : {};
+  const symbol = payload.symbol || requestPayload.symbol;
+  if (symbol && kanglongSymbol) {
+    kanglongSymbol.value = String(symbol).trim().toUpperCase();
+  }
+  const selectedSide = payload.selected_side || payload.plan?.selected_side || requestPayload.selected_side;
+  if (kanglongSide && selectedSide !== undefined && selectedSide !== null) {
+    kanglongSide.value = String(selectedSide || "").trim().toUpperCase();
+  }
+  const mainAccountId = kanglongAccountId(payload.main_account_id || requestPayload.main_account_id);
+  if (mainAccountId) {
+    kanglongState.mainAccountId = mainAccountId;
+    kanglongState.selectedSubaccountIds.delete(mainAccountId);
+  }
+  const subaccountIds = Array.isArray(payload.subaccount_ids) ? payload.subaccount_ids : requestPayload.subaccount_ids;
+  if (Array.isArray(subaccountIds)) {
+    kanglongState.selectedSubaccountIds = new Set(
+      subaccountIds.map((accountId) => kanglongAccountId(accountId)).filter((accountId) => accountId && accountId !== mainAccountId),
+    );
+    kanglongState.checkedPoolAccountIds.clear();
+  }
+}
+
+async function restoreActiveKanglongRun() {
+  if (kanglongActiveRunRestored) return kanglongState.plan;
+  let payload = null;
+  try {
+    payload = await request("/kanglong/simulation/run/active");
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.kanglong.request_failed",
+      messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+    });
+    return null;
+  }
+  kanglongActiveRunRestored = true;
+  if (!payload || payload.status === "idle") {
+    if (!kanglongState.plan) {
+      kanglongState.confirmedPlanVersion = "";
+      kanglongState.latestEventId = 0;
+      kanglongState.seenEventIds.clear();
+    }
+    syncKanglongWorkflowButtons(kanglongState.plan);
+    return null;
+  }
+
+  const actions = kanglongAvailableActions(payload);
+  const planVersion = kanglongPlanVersion(payload);
+  kanglongState.plan = payload;
+  kanglongState.confirmedPlanVersion = (
+    payload.status === "plan_confirmed" || (actions.includes("execute") && planVersion)
+  ) ? planVersion : "";
+  const latestEventId = Number(payload.latest_event_id || 0);
+  kanglongState.latestEventId = Number.isFinite(latestEventId) && latestEventId > 0 ? latestEventId : 0;
+  kanglongState.seenEventIds.clear();
+  restoreKanglongSelectionFromPayload(payload);
+  if (kanglongExecutionLog) {
+    setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
+  }
+  renderKanglongPlanSummary(payload);
+  syncKanglongWorkflowButtons(payload);
+  try {
+    await pollKanglongEvents();
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.kanglong.request_failed",
+      messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+    });
+  }
   return payload;
 }
 
@@ -3347,6 +3422,7 @@ async function applyAppPage(page) {
     maybeScheduleCurrentModePrecheck("page_switch");
   } else if (appPage === "kanglong" && typeof renderKanglongAccountPool === "function") {
     renderKanglongAccountPool(availableAccounts);
+    await restoreActiveKanglongRun();
   }
   return true;
 }

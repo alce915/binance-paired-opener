@@ -23,6 +23,7 @@ for (const id of [
 assert.equal(indexSource.includes(`id="kanglongPanel"`), false, "old simulation Kanglong panel should be removed");
 assert.ok(appSource.includes(`"kanglong"`), "app.js should recognize kanglong as an app page");
 assert.ok(appSource.includes(`KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan"`), "app.js should declare the split plan endpoint reference");
+assert.ok(appSource.includes(`"/kanglong/simulation/run/active"`), "app.js should request the active Kanglong run endpoint");
 assert.equal(/request\(\s*["']\/kanglong\/simulation\/run["']/.test(appSource), false, "frontend should not POST to the deprecated Kanglong run endpoint");
 
 for (const symbol of [
@@ -37,6 +38,7 @@ for (const symbol of [
   "confirmKanglongPlan",
   "executeKanglongPlan",
   "pollKanglongEvents",
+  "restoreActiveKanglongRun",
   "renderKanglongPlanSummary",
   "appendKanglongExecutionEvent",
   "newKanglongIdempotencyKey",
@@ -154,6 +156,7 @@ function makeKanglongHarness(requestImpl) {
       seenEventIds: new Set(),
       logFilter: "all",
     };
+    let kanglongActiveRunRestored = false;
     const kanglongConfirmPlanBtn = { disabled: false };
     const kanglongExecutePlanBtn = { disabled: false };
     const kanglongDetectPlanBtn = { disabled: false };
@@ -215,6 +218,10 @@ function makeKanglongHarness(requestImpl) {
       empty.textContent = text;
       container.replaceChildren(empty);
     }
+    function kanglongAccountId(account) {
+      if (typeof account === "string") return account.trim().toLowerCase();
+      return String(account?.id || account?.account_id || "").trim().toLowerCase();
+    }
     function nowTime() {
       return "12:00:00";
     }
@@ -239,6 +246,7 @@ function makeKanglongHarness(requestImpl) {
       planSummary: kanglongPlanSummary,
       pollKanglongEvents,
       renderKanglongPlanSummary,
+      restoreActiveKanglongRun,
       runKanglongWorkflowAction,
       state: kanglongState,
       logs: appendLogEntries,
@@ -311,4 +319,98 @@ function makeKanglongHarness(requestImpl) {
   assert.equal(calls.length, 2, "Kanglong event polling should continue while has_more is true");
   assert.equal(api.state.latestEventId, 2, "Kanglong event cursor should advance to the next page cursor");
   assert.equal(api.executionLog.children.length, 2, "both Kanglong event pages should append");
+}
+
+{
+  const calls = [];
+  const api = makeKanglongHarness(async (requestPath) => {
+    calls.push(requestPath);
+    return { status: "idle", available_actions: ["create_plan"] };
+  });
+  api.state.plan = null;
+  api.state.confirmedPlanVersion = "";
+  api.state.latestEventId = 0;
+  api.confirmButton.disabled = true;
+  api.executeButton.disabled = true;
+
+  await api.restoreActiveKanglongRun();
+
+  assert.deepEqual(calls, ["/kanglong/simulation/run/active"], "idle restore should only query the active endpoint");
+  assert.equal(api.state.plan, null, "idle active response should leave empty Kanglong state empty");
+  assert.equal(api.state.confirmedPlanVersion, "", "idle active response should not set a confirmed plan");
+  assert.equal(api.confirmButton.disabled, true, "idle active response should keep confirm disabled");
+  assert.equal(api.executeButton.disabled, true, "idle active response should keep execute disabled");
+}
+
+{
+  const calls = [];
+  const api = makeKanglongHarness(async (requestPath) => {
+    calls.push(requestPath);
+    if (requestPath === "/kanglong/simulation/run/active") {
+      return {
+        run_id: "active-run",
+        status: "plan_confirmed",
+        plan_version: "plan-active",
+        latest_event_id: 5,
+        available_actions: ["execute", "refresh_plan"],
+        request: {
+          symbol: "BTCUSDC",
+          main_account_id: "main-active",
+          subaccount_ids: ["sub-active"],
+          selected_side: "SHORT",
+        },
+        report: {
+          summary: {
+            group_count: 2,
+            round_count: 4,
+            planned_release_qty: "1.25",
+          },
+        },
+      };
+    }
+    assert.equal(requestPath, "/kanglong/simulation/run/active-run/events?after_event_id=5");
+    return {
+      run_id: "active-run",
+      events: [{ event_id: 6, payload: { message_key: "events.kanglong.group_simulated", message_params: { group_id: "B" } } }],
+      next_after_event_id: 6,
+      latest_event_id: 6,
+      has_more: false,
+    };
+  });
+
+  await api.restoreActiveKanglongRun();
+
+  assert.deepEqual(calls, [
+    "/kanglong/simulation/run/active",
+    "/kanglong/simulation/run/active-run/events?after_event_id=5",
+  ], "active restore should poll events after the restored cursor");
+  assert.equal(api.state.plan.run_id, "active-run", "active payload should become the current Kanglong plan");
+  assert.equal(api.state.confirmedPlanVersion, "plan-active", "confirmed active plan should restore execute version");
+  assert.equal(api.state.latestEventId, 6, "event polling should advance the restored event cursor");
+  assert.equal(api.executeButton.disabled, false, "execute should be enabled for a restored executable plan");
+  assert.equal(api.confirmButton.disabled, true, "confirm should be disabled when only execute is available");
+  assert.ok(api.planSummary.textContent.includes("plan_confirmed"), "restored plan summary should render active status");
+  assert.equal(api.executionLog.children.length, 1, "restored active run should poll and render newer events");
+}
+
+{
+  const api = makeKanglongHarness(async (requestPath) => {
+    if (requestPath === "/kanglong/simulation/run/active") {
+      return {
+        run_id: "active-run",
+        status: "plan_confirmed",
+        plan_version: "plan-active",
+        latest_event_id: 0,
+        available_actions: ["execute"],
+        report: { summary: { group_count: 1 } },
+      };
+    }
+    throw new Error("event polling failed");
+  });
+
+  await api.restoreActiveKanglongRun();
+
+  assert.equal(api.state.plan.run_id, "active-run", "restore should keep the active plan when event polling fails");
+  assert.equal(api.logs.length, 1, "event polling failure should be logged once");
+  assert.equal(api.logs[0].options.messageCode, "runtime.kanglong.request_failed", "restore polling failure should use Kanglong request error copy");
 }

@@ -160,6 +160,64 @@ def test_service_plan_confirm_execute_records_state_and_events(tmp_path) -> None
     assert events["latest_event_id"] > 0
 
 
+def test_service_active_run_returns_latest_restorable_run_with_actions(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        repository.create_kanglong_run(
+            {
+                "run_id": "older-open",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1"],
+                "status": KanglongRunStatus.CHAIN_READY.value,
+                "plan_version": "plan-older",
+                "available_actions": ["confirm", "refresh_plan"],
+                "report": {"summary": {"group_count": 1, "round_count": 2, "planned_release_qty": "0.5"}},
+                "created_at": "2026-05-17T01:00:00+00:00",
+                "updated_at": "2026-05-17T01:00:00+00:00",
+            }
+        )
+        repository.create_kanglong_run(
+            {
+                "run_id": "latest-open",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1", "sub2"],
+                "status": KanglongRunStatus.PLAN_CONFIRMED.value,
+                "plan_version": "plan-latest",
+                "available_actions": ["execute", "refresh_plan"],
+                "report": {"summary": {"group_count": 2, "round_count": 4, "planned_release_qty": "1"}},
+                "created_at": "2026-05-17T02:00:00+00:00",
+                "updated_at": "2026-05-17T02:00:00+00:00",
+            }
+        )
+        repository.create_kanglong_run(
+            {
+                "run_id": "newer-completed",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1"],
+                "status": KanglongRunStatus.COMPLETED.value,
+                "plan_version": "plan-completed",
+                "available_actions": ["view_report"],
+                "report": {"summary": {"group_count": 9}},
+                "created_at": "2026-05-17T03:00:00+00:00",
+                "updated_at": "2026-05-17T03:00:00+00:00",
+            }
+        )
+
+        active = service.active_run()
+    finally:
+        repository.close()
+
+    assert active is not None
+    assert active["run_id"] == "latest-open"
+    assert active["status"] == "plan_confirmed"
+    assert active["available_actions"] == ["execute", "refresh_plan"]
+    assert active["report_summary"]["group_count"] == 2
+
+
 def test_service_does_not_confirm_blocked_plan_or_store_idempotency(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)

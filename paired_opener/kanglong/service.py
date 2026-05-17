@@ -117,6 +117,13 @@ class KanglongSimulationService:
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         return self._repository.get_kanglong_run(run_id)
 
+    def active_run(self) -> dict[str, Any] | None:
+        payload = self._repository.get_active_kanglong_run()
+        if payload is None:
+            return None
+        payload["latest_event_id"] = self._repository.latest_kanglong_event_id(payload["run_id"])
+        return payload
+
     def create_plan(
         self,
         *,

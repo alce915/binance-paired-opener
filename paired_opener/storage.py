@@ -39,6 +39,19 @@ def _kanglong_report_summary(payload: dict[str, Any], report: dict[str, Any]) ->
     return summary if isinstance(summary, dict) else {}
 
 
+_ACTIVE_KANGLONG_RUN_STATUSES = (
+    "draft_plan",
+    "chain_ready",
+    "plan_confirmed",
+    "execution_starting",
+    "group_ready",
+    "paused_group_not_executable",
+    "paused_plan_recheck_changed",
+    "needs_abort_recover",
+    "abort_recovering",
+)
+
+
 class SqliteRepository:
     def __init__(
         self,
@@ -287,6 +300,21 @@ class SqliteRepository:
         row = self._connection.execute(
             "SELECT * FROM kanglong_runs WHERE run_id = ?",
             (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._deserialize_kanglong_run_row(row)
+
+    def get_active_kanglong_run(self) -> dict[str, Any] | None:
+        placeholders = ", ".join("?" for _ in _ACTIVE_KANGLONG_RUN_STATUSES)
+        row = self._connection.execute(
+            f"""
+            SELECT * FROM kanglong_runs
+            WHERE status IN ({placeholders})
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            _ACTIVE_KANGLONG_RUN_STATUSES,
         ).fetchone()
         if row is None:
             return None

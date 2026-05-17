@@ -427,6 +427,14 @@ async def run_kanglong_simulation(request: KanglongSimulationRunRequest) -> Kang
     )
 
 
+@app.get("/kanglong/simulation/run/active")
+async def get_active_kanglong_simulation() -> dict:
+    payload = app.state.kanglong_service.active_run()
+    if payload is None:
+        return {"status": "idle", "available_actions": ["create_plan"]}
+    return payload
+
+
 @app.get('/kanglong/simulation/run/{run_id}')
 async def get_kanglong_simulation(run_id: str) -> dict:
     payload = app.state.kanglong_service.get_run(run_id)
