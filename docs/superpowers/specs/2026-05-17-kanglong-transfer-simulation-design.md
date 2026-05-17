@@ -568,6 +568,8 @@ net_profit_after_cost
 draft_plan
 precheck
 chain_ready
+plan_confirmed
+execution_starting
 group_ready
 round_simulated
 group_completed
@@ -661,11 +663,13 @@ other_side_preview
 rounding_ledger
 event_sequence
 operator_choice
+operator_confirmations
+available_actions_history
 ```
 
 每个组和每轮都引用同一个 `run_id`，并记录输入快照版本和输出事件。报告必须能从最终结果追溯到每一轮的计划数量、实际成交数量、成交均价、手续费、残差、配对订单、锁续期、暂停原因和实盘准入判断。
 
-`batch_debt_buffer_history` 记录每个 donor batch 的成功 group、失败点和转入待修复缺口的数量。`abort_recover_history` 必须记录操作者、恢复前快照、恢复后快照、处理动作、释放锁原因和确认时间。`rounding_ledger` 是 `residual_ledger` 的子集，用于专门追踪 step size 向下取整产生的数量差额。
+`batch_debt_buffer_history` 记录每个 donor batch 的成功 group、失败点和转入待修复缺口的数量。`abort_recover_history` 必须记录操作者、恢复前快照、恢复后快照、处理动作、释放锁原因和确认时间。`operator_confirmations` 记录链路确认、警告确认、市场减仓确认和恢复确认。`available_actions_history` 记录每次状态变化后后端允许的下一步动作。`rounding_ledger` 是 `residual_ledger` 的子集，用于专门追踪 step size 向下取整产生的数量差额。
 
 ## 前端工作台与交互设计
 
@@ -718,6 +722,58 @@ operator_choice
 
 执行期间锁定交易对、方向、主账号和子账号列表。页面可以继续查看账号池，但不能修改本次运行配置。暂停后页面提供 `重新检测`、`查看账本` 和 `进入人工恢复` 等动作；市场减仓建议只能作为单独确认流程出现。
 
+账号池卡片应尽量减少“检测后才知道不能用”的挫败感。检测前也要展示轻量状态标签，包括 `无本方向持仓`、`无盈利仓位`、`数据过期`、`已加入`、`主账号冲突`、`风险未知`。这些标签只做预览，不替代正式检测；正式是否可执行以后端检测报告为准。
+
+确认链路时必须展示高层摘要，而不是只展示 group 明细。摘要至少包含计划释放方向和数量、参与子账号数、预计 group 数、预计轮次数、预计手续费、预计价差损耗、是否存在警告和是否可能需要市场减仓建议。用户可以先用摘要判断规模，再展开 group 明细。
+
+执行日志支持基础过滤，第一版至少包含 `全部`、`警告`、`错误`、`当前组`、`成本事件`、`账本事件`。过滤只影响展示，不改变事件保存和审计顺序。日志视图必须保留最新事件自动滚动，同时允许用户暂停滚动查看历史。
+
+成本统计分为预计和实际两条线。检测阶段输出预计手续费和预计价差损耗；执行阶段根据事件持续累积实际手续费、实际平仓/开仓价差 PnL、实际残差和实际配平结果。完成报告必须展示预计/实际差异，并能追溯到 group 和 round。
+
+暂停状态不能只展示状态名。每个暂停原因都必须返回后端允许的下一步动作，例如 `重新检测`、`查看差异`、`继续执行`、`进入人工恢复`、`放弃本次计划`。前端只渲染后端返回的可用动作，不自行判断能否继续。
+
+亢龙页面是第三个顶层页面状态，不能被归类为 `real` 或 `simulation` 的副作用页面。前端状态模型必须显式支持 `appPage = kanglong`，并审查所有“非 simulation 即 real”的逻辑，避免亢龙页面误触发实盘表单、实盘日志、实盘按钮、实盘预检或实盘运行锁。
+
+## API 与运行恢复
+
+第一版应把检测、确认、执行和日志读取拆成独立接口，避免一个 `/run` 同时承担草案生成和执行副作用。建议接口边界如下：
+
+```text
+POST /kanglong/simulation/plan
+POST /kanglong/simulation/plan/{run_id}/confirm
+POST /kanglong/simulation/plan/{run_id}/execute
+GET  /kanglong/simulation/run/active
+GET  /kanglong/simulation/run/{run_id}
+GET  /kanglong/simulation/run/{run_id}/events
+POST /kanglong/simulation/run/{run_id}/recover
+```
+
+`plan` 只读取快照、运行预检、生成链路草案和预计成本，不产生交易副作用。`confirm` 只确认某个 `plan_version` 和警告集合，并记录操作者。`execute` 只接受已确认且复检通过的计划；如果计划过期或复检失败，必须返回结构化状态和可用下一步动作。`events` 返回执行日志、进度、成本事件、账本事件和恢复事件，支持按 `after_event_id` 增量读取。
+
+页面刷新后必须能恢复当前运行。`active` 接口返回当前账号集合和交易对范围内的活跃亢龙运行，包括草案、已确认、执行中、暂停、需要恢复、已完成但报告未查看等状态。前端根据状态恢复到对应阶段，不能因为刷新丢失确认状态、执行日志、暂停原因或账本摘要。
+
+运行恢复数据至少包含：
+
+```text
+run_id
+status
+result_grade
+plan_version
+confirmed_at
+selected_side
+symbol
+main_account_id
+subaccount_ids
+current_group_id
+current_round_id
+progress
+available_actions
+report_summary
+latest_event_id
+```
+
+`available_actions` 由后端生成，用于驱动按钮状态。前端不能通过字符串状态自行推断是否可以继续、恢复、重新检测或放弃。
+
 ## 展示文案与语言包
 
 亢龙模块新增的用户可见文本必须从语言包渲染，不允许在前端、后端报告、日志适配层或预检响应里硬编码中文展示文案。第一版默认语言为 `zh-CN`，但事件、状态、阻断原因和报告字段必须保留稳定的机器码，方便后续扩展其他语言。
@@ -740,11 +796,13 @@ console.kanglong.card.*
 console.kanglong.precheck.*
 console.kanglong.plan.*
 console.kanglong.execution.*
+console.kanglong.logs.*
 console.kanglong.costs.*
+console.kanglong.actions.*
 runtime.kanglong.*
 ```
 
-前端日志展示不得把中文模板写在 `app.js` 中；日志行应使用 `message_key + message_params` 渲染。账号卡片里的状态标签也必须通过 key 渲染，例如 `available`、`joined`、`stale`、`blocked`、`warning`、`main_not_flat` 和 `capacity_insufficient`。
+前端日志展示不得把中文模板写在 `app.js` 中；日志行应使用 `message_key + message_params` 渲染。账号卡片里的状态标签也必须通过 key 渲染，例如 `available`、`joined`、`stale`、`blocked`、`warning`、`main_not_flat`、`capacity_insufficient`、`no_position`、`no_profit` 和 `risk_unknown`。日志过滤项和后端返回的 `available_actions` 也必须通过语言包 key 渲染。
 
 状态码和原因码必须作为结构化字段保存，例如 `blocked_main_not_flat`、`blocked_main_insufficient_capacity`、`blocked_initial_subaccount_unbalanced`、`paused_group_not_executable`、`needs_abort_recover`、`market_reduce_required` 和 `unsafe_dust_residual`。报告层展示时通过语言包 key 渲染，不能只保存已经渲染好的中文。
 
@@ -826,6 +884,17 @@ message_params:
 - 执行期间交易对、方向、主账号和子账号列表被锁定，不能修改本次运行配置。
 - 执行日志展示 group、round、from/to、方向、数量、平仓价、开仓价、手续费、状态，并能展开原始事件和残差账本。
 - 完成后展示预计与实际消耗对比，包括手续费、手续费资产、价差 PnL、保守价差损耗、残差和最终配平结果。
+- 检测、确认、执行和日志读取必须使用拆分接口，不能把检测链路和开始执行混在同一个 `/run`。
+- 页面刷新后必须能从 active run 恢复到草案、已确认、执行中、暂停、完成或恢复状态。
+- 亢龙页作为第三个 `appPage`，不能沿用“非 simulation 即 real”的判断。
+- `plan` 接口只生成草案和预计成本，不产生执行副作用。
+- `confirm` 接口必须校验 `plan_version`，并记录操作者、警告确认和确认快照摘要。
+- `execute` 接口只接受已确认且复检通过的计划，过期计划返回结构化阻断状态和可用动作。
+- `events` 接口支持按 `after_event_id` 增量读取，页面刷新后不会丢失执行日志。
+- 暂停状态的按钮由后端 `available_actions` 决定，前端不能自行推断继续或恢复能力。
+- 执行日志过滤覆盖全部、警告、错误、当前组、成本事件和账本事件，过滤不改变审计顺序。
+- 检测摘要展示总释放数量、参与账号数、预计组数、预计轮次、预计手续费和预计价差损耗。
+- 账号池轻量状态标签覆盖无本方向持仓、无盈利、数据过期、已加入、主账号冲突和风险未知。
 - 新增 UI、报告、日志、预检和阻断原因的用户可见文案必须通过 i18n key 渲染，不能硬编码中文。
 - 新增状态、原因、事件和日志 key 必须写入 `zh-CN` 语言包和对应 registry，参数占位符与事件数据保持一致。
 - 中文开发环境下保持 UTF-8，语言包使用完整模板和具名参数，不允许运行时拼接中文片段。
