@@ -332,6 +332,7 @@
   "runtime.stop_reason.stale_orderbook": "盘口过期",
   "runtime.stop_reason.target_guard_blocked": "目标量保护阻断",
   "runtime.stop_reason.user_aborted": "用户终止",
+  "runtime.symbol": "交易对",
   "runtime.symbol_info_load_failed": "加载交易对规则失败：{error}",
   "runtime.symbol_not_whitelisted": "{symbol} 存在于币安 U 本位合约，但不在当前白名单中，真实下单将失败。",
   "runtime.symbol_switch_failed": "切换交易对 {symbol} 失败：{error}",

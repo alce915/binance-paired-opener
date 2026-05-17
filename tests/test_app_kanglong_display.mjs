@@ -19,7 +19,7 @@ for (const id of [
 
 assert.equal(indexSource.includes(`id="kanglongPanel"`), false, "old simulation Kanglong panel should be removed");
 assert.ok(appSource.includes(`"kanglong"`), "app.js should recognize kanglong as an app page");
-assert.ok(appSource.includes("/kanglong/simulation/plan"), "frontend should call split plan endpoint");
+assert.ok(appSource.includes(`KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan"`), "app.js should declare the split plan endpoint reference");
 assert.equal(appSource.includes("/kanglong/simulation/run\""), false, "frontend should not call deprecated Kanglong run endpoint");
 
 for (const key of [
@@ -30,4 +30,16 @@ for (const key of [
   "console.kanglong.execution.log_title",
 ]) {
   assert.ok(indexSource.includes(key) || appSource.includes(key) || zhSource.includes(key), `${key} should be wired`);
+}
+
+const zhMessages = JSON.parse(zhSource);
+const task7I18nKeys = [
+  ...indexSource.matchAll(/data-i18n="([^"]+)"/g),
+]
+  .map((match) => match[1])
+  .filter((key) => key === "runtime.symbol" || key.startsWith("console.kanglong."));
+
+for (const key of task7I18nKeys) {
+  assert.ok(Object.hasOwn(zhMessages, key), `${key} should be defined in zh-CN.json`);
+  assert.notEqual(zhMessages[key], key, `${key} should not render as a raw key`);
 }
