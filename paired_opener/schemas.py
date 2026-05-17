@@ -116,6 +116,23 @@ class SimulationRunRequest(ExecutionPolicyFields):
 
 SimulationRequest = SimulationRunRequest
 
+
+class KanglongSimulationRunRequest(BaseModel):
+    mode: str = Field(default="simulation", pattern="^simulation$")
+    symbol: str = Field(default=DEFAULT_TRADING_SYMBOL)
+    main_account_id: str
+    subaccount_ids: list[str] = Field(..., min_length=1)
+    selected_side: PositionSide | None = None
+
+
+class KanglongSimulationRunResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    run_id: str
+    status: str
+    result_grade: str | None = None
+    report: dict[str, Any] = Field(default_factory=dict)
+
+
 class PrecheckItem(BaseModel):
     contract_version: str = CONTRACT_VERSION
     code: str

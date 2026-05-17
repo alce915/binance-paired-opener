@@ -4,6 +4,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
@@ -15,6 +16,7 @@ from paired_opener.account_runtime import AccountRuntimeManager
 from paired_opener.config import Settings, settings
 from paired_opener.domain import ExchangeStateError, SessionConflictError
 from paired_opener.errors import TradingError, ensure_trading_error, http_status_for_error, invalid_parameter_error
+from paired_opener.kanglong.service import KanglongSimulationService
 from paired_opener.market_stream import format_sse
 from paired_opener.schemas import (
     AccountListResponse,
@@ -22,6 +24,8 @@ from paired_opener.schemas import (
     AccountSelectResponse,
     AccountSummary,
     CloseSessionRequest,
+    KanglongSimulationRunRequest,
+    KanglongSimulationRunResponse,
     MarketConnectRequest,
     OpenSessionRequest,
     SessionActionResponse,
@@ -64,6 +68,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = app_settings
     app.state.repository = repository
     app.state.runtime_manager = runtime_manager
+    app.state.kanglong_service = KanglongSimulationService(repository)
     await runtime_manager.initialize_startup_recovery()
     try:
         yield
@@ -285,6 +290,28 @@ async def run_simulation(request: SimulationRunRequest) -> dict:
         )
     except Exception as exc:
         _raise_api_error(exc, code='trading_request_failed', source='service')
+
+
+@app.post('/kanglong/simulation/run', response_model=KanglongSimulationRunResponse)
+async def run_kanglong_simulation(request: KanglongSimulationRunRequest) -> KanglongSimulationRunResponse:
+    if request.mode != "simulation":
+        raise HTTPException(status_code=400, detail={"code": "kanglong_live_mode_not_supported"})
+    run_id = str(uuid4())
+    payload = app.state.kanglong_service.create_draft_run(
+        run_id=run_id,
+        symbol=request.symbol,
+        main_account_id=request.main_account_id,
+        subaccount_ids=request.subaccount_ids,
+    )
+    return KanglongSimulationRunResponse(run_id=run_id, status=payload["status"], report={})
+
+
+@app.get('/kanglong/simulation/run/{run_id}')
+async def get_kanglong_simulation(run_id: str) -> dict:
+    payload = app.state.kanglong_service.get_run(run_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail={"code": "kanglong_run_not_found", "run_id": run_id})
+    return payload
 
 
 @app.post('/simulation/abort', response_model=SimulationActionResponse)
