@@ -104,6 +104,7 @@ const kanglongState = {
   plan: null,
   confirmedPlanVersion: "",
   latestEventId: 0,
+  seenEventIds: new Set(),
   logFilter: "all",
 };
 let whitelistSymbols = [];
@@ -1404,6 +1405,7 @@ function invalidateKanglongPlan() {
   kanglongState.plan = null;
   kanglongState.confirmedPlanVersion = "";
   kanglongState.latestEventId = 0;
+  kanglongState.seenEventIds.clear();
   if (kanglongConfirmPlanBtn) kanglongConfirmPlanBtn.disabled = true;
   if (kanglongExecutePlanBtn) kanglongExecutePlanBtn.disabled = true;
   if (kanglongPlanSummary) kanglongPlanSummary.replaceChildren();
@@ -1440,7 +1442,7 @@ function syncKanglongWorkflowButtons(payload = kanglongState.plan, options = {})
 function renderKanglongPlanSummary(payload = {}) {
   if (!kanglongPlanSummary) return;
   const summary = payload?.report?.summary || payload?.summary || {};
-  const status = summary.status ?? payload.status ?? payload?.report?.status ?? "--";
+  const status = payload.status ?? payload?.report?.status ?? summary.status ?? "--";
   const groupCount = summary.group_count ?? summary.groups ?? payload.group_count ?? "--";
   const roundCount = summary.round_count ?? summary.rounds ?? payload.round_count ?? "--";
   const releaseQty = summary.planned_release_qty ?? summary.release_qty ?? payload.planned_release_qty ?? "--";
@@ -1473,11 +1475,14 @@ function appendKanglongExecutionEvent(event = {}) {
   const time = createdAt ? new Date(createdAt).toLocaleTimeString(APP_LOCALE, { hour12: false, timeZone: APP_TIMEZONE }) : nowTime();
   const eventId = Number(event.event_id || payload.event_id || 0);
   if (eventId > 0) {
+    if (kanglongState.seenEventIds.has(eventId)) return;
+    kanglongState.seenEventIds.add(eventId);
     kanglongState.latestEventId = Math.max(kanglongState.latestEventId || 0, eventId);
   }
+  const messageCode = source.messageCode || source.message_code || source.messageKey || source.message_key;
   row.textContent = [
     time,
-    resolveLogMessage({ ...source, fallbackMessage }, fallbackMessage),
+    resolveLogMessage({ ...source, messageCode, fallbackMessage }, fallbackMessage),
   ].filter(Boolean).join(" | ");
   if (kanglongExecutionLog.querySelector(".empty-state")) {
     kanglongExecutionLog.replaceChildren();
@@ -1486,6 +1491,7 @@ function appendKanglongExecutionEvent(event = {}) {
 }
 
 async function createKanglongPlan() {
+  invalidateKanglongPlan();
   const mainAccountId = kanglongState.mainAccountId || currentAccount.id || "";
   const subaccountIds = Array.from(kanglongState.selectedSubaccountIds);
   if (!mainAccountId || subaccountIds.length === 0) {
@@ -1505,6 +1511,7 @@ async function createKanglongPlan() {
   kanglongState.plan = payload;
   kanglongState.confirmedPlanVersion = "";
   kanglongState.latestEventId = 0;
+  kanglongState.seenEventIds.clear();
   if (kanglongExecutionLog) {
     setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
   }
@@ -1558,13 +1565,22 @@ async function executeKanglongPlan() {
 async function pollKanglongEvents() {
   const runId = kanglongRunId();
   if (!runId) return null;
-  const afterEventId = kanglongState.latestEventId || 0;
-  const payload = await request(`/kanglong/simulation/run/${encodeURIComponent(runId)}/events?after_event_id=${afterEventId}`);
-  (payload.events || []).forEach(appendKanglongExecutionEvent);
-  const nextEventId = Number(payload.next_after_event_id || payload.latest_event_id || 0);
-  if (nextEventId > 0) {
-    kanglongState.latestEventId = nextEventId;
-  }
+  let afterEventId = kanglongState.latestEventId || 0;
+  let payload = null;
+  let pageCount = 0;
+  do {
+    payload = await request(`/kanglong/simulation/run/${encodeURIComponent(runId)}/events?after_event_id=${afterEventId}`);
+    (payload.events || []).forEach(appendKanglongExecutionEvent);
+    const nextEventId = Number(payload.next_after_event_id || payload.latest_event_id || 0);
+    if (nextEventId > 0) {
+      kanglongState.latestEventId = nextEventId;
+    }
+    if (!payload.has_more || nextEventId <= afterEventId) {
+      break;
+    }
+    afterEventId = nextEventId;
+    pageCount += 1;
+  } while (pageCount < 20);
   return payload;
 }
 
@@ -4943,8 +4959,8 @@ async function runKanglongWorkflowAction(button, action) {
       messageParams: { error: userVisibleErrorMessage(error, error?.message) },
     });
   } finally {
+    syncKanglongWorkflowButtons(kanglongState.plan);
     if (button === kanglongDetectPlanBtn && button) button.disabled = false;
-    if (button !== kanglongDetectPlanBtn) syncKanglongWorkflowButtons(kanglongState.plan);
   }
 }
 

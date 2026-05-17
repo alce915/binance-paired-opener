@@ -376,6 +376,7 @@
   "runtime.kanglong.request_failed": "亢龙请求失败：{error}",
   "runtime.kanglong.status.blocked_main_not_flat": "主账号本交易对不是空仓",
   "reasons.kanglong.blocked_main_not_flat": "主账号当前 {symbol} 持仓未清空，多仓 {long_qty}，空仓 {short_qty}，容忍数量 {qty_tolerance}。",
+  "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
   "events.kanglong.round_completed": "亢龙第 {group_id} 组第 {round_id} 轮完成，配对数量 {matched_qty}",
   "log.kanglong.abort_recovered": "亢龙运行 {run_id} 已完成人工恢复，释放锁原因：{release_reason}",
   "precheck.labels.kanglong.main_flat": "主账号空仓",
