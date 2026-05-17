@@ -33,7 +33,14 @@
       }
       main { max-width: 1400px; margin: 0 auto; padding: 24px 18px 44px; }
       .app-view-real [data-simulation-only],
-      .app-view-simulation [data-real-only] { display: none !important; }
+      .app-view-real [data-kanglong-only],
+      .app-view-simulation [data-real-only],
+      .app-view-simulation [data-kanglong-only],
+      .app-view-kanglong [data-real-only],
+      .app-view-kanglong [data-simulation-only],
+      .app-view-kanglong [data-trading-only] {
+        display: none !important;
+      }
       .app-nav {
         display: flex;
         gap: 10px;
@@ -91,20 +98,37 @@
         display: grid;
         gap: 12px;
       }
-      .kanglong-panel .form-grid {
+      .kanglong-workspace {
+        display: grid;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+      .kanglong-toolbar {
         display: grid;
         gap: 12px;
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(160px, 1fr) minmax(140px, 0.7fr) repeat(3, minmax(128px, auto));
+        align-items: end;
       }
-      .kanglong-report {
-        min-height: 44px;
-        margin-top: 12px;
-        padding: 12px 14px;
+      .kanglong-toolbar button { min-height: 46px; }
+      .kanglong-layout {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+      }
+      .kanglong-compact-list {
+        display: grid;
+        gap: 8px;
+      }
+      .kanglong-account-row {
+        min-height: 64px;
+        padding: 8px 10px;
         border: 1px solid rgba(216, 197, 170, 0.8);
         border-radius: 8px;
-        background: #fffaf5;
-        color: var(--ink);
-        font-weight: 800;
+        background: #fffdf8;
+      }
+      .kanglong-plan-summary,
+      .kanglong-execution-log {
+        min-height: 96px;
       }
       .compact-actions {
         display: grid;
@@ -599,6 +623,10 @@
       .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; background: #aa9a85; }
       .dot.live { background: var(--success); }
       .mono { font-variant-numeric: tabular-nums; font-family: Consolas, Monaco, monospace; }
+      @media (max-width: 860px) {
+        .kanglong-layout,
+        .kanglong-toolbar { grid-template-columns: 1fr; }
+      }
       @media (max-width: 1240px) {
         .dashboard,
         .simulation-under-log-grid { grid-template-columns: 1fr; }
@@ -631,9 +659,50 @@
       <nav class="app-nav" aria-label="交易环境切换">
         <button id="navRealBtn" class="active" type="button">实盘</button>
         <button id="navSimulationBtn" type="button">模拟盘</button>
+        <button id="navKanglongBtn" type="button" data-i18n="console.kanglong.nav"></button>
       </nav>
 
-      <section class="dashboard">
+      <section id="kanglongWorkspace" class="kanglong-workspace" data-kanglong-only>
+        <div class="kanglong-toolbar">
+          <div class="field">
+            <label for="kanglongSymbol" data-i18n="runtime.symbol"></label>
+            <input id="kanglongSymbol" value="ETHUSDC" />
+          </div>
+          <div class="field">
+            <label for="kanglongSide" data-i18n="console.kanglong.selected_side"></label>
+            <select id="kanglongSide">
+              <option value="" data-i18n="console.kanglong.side_auto"></option>
+              <option value="LONG" data-i18n="console.position_side.long"></option>
+              <option value="SHORT" data-i18n="console.position_side.short"></option>
+            </select>
+          </div>
+          <button id="kanglongDetectPlanBtn" type="button" data-i18n="console.kanglong.actions.detect"></button>
+          <button id="kanglongConfirmPlanBtn" type="button" data-i18n="console.kanglong.actions.confirm" disabled></button>
+          <button id="kanglongExecutePlanBtn" type="button" data-i18n="console.kanglong.actions.execute" disabled></button>
+        </div>
+        <div class="kanglong-layout">
+          <section class="card kanglong-account-section">
+            <h2 class="card-title" data-i18n="console.kanglong.account_pool.title"></h2>
+            <div id="kanglongMainAccountCard" class="kanglong-compact-list"></div>
+            <div id="kanglongAccountPool" class="kanglong-compact-list"></div>
+          </section>
+          <section class="card kanglong-selected-section">
+            <h2 class="card-title" data-i18n="console.kanglong.selected_accounts.title"></h2>
+            <div id="kanglongSelectedSubaccounts" class="kanglong-compact-list"></div>
+          </section>
+        </div>
+        <section class="card kanglong-plan-section">
+          <h2 class="card-title" data-i18n="console.kanglong.plan.summary_title"></h2>
+          <div id="kanglongPlanSummary" class="kanglong-plan-summary"></div>
+        </section>
+        <section class="card kanglong-execution-section">
+          <h2 class="card-title" data-i18n="console.kanglong.execution.log_title"></h2>
+          <div id="kanglongLogFilters" class="kanglong-log-filters"></div>
+          <div id="kanglongExecutionLog" class="kanglong-execution-log"></div>
+        </section>
+      </section>
+
+      <section class="dashboard" data-trading-only>
         <div class="left-col">
           <section class="card" data-real-only>
             <div class="card-header">
@@ -1021,7 +1090,7 @@
         </div>
       </section>
 
-      <section class="dashboard-lower">
+      <section class="dashboard-lower" data-trading-only>
         <section class="card logs-card" id="executionLogCard">
           <div class="logs-toolbar">
             <div class="logs-title-group">
@@ -1034,36 +1103,6 @@
         </section>
 
         <div class="simulation-under-log-grid" data-simulation-only>
-          <section class="card kanglong-panel" id="kanglongPanel">
-            <div class="card-header">
-              <h2 class="card-title" data-i18n="console.kanglong.title"></h2>
-            </div>
-            <div class="card-body">
-              <div class="form-grid">
-                <div>
-                  <label for="kanglongMainAccount" data-i18n="console.kanglong.main_account"></label>
-                  <select id="kanglongMainAccount"></select>
-                </div>
-                <div>
-                  <label for="kanglongSubaccounts" data-i18n="console.kanglong.subaccounts"></label>
-                  <select id="kanglongSubaccounts" multiple></select>
-                </div>
-                <div>
-                  <label for="kanglongSelectedSide" data-i18n="console.kanglong.selected_side"></label>
-                  <select id="kanglongSelectedSide">
-                    <option value="" data-i18n="console.kanglong.side_auto"></option>
-                    <option value="LONG" data-i18n="console.position_side.long"></option>
-                    <option value="SHORT" data-i18n="console.position_side.short"></option>
-                  </select>
-                </div>
-              </div>
-              <div class="compact-actions" style="margin-top: 12px;">
-                <button id="kanglongRunSimulation" class="simulation-run-btn" type="button" data-i18n="console.kanglong.run_simulation"></button>
-              </div>
-              <div id="kanglongReport" class="kanglong-report"></div>
-            </div>
-          </section>
-
           <section class="card" id="simulationSettingsCard">
             <div class="card-header">
               <h2 class="card-title">模拟设置</h2>

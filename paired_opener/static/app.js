@@ -3,6 +3,7 @@ const asksContainer = document.getElementById("asksContainer");
 const appRoot = document.getElementById("appRoot");
 const navRealBtn = document.getElementById("navRealBtn");
 const navSimulationBtn = document.getElementById("navSimulationBtn");
+const navKanglongBtn = document.getElementById("navKanglongBtn");
 const bidsContainer = document.getElementById("bidsContainer");
 const connectionToggle = document.getElementById("connectionToggle");
 const accountSelect = document.getElementById("accountSelect");
@@ -41,11 +42,16 @@ const exportSimHistoryBtn = document.getElementById("exportSimHistoryBtn");
 const clearSimHistoryBtn = document.getElementById("clearSimHistoryBtn");
 const simHistoryList = document.getElementById("simHistoryList");
 const simHistoryCount = document.getElementById("simHistoryCount");
-const kanglongMainAccount = document.getElementById("kanglongMainAccount");
-const kanglongSubaccounts = document.getElementById("kanglongSubaccounts");
-const kanglongSelectedSide = document.getElementById("kanglongSelectedSide");
-const kanglongRunSimulation = document.getElementById("kanglongRunSimulation");
-const kanglongReport = document.getElementById("kanglongReport");
+const kanglongWorkspace = document.getElementById("kanglongWorkspace");
+const kanglongSymbol = document.getElementById("kanglongSymbol");
+const kanglongSide = document.getElementById("kanglongSide");
+const kanglongDetectPlanBtn = document.getElementById("kanglongDetectPlanBtn");
+const kanglongConfirmPlanBtn = document.getElementById("kanglongConfirmPlanBtn");
+const kanglongExecutePlanBtn = document.getElementById("kanglongExecutePlanBtn");
+const kanglongAccountPool = document.getElementById("kanglongAccountPool");
+const kanglongSelectedSubaccounts = document.getElementById("kanglongSelectedSubaccounts");
+const kanglongPlanSummary = document.getElementById("kanglongPlanSummary");
+const kanglongExecutionLog = document.getElementById("kanglongExecutionLog");
 const executionSummaryBanner = document.getElementById("executionSummaryBanner");
 const executionSummaryText = document.getElementById("executionSummaryText");
 const executionRiskBanner = document.getElementById("executionRiskBanner");
@@ -75,6 +81,7 @@ const modePanels = {
   single_close: document.getElementById("singleClosePanel"),
 };
 const DEFAULT_SYMBOL = "ETHUSDC";
+const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
 let eventSource = null;
 let executionMode = "paired_open";
 let appPage = "real";
@@ -125,8 +132,8 @@ let sessionAbortInFlight = false;
 const sessionAbortInFlightIds = new Set();
 let latestExecutionStatsState = null;
 let activeExecutionSummary = null;
-const executionSummaryByPage = { real: null, simulation: null };
-const executionStatsByPage = { real: null, simulation: null };
+const executionSummaryByPage = { real: null, simulation: null, kanglong: null };
+const executionStatsByPage = { real: null, simulation: null, kanglong: null };
 const seenSimulationRunLogKeys = new Set();
 const seenSimulationEventIds = new Set();
 let activeSimulationRunId = null;
@@ -214,11 +221,12 @@ const EXECUTION_SYMBOL_FIELD_BY_MODE = Object.freeze({
   single_open: "singleOpenExecutionSymbol",
   single_close: "singleCloseExecutionSymbol",
 });
-const executionPageFormStates = { real: null, simulation: null };
+const executionPageFormStates = { real: null, simulation: null, kanglong: null };
 let restoringExecutionPageState = false;
 let executionPageSwitchQueue = Promise.resolve();
 
 function normalizeAppPage(page) {
+  if (page === "kanglong") return "kanglong";
   return page === "simulation" ? "simulation" : "real";
 }
 
@@ -253,6 +261,9 @@ function initializeExecutionPageFormStates() {
   }
   if (!executionPageFormStates.simulation) {
     executionPageFormStates.simulation = cloneExecutionFormState(currentState);
+  }
+  if (!executionPageFormStates.kanglong) {
+    executionPageFormStates.kanglong = cloneExecutionFormState(currentState);
   }
 }
 
@@ -1235,81 +1246,12 @@ function renderAccountOptions(accounts) {
   if (activeAccount) {
     setCurrentAccount(activeAccount.id, activeAccount.name, true);
   }
-  renderKanglongAccountOptions(availableAccounts);
 }
 
 async function loadAccounts() {
   const payload = await request("/config/accounts");
   renderAccountOptions(payload.accounts || []);
   return payload.accounts || [];
-}
-
-function renderKanglongAccountOptions(accounts = availableAccounts) {
-  if (!kanglongMainAccount || !kanglongSubaccounts) return;
-  const normalizedAccounts = Array.isArray(accounts) ? accounts : [];
-  const selectedMain = kanglongMainAccount.value
-    || currentAccount.id
-    || normalizedAccounts.find((account) => account.is_active)?.id
-    || normalizedAccounts[0]?.id
-    || "";
-  const selectedSubs = new Set(
-    Array.from(kanglongSubaccounts.selectedOptions || []).map((option) => option.value)
-  );
-
-  kanglongMainAccount.innerHTML = "";
-  kanglongSubaccounts.innerHTML = "";
-  normalizedAccounts.forEach((account) => {
-    const mainOption = document.createElement("option");
-    mainOption.value = account.id;
-    mainOption.textContent = account.name || account.id;
-    kanglongMainAccount.appendChild(mainOption);
-  });
-  if (normalizedAccounts.some((account) => account.id === selectedMain)) {
-    kanglongMainAccount.value = selectedMain;
-  }
-  const activeMain = kanglongMainAccount.value || selectedMain;
-  normalizedAccounts.forEach((account) => {
-    if (account.id === activeMain) return;
-    const subOption = document.createElement("option");
-    subOption.value = account.id;
-    subOption.textContent = account.name || account.id;
-    subOption.selected = selectedSubs.has(account.id);
-    kanglongSubaccounts.appendChild(subOption);
-  });
-}
-
-function renderKanglongReport(payload = {}) {
-  if (!kanglongReport) return;
-  const resultGrade = payload.result_grade || "--";
-  const status = payload.status || "--";
-  kanglongReport.textContent = [
-    copyOrDefault("console.kanglong.report.result_grade", "{result_grade}", { result_grade: resultGrade }),
-    copyOrDefault("console.kanglong.report.status", "{status}", { status }),
-  ].join(" | ");
-}
-
-async function runKanglongSimulation() {
-  const mainAccountId = kanglongMainAccount?.value || "";
-  const subaccountIds = Array.from(kanglongSubaccounts?.selectedOptions || [])
-    .map((option) => option.value)
-    .filter(Boolean);
-  if (!mainAccountId || subaccountIds.length === 0) {
-    throw new Error(copyOrDefault("runtime.kanglong.account_selection_required", "runtime.kanglong.account_selection_required"));
-  }
-  const payload = {
-    mode: "simulation",
-    symbol: executionSymbol?.value || DEFAULT_SYMBOL,
-    main_account_id: mainAccountId,
-    subaccount_ids: subaccountIds,
-    selected_side: kanglongSelectedSide?.value || null,
-  };
-  const response = await request("/kanglong/simulation/run", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  renderKanglongReport(response);
-  return response;
 }
 
 function rebuildSymbolOptions(selectedSymbol = activeSymbol) {
@@ -2905,8 +2847,10 @@ function applyAppPageChrome(page) {
   appPage = normalizeAppPage(page);
   appRoot?.classList.toggle("app-view-real", appPage === "real");
   appRoot?.classList.toggle("app-view-simulation", appPage === "simulation");
+  appRoot?.classList.toggle("app-view-kanglong", appPage === "kanglong");
   navRealBtn?.classList.toggle("active", appPage === "real");
   navSimulationBtn?.classList.toggle("active", appPage === "simulation");
+  navKanglongBtn?.classList.toggle("active", appPage === "kanglong");
 }
 
 function setAppPage(page) {
@@ -2959,7 +2903,7 @@ async function applyAppPage(page) {
     openSse();
     refreshSimulationAccount();
     refreshSimulationHistory();
-  } else {
+  } else if (appPage === "real") {
     maybeScheduleCurrentModePrecheck("page_switch");
   }
   return true;
@@ -4557,6 +4501,12 @@ navSimulationBtn?.addEventListener("click", () => {
     messageParams: { symbol: activeSymbol, error: userVisibleErrorMessage(error) },
   }));
 });
+navKanglongBtn?.addEventListener("click", () => {
+  setAppPage("kanglong").catch((error) => appendLog("error", "", undefined, {
+    messageCode: "runtime.symbol_switch_failed",
+    messageParams: { symbol: activeSymbol, error: userVisibleErrorMessage(error) },
+  }));
+});
 
 saveSimSettingsBtn?.addEventListener("click", async () => {
   try {
@@ -4612,25 +4562,6 @@ exportSimHistoryBtn?.addEventListener("click", () => {
   window.location.href = "/simulation/history/export.csv";
 });
 
-kanglongMainAccount?.addEventListener("change", () => {
-  renderKanglongAccountOptions(availableAccounts);
-});
-
-kanglongRunSimulation?.addEventListener("click", async () => {
-  try {
-    const payload = await runKanglongSimulation();
-    appendLog("success", "", undefined, {
-      messageCode: "console.kanglong.report.status",
-      messageParams: { status: payload.status || "--" },
-    });
-  } catch (error) {
-    appendLog("error", "", undefined, {
-      messageCode: "runtime.kanglong.request_failed",
-      messageParams: { error: userVisibleErrorMessage(error) },
-    });
-  }
-});
-
 simHistoryList?.addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
@@ -4651,7 +4582,6 @@ simHistoryList?.addEventListener("click", async (event) => {
 });
 
 applyStaticI18n();
-renderKanglongReport();
 setEmptyState(asksContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_asks"] || "开启连接后加载卖盘");
 setEmptyState(bidsContainer, "empty-state orderbook-empty", I18N_MESSAGES["runtime.orderbook_empty_bids"] || "开启连接后加载买盘");
 setActiveSymbol(activeSymbol, false);
