@@ -1564,10 +1564,10 @@ async function executeKanglongPlan() {
   return payload;
 }
 
-async function pollKanglongEvents() {
+async function pollKanglongEvents(options = {}) {
   const runId = kanglongRunId();
   if (!runId) return null;
-  let afterEventId = kanglongState.latestEventId || 0;
+  let afterEventId = Number(options.afterEventId ?? kanglongState.latestEventId ?? 0);
   let payload = null;
   let pageCount = 0;
   do {
@@ -1575,7 +1575,7 @@ async function pollKanglongEvents() {
     (payload.events || []).forEach(appendKanglongExecutionEvent);
     const nextEventId = Number(payload.next_after_event_id || payload.latest_event_id || 0);
     if (nextEventId > 0) {
-      kanglongState.latestEventId = nextEventId;
+      kanglongState.latestEventId = Math.max(kanglongState.latestEventId || 0, nextEventId);
     }
     if (!payload.has_more || nextEventId <= afterEventId) {
       break;
@@ -1643,13 +1643,14 @@ async function restoreActiveKanglongRun() {
   kanglongState.latestEventId = Number.isFinite(latestEventId) && latestEventId > 0 ? latestEventId : 0;
   kanglongState.seenEventIds.clear();
   restoreKanglongSelectionFromPayload(payload);
+  renderKanglongAccountPool(availableAccounts);
   if (kanglongExecutionLog) {
     setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
   }
   renderKanglongPlanSummary(payload);
   syncKanglongWorkflowButtons(payload);
   try {
-    await pollKanglongEvents();
+    await pollKanglongEvents({ afterEventId: 0 });
   } catch (error) {
     appendLog("error", "", undefined, {
       messageCode: "runtime.kanglong.request_failed",

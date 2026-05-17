@@ -141,6 +141,7 @@ function makeKanglongHarness(requestImpl) {
       "runtime.kanglong.account_selection_required": "请选择主账号和至少一个子账号。",
     };
     const currentAccount = { id: "main" };
+    const availableAccounts = [];
     const kanglongState = {
       mainAccountId: "main",
       selectedSubaccountIds: new Set(["sub1"]),
@@ -163,6 +164,7 @@ function makeKanglongHarness(requestImpl) {
     const kanglongSymbol = { value: "ETHUSDC" };
     const kanglongSide = { value: "LONG" };
     const appendLogEntries = [];
+    const renderAccountPoolCalls = [];
     function makeContainer() {
       return {
         children: [],
@@ -231,6 +233,15 @@ function makeKanglongHarness(requestImpl) {
     function userVisibleErrorMessage(error, fallback = "") {
       return error?.message || fallback || "error";
     }
+    function renderKanglongAccountPool(accounts = []) {
+      renderAccountPoolCalls.push({
+        accounts,
+        mainAccountId: kanglongState.mainAccountId,
+        selectedSubaccountIds: Array.from(kanglongState.selectedSubaccountIds),
+        symbol: kanglongSymbol.value,
+        side: kanglongSide.value,
+      });
+    }
     async function request(path, options = {}) {
       return globalThis.__request(path, options);
     }
@@ -250,6 +261,7 @@ function makeKanglongHarness(requestImpl) {
       runKanglongWorkflowAction,
       state: kanglongState,
       logs: appendLogEntries,
+      renderAccountPoolCalls,
     };
   `;
   vm.runInNewContext(script, sandbox);
@@ -368,12 +380,17 @@ function makeKanglongHarness(requestImpl) {
         },
       };
     }
-    assert.equal(requestPath, "/kanglong/simulation/run/active-run/events?after_event_id=5");
+    assert.equal(requestPath, "/kanglong/simulation/run/active-run/events?after_event_id=0");
     return {
       run_id: "active-run",
-      events: [{ event_id: 6, payload: { message_key: "events.kanglong.group_simulated", message_params: { group_id: "B" } } }],
-      next_after_event_id: 6,
-      latest_event_id: 6,
+      events: [
+        { event_id: 1, payload: { message_key: "events.kanglong.group_simulated", message_params: { group_id: "A" } } },
+        { event_id: 2, payload: { message_key: "events.kanglong.group_simulated", message_params: { group_id: "B" } } },
+        { event_id: 2, payload: { message_key: "events.kanglong.group_simulated", message_params: { group_id: "B" } } },
+        { event_id: 5, payload: { message_key: "events.kanglong.group_simulated", message_params: { group_id: "E" } } },
+      ],
+      next_after_event_id: 5,
+      latest_event_id: 5,
       has_more: false,
     };
   });
@@ -382,15 +399,19 @@ function makeKanglongHarness(requestImpl) {
 
   assert.deepEqual(calls, [
     "/kanglong/simulation/run/active",
-    "/kanglong/simulation/run/active-run/events?after_event_id=5",
-  ], "active restore should poll events after the restored cursor");
+    "/kanglong/simulation/run/active-run/events?after_event_id=0",
+  ], "active restore should poll existing events from the beginning");
   assert.equal(api.state.plan.run_id, "active-run", "active payload should become the current Kanglong plan");
   assert.equal(api.state.confirmedPlanVersion, "plan-active", "confirmed active plan should restore execute version");
-  assert.equal(api.state.latestEventId, 6, "event polling should advance the restored event cursor");
+  assert.equal(api.state.latestEventId, 5, "event polling should advance to the restored latest event cursor");
   assert.equal(api.executeButton.disabled, false, "execute should be enabled for a restored executable plan");
   assert.equal(api.confirmButton.disabled, true, "confirm should be disabled when only execute is available");
   assert.ok(api.planSummary.textContent.includes("plan_confirmed"), "restored plan summary should render active status");
-  assert.equal(api.executionLog.children.length, 1, "restored active run should poll and render newer events");
+  assert.equal(api.executionLog.children.length, 3, "restored active run should render existing events without duplicates");
+  assert.equal(api.renderAccountPoolCalls.length, 1, "restored selection should rerender the account pool");
+  assert.equal(JSON.stringify(api.renderAccountPoolCalls[0].selectedSubaccountIds), JSON.stringify(["sub-active"]), "account pool rerender should see restored subaccounts");
+  assert.equal(api.renderAccountPoolCalls[0].symbol, "BTCUSDC", "account pool rerender should see restored symbol");
+  assert.equal(api.renderAccountPoolCalls[0].side, "SHORT", "account pool rerender should see restored side");
 }
 
 {

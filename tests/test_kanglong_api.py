@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from fastapi.testclient import TestClient
 
 from paired_opener import api as api_module
 from paired_opener.classified_gateway import ClassifiedExchangeGateway
@@ -310,6 +311,45 @@ async def test_old_kanglong_run_endpoint_is_deprecated() -> None:
     assert exc.value.detail["code"] == "kanglong_run_endpoint_deprecated"
     assert exc.value.detail["replacement"] == "/kanglong/simulation/plan"
 
+
+def test_active_kanglong_run_route_is_not_captured_as_run_id() -> None:
+    class CollisionProbeService:
+        def __init__(self) -> None:
+            self.active_calls = 0
+            self.get_run_calls: list[str] = []
+
+        def active_run(self) -> dict:
+            self.active_calls += 1
+            return {
+                "run_id": "active-run",
+                "status": "plan_confirmed",
+                "plan_version": "plan-active",
+                "available_actions": ["execute"],
+                "report": {},
+            }
+
+        def get_run(self, run_id: str) -> dict:
+            self.get_run_calls.append(run_id)
+            return {
+                "run_id": f"parameterized-{run_id}",
+                "status": "chain_ready",
+                "available_actions": ["confirm"],
+                "report": {},
+            }
+
+    service = CollisionProbeService()
+    original_service = getattr(api_module.app.state, "kanglong_service", None)
+    api_module.app.state.kanglong_service = service
+    try:
+        response = TestClient(api_module.app).get("/kanglong/simulation/run/active")
+    finally:
+        if original_service is not None:
+            api_module.app.state.kanglong_service = original_service
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "active-run"
+    assert service.active_calls == 1
+    assert service.get_run_calls == []
 
 
 def test_kanglong_service_report_contains_plan_events_and_costs(tmp_path) -> None:
