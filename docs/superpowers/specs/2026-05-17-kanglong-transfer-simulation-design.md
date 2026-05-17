@@ -38,7 +38,7 @@
 
 ### 盈利方向
 
-默认自动选择未实现盈利金额更多的方向。若 LONG 和 SHORT 都盈利，优先选择盈利金额更高的方向；如果盈利金额相同，再选择可平仓数量更大的方向。
+亢龙每次运行只处理一个全局方向 `selected_side`。默认自动选择所有参与子账号汇总后未实现盈利金额更多的方向。若 LONG 和 SHORT 汇总后都盈利，优先选择盈利金额更高的方向；如果盈利金额相同，再选择汇总可平仓数量更大的方向。
 
 策略允许用户手动选择 LONG 或 SHORT。手动方向仍必须盈利，否则检测阶段阻断。
 
@@ -46,9 +46,9 @@
 
 ### 起始账号
 
-自动方向下，先为每个子账号选择盈利更多的方向，再按该方向可平仓数量从大到小排序。手动方向下，只扫描指定方向盈利的子账号，并按该方向可平仓数量排序。
+方向确定后，只扫描 `selected_side` 盈利的子账号，并按该方向可平仓数量从大到小排序。
 
-起始账号为排序第一的子账号。计划释放数量为该账号该盈利方向的全部可平仓数量。
+起始账号为排序第一的子账号。计划释放数量为该账号 `selected_side` 的全部可平仓数量。
 
 ## 配置
 
@@ -102,6 +102,9 @@ submitted_qty
 filled_qty
 avg_price
 fee
+fee_asset
+fee_rate
+liquidity_role
 fills
 order_type
 status
@@ -114,7 +117,7 @@ filled_at
 event_time
 ```
 
-`action_type` 包括 `single_close`、`single_open` 和 `market_reduce_proposal`。`status` 至少包括 `filled`、`partial_filled`、`rejected`、`timeout` 和 `cancelled`。`leg_id` 和 `paired_leg_id` 用于把一轮内的平仓腿和开仓腿关联起来；实盘里记录真实交易所订单号，模拟盘里生成可回放的合成订单号。
+`action_type` 包括 `single_close`、`single_open` 和 `market_reduce_proposal`。`status` 至少包括 `filled`、`partial_filled`、`rejected`、`timeout` 和 `cancelled`。`leg_id` 和 `paired_leg_id` 用于把一轮内的平仓腿和开仓腿关联起来；实盘里记录真实交易所订单号，模拟盘里生成可回放的合成订单号。`liquidity_role` 记录 `maker` 或 `taker`，用于还原真实手续费和价差统计。
 
 模拟盘必须能模拟部分成交、拒单、超时、手续费、成交均价、Market fallback、残差和交易规则不可用等结果。未来实盘只替换执行适配层，不替换链路规划、预检、风控、对账和消耗统计逻辑。
 
@@ -125,6 +128,8 @@ event_time
 参与账号和交易对在同一时间只能存在一个亢龙运行。预检阶段如果发现本模块之外的未完成挂单、手动调仓痕迹、快照版本异常变化或已有运行锁，必须阻断。组开始和轮开始时重新校验快照版本；如果发现不是当前运行造成的仓位或挂单变化，暂停链路并进入 `paused_external_state_changed`。
 
 运行锁范围按保证金模式决定。逐仓模式按 `account_id + symbol` 加锁；全仓或共享 USDC 保证金模式按 `account_id + margin_asset` 加锁；如果无法可靠识别保证金模式，则退化为整个账号加锁。
+
+运行锁在链路执行期间必须通过 heartbeat 续期，续期间隔小于 `run_lock_ttl_ms / 2`。只有 `completed`、`blocked`、`paused` 或 `unsafe` 终态可以释放运行锁；如果进程异常退出导致锁过期，下一次运行必须先进入安全恢复检查，确认没有本模块遗留挂单和未解释仓位变化后才能重新加锁。
 
 第一版要求所有参与子账号在运行前已经双向配平：
 
@@ -177,11 +182,16 @@ first_donor -> main
 
 其中 `first_donor` 是盈利方向可平仓数量最高的子账号。
 
-第一组完成后，系统进入确定性亏欠队列 planner。第一组会让 `first_donor` 的盈利方向数量低于运行前基准，同时让主账号临时持有同方向仓位：
+第一组完成后，系统进入确定性亏欠队列 planner。第一组会让 `first_donor` 的 `selected_side` 数量低于运行前基准，同时让主账号临时持有同方向仓位。账本推进只使用已配对数量：
 
 ```text
-main_buffer_qty = first_group_actual_qty
-pending_debt_queue = [first_donor: first_group_actual_qty]
+matched_qty = min(from_actual_closed_qty, to_actual_opened_qty)
+close_residual_qty = from_actual_closed_qty - matched_qty
+open_residual_qty = to_actual_opened_qty - matched_qty
+
+main_buffer_qty += matched_qty
+pending_debt_queue.push(first_donor, matched_qty)
+residual_ledger += close_residual_qty + open_residual_qty
 ```
 
 后续每一步从候选子账号里选择新的 donor，用该 donor 平掉盈利方向，并给 `pending_debt_queue` 中的接收账号开同方向仓位。每个实际动作仍然只生成一组账号：
@@ -190,13 +200,18 @@ pending_debt_queue = [first_donor: first_group_actual_qty]
 donor -> receiver
 ```
 
-本组完成后，被接收账号的缺口减少，donor 新增同方向待补回缺口。`pending_debt_queue` 的总量应始终等于主账号临时持有的 `main_buffer_qty`，直到闭合阶段由主账号回填最后剩余的缺口。
+接收账号按 FIFO 顺序从 `pending_debt_queue` 头部选择。若队首缺口大于 donor 可转移数量，则本组只填队首的一部分；若 donor 可转移数量大于队首缺口，则继续消化下一个队列项，但每个实际动作仍然拆成独立的两账号组。
+
+本组完成后，被接收账号的缺口按 `matched_qty` 减少，donor 按 `matched_qty` 新增同方向待补回缺口。`pending_debt_queue` 的总量应始终等于主账号临时持有的 `main_buffer_qty` 加上可解释残差，直到闭合阶段由主账号回填最后剩余的缺口。
+
+第一版禁止已经存在未偿还缺口的账号继续作为 donor，避免链路绕圈。只有当该账号在 `pending_debt_queue` 中的缺口被完全填平后，才允许重新进入 donor 候选池。
 
 候选 donor 必须同时满足：
 
 ```text
 selected_side is profitable
 selected_side_closeable_qty > qty_tolerance
+account has no pending debt
 risk checks pass
 estimated_net_release_profit > 0
 no external order, lock, or snapshot conflict
@@ -267,6 +282,15 @@ round_qty = min(
 ```
 
 计算后按交易所 step size 归一化，并检查最小名义金额、保证金占用、盈利覆盖摩擦成本和价格偏移。
+
+组计划生成和组开始重算时必须检查轮数上限：
+
+```text
+required_rounds = ceil(group_target_qty / per_round_qty_limit)
+required_rounds <= max_rounds_per_group
+```
+
+如果第一组超过 `max_rounds_per_group`，模拟不可开始，状态为 `blocked_group_round_limit_exceeded`。如果后续组超过上限，进入 `paused_group_round_limit_exceeded`，不自动拆成额外组。
 
 每轮流程：
 
@@ -373,6 +397,12 @@ close_price
 open_price
 fee_close
 fee_open
+fee_asset
+fee_rate
+liquidity_role
+matched_qty
+close_residual_qty
+open_residual_qty
 price_diff_pnl
 price_diff_loss
 total_round_cost
@@ -383,6 +413,8 @@ total_round_cost
 ```text
 fee_cost = close_fee + open_fee
 ```
+
+手续费必须按 `fee_asset` 归集；如果手续费资产不是结算资产，报告中保留原始资产数量，并按参考价格折算为统一成本展示。`fee_rate` 和 `liquidity_role` 用于解释不同账号、maker/taker 或返佣导致的手续费差异。
 
 移仓/配平价差损耗：
 
@@ -440,12 +472,15 @@ blocked_initial_subaccount_unbalanced
 blocked_open_order_conflict
 blocked_run_lock_exists
 blocked_symbol_rules_unavailable
+blocked_group_round_limit_exceeded
 blocked_live_simulation_expired
 blocked_live_precheck_failed
 paused_price_drift
 paused_round_unbalanced
 paused_external_state_changed
 paused_group_not_executable
+paused_group_round_limit_exceeded
+paused_lock_heartbeat_lost
 round_pending_repair
 needs_market_reduce_confirmation
 unsafe_unclosed
@@ -494,11 +529,14 @@ symbol_rule_version
 price_source
 simulation_expires_at
 live_precheck_run_id
+lock_scope
+lock_heartbeat_history
+residual_ledger
 event_sequence
 operator_choice
 ```
 
-每个组和每轮都引用同一个 `run_id`，并记录输入快照版本和输出事件。报告必须能从最终结果追溯到每一轮的计划数量、实际成交数量、成交均价、手续费、残差、配对订单、暂停原因和实盘准入判断。
+每个组和每轮都引用同一个 `run_id`，并记录输入快照版本和输出事件。报告必须能从最终结果追溯到每一轮的计划数量、实际成交数量、成交均价、手续费、残差、配对订单、锁续期、暂停原因和实盘准入判断。
 
 ## 复用现有规则
 
@@ -512,18 +550,23 @@ operator_choice
 
 ## 测试重点
 
-- 起始账号选择：自动方向下选盈利方向可平仓数量最高的子账号。
+- 起始账号选择：全局 `selected_side` 确定后，选择该方向可平仓数量最高的盈利子账号。
+- 自动方向先选全局 `selected_side`，后续起始账号和 donor 都只能扫描该方向。
 - 手动方向选择：只扫描指定方向，方向不盈利时阻断。
 - 手动方向选择不能绕过释放数量、主账号承接和风险阻断规则。
 - 初始子账号未双向配平时阻断为 `blocked_initial_subaccount_unbalanced`。
 - 主账号承接不足：检测阶段阻断并给出保证金缺口。
 - 主账号承接能力同时覆盖临时数量上限、名义风险比例、保证金、手续费、价格漂移缓冲和爆仓距离。
 - 运行锁按逐仓、全仓或共享保证金模式选择正确范围。
+- 运行锁 heartbeat 正常续期，heartbeat 丢失进入 `paused_lock_heartbeat_lost`。
 - 确定性 planner 按评分规则选择后续 donor，并用 account_id 稳定排序兜底。
-- 亏欠队列链路保持 `pending_debt_queue` 总量等于 `main_buffer_qty`。
+- 亏欠队列按 FIFO 消化，已有未偿还缺口的账号不能作为 donor。
+- 亏欠队列链路用 `matched_qty` 推进，残差进入 `residual_ledger`。
+- 亏欠队列链路保持 `pending_debt_queue` 总量等于 `main_buffer_qty` 加可解释残差。
 - Planner 到达 `max_chain_groups`、无正收益 donor 或风险阻断时进入闭合阶段。
 - 每组只能涉及两个账号。
 - 组内按交易对数量上限拆轮。
+- 第一组超过 `max_rounds_per_group` 时阻断，后续组超过时暂停。
 - 每轮不配平时暂停，不进入下一轮。
 - 单腿异常、部分成交、拒单和超时进入 `round_pending_repair`，不得继续下一轮。
 - 中间允许子账号临时不配平，但最终必须恢复运行前基准仓位。
@@ -532,7 +575,7 @@ operator_choice
 - 残差超过容忍范围但低于最小下单规则时标记 `unsafe_dust_residual`。
 - 外部挂单、手动调仓、运行锁和快照版本异常会阻断或暂停。
 - 账号间无法闭合时只生成市场减仓建议。
-- 消耗统计正确区分手续费、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
-- 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、手续费、残差、交易规则不可用、配对腿 ID 和订单 ID。
+- 消耗统计正确区分手续费、手续费资产、maker/taker、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
+- 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、手续费、手续费资产、残差、交易规则不可用、配对腿 ID 和订单 ID。
 - 模拟和未来实盘使用同一套规划与风控接口，仅执行模式不同。
 - 实盘候选必须校验模拟结果未过期、重新预检通过，并由操作员单独确认。
