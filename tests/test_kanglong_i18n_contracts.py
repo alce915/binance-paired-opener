@@ -67,7 +67,7 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
     assert catalog["console.kanglong.logs.filter.ledger"] == "账本事件"
     assert catalog["runtime.kanglong.idempotency_conflict"] == "重复请求的幂等键与原请求不一致，请刷新后重试。"
     assert catalog["runtime.kanglong.plan_stale"] == "检测链路已过期，请重新检测账号状态。"
-    assert catalog["events.kanglong.group_simulated"] == "亢龙组 {group_id} 已完成模拟。"
+    assert catalog["events.kanglong.group_simulated"] == "亢龙第 {group_id} 组模拟完成"
     assert catalog["reasons.kanglong.blocked_plan_stale"] == "计划版本已变化，需要重新检测并确认。"
     assert catalog["reasons.kanglong.idempotency_conflict"] == "同一个幂等键被用于不同请求。"
 
