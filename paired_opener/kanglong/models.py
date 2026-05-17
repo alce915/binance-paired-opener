@@ -161,3 +161,15 @@ class KanglongAccountSnapshot:
     def pnl(self, side: PositionSide) -> Decimal:
         position = self.positions.get(side)
         return position.unrealized_pnl if position else Decimal("0")
+
+
+@dataclass(slots=True)
+class KanglongPrecheckResult:
+    ok: bool
+    status: KanglongRunStatus
+    reason_code: str | None
+    selected_side: PositionSide | None
+    first_donor_account_id: str | None
+    planned_release_qty: Decimal
+    other_side_preview: dict[str, Any]
+    details: dict[str, Any] = field(default_factory=dict)
