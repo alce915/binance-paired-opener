@@ -21,6 +21,9 @@
 - 主账号开始前也必须为空仓，避免亢龙流程误处理主账号既有仓位。
 - 最终配平优先账号间转移；只有无法闭合时才生成市场减仓建议，且必须单独确认。
 - 全流程统计手续费消耗、移仓/配平价差 PnL 和保守价差损耗。
+- 前端提供独立的 `亢龙有悔移仓模拟` 顶层页签，旧模拟盘页面内嵌的亢龙模块移除。
+- 前端流程拆成账号选择、检测链路、确认执行和执行日志四个清晰阶段。
+- 账号池支持多选批量加入子账号列表；子账号列表不使用原生多选框，避免误操作。
 
 ## 非目标
 
@@ -29,6 +32,7 @@
 - 第一版不允许起始账号部分释放。
 - 第一版不自动执行市场减仓。
 - 第一版不并发执行多组账号转移。
+- 第一版不允许用户手工指定最终链路顺序；最终执行顺序仍由检测阶段的 planner 决定。
 
 ## 核心概念
 
@@ -74,7 +78,9 @@
     "snapshot_ttl_ms": 5000,
     "price_ttl_ms": 2000,
     "run_lock_ttl_ms": 600000,
-    "simulation_result_ttl_ms": 60000
+    "simulation_result_ttl_ms": 60000,
+    "plan_recheck_price_drift_bps": 5,
+    "plan_recheck_qty_tolerance": "0.0001"
   }
 }
 ```
@@ -82,6 +88,8 @@
 `per_round_qty_limit` 是每一轮最多转移的标的数量。金额、保证金、最小名义金额和盈利覆盖成本作为风险检查，不作为主拆分单位。
 
 `max_chain_groups` 限制完整链路最多生成多少个账号组，避免最优化策略生成过长链路。`price_buffer_bps`、`margin_safety_ratio` 和 `min_liquidation_buffer_ratio` 用于主账号承接能力和组内风险检查。`snapshot_ttl_ms`、`price_ttl_ms` 和 `simulation_result_ttl_ms` 用于判断模拟结果和实盘启动前状态是否过期。`run_lock_ttl_ms` 用于清理异常中断后残留的运行锁；锁过期前不能启动同范围的新运行。
+
+`plan_recheck_price_drift_bps` 和 `plan_recheck_qty_tolerance` 用于确认后的轻量复检。只要价格漂移、账号仓位、可平仓数量、主账号容量或风险等级变化超过这些阈值，就不能直接使用旧链路继续执行。
 
 所有仓位数量、价格、费用和 PnL 计算必须使用 Decimal，不允许使用浮点数。下单数量按交易所 step size 向下取整；任何取整差额都必须写入结构化 `residual_ledger`，最终按账号、方向和腿类型聚合校验。价格按交易所 tick size 归一化；价格取整差异只进入成本估算和价差统计，不进入仓位残差账本。
 
@@ -213,6 +221,16 @@ main_receivable_qty = min(
 
 - `warning`：接近风险上限但未超过。
 - `blocked`：超过风险上限，不能开始模拟或不能进入当前组。
+
+检测阶段生成的链路只是可确认草案，不等同于可直接执行指令。检测结果必须记录 `plan_version`、账号快照版本、价格快照、交易对规则版本、主账号、子账号集合、`selected_side`、配置版本和生成时间。
+
+只要用户在页面上修改交易对、盈利方向、主账号或子账号列表，前一次检测结果立即失效，确认按钮禁用，必须重新检测。账号池中任意账号数据过期时，允许继续浏览旧数据，但点击检测必须先刷新账号状态。
+
+用户确认链路后，点击开始模拟移仓时必须执行轻量复检。复检需要重新读取价格、账号快照、主账号空仓状态、第一组 donor 可释放数量、主账号承接容量和运行锁。若硬阻断项失败，状态为 `blocked_plan_recheck_failed`；若价格、数量或风险等级变化超过 `plan_recheck_price_drift_bps` 或 `plan_recheck_qty_tolerance`，状态为 `blocked_plan_stale`，页面提示用户重新检测并重新确认。
+
+执行期间每一组开始前再次复检。组前复检必须使用最新价格和账号快照重新计算当前组是否可执行，并确认前序账本与计划账本仍可解释。若变化仍在阈值内且组内风险通过，可以继续执行；若变化超过阈值或当前组无法闭合，进入 `paused_plan_recheck_changed` 或 `paused_group_not_executable`，不得自动切换链路或自动市场减仓。
+
+检测报告必须区分阻断和警告。阻断项不能确认链路；警告项允许确认，但需要在确认动作里记录操作者、确认时间、警告码和确认时的快照摘要。
 
 ## 链路规划
 
@@ -570,9 +588,12 @@ blocked_open_order_conflict
 blocked_run_lock_exists
 blocked_symbol_rules_unavailable
 blocked_group_round_limit_exceeded
+blocked_plan_stale
+blocked_plan_recheck_failed
 blocked_live_simulation_expired
 blocked_live_precheck_failed
 paused_price_drift
+paused_plan_recheck_changed
 paused_round_unbalanced
 paused_external_state_changed
 paused_group_not_executable
@@ -646,6 +667,57 @@ operator_choice
 
 `batch_debt_buffer_history` 记录每个 donor batch 的成功 group、失败点和转入待修复缺口的数量。`abort_recover_history` 必须记录操作者、恢复前快照、恢复后快照、处理动作、释放锁原因和确认时间。`rounding_ledger` 是 `residual_ledger` 的子集，用于专门追踪 step size 向下取整产生的数量差额。
 
+## 前端工作台与交互设计
+
+前端新增顶层页签 `亢龙有悔移仓模拟`，与 `实盘`、`模拟盘` 并列。旧模拟盘页面中位于执行日志下方的亢龙卡片必须移除，避免同一能力存在两个入口。亢龙页面第一版只走模拟盘执行模式，不能触发真实下单。
+
+页面采用四阶段工作台：
+
+```text
+账号选择 -> 检测链路 -> 确认并执行 -> 完成/暂停/恢复
+```
+
+顶部工具条包含交易对、盈利方向、数据更新时间、当前状态、检测按钮和执行按钮。盈利方向支持 `自动选择`、`LONG`、`SHORT`。手动方向会影响账号持仓展示和检测口径；自动方向在检测前展示双向摘要，检测后高亮最终 `selected_side`，同时保留 `other_side_preview`。
+
+账号选择区分为主账号、账号池和已选子账号列表：
+
+- 主账号只能单选，展示本交易对 LONG/SHORT 是否为空仓、可用余额、预计承接容量和阻断状态。
+- 账号池支持搜索、状态筛选、勾选多账号和批量加入。
+- 已选子账号列表展示本次参与账号，支持移除单个账号和清空列表。
+- 主账号不能加入子账号列表；已加入子账号不能重复加入。
+- 用户选择的子账号集合只决定参与范围，不决定最终链路顺序；链路顺序由检测阶段 planner 生成。
+
+账号池和已选子账号列表都使用紧凑持仓行卡片，不使用原生 `multiple select`。单行高度目标为 64-76px，避免大量账号时页面过高。卡片以当前交易对和当前盈利方向为主，只展示参与判断必要信息：
+
+```text
+[ ] 子账号A        LONG 12.5000      +38.20 USDC
+    ETHUSDC        均价 2430.12      标记 2461.80   可平 12.5000   正常
+```
+
+宽屏下账号池可以使用两列紧凑列表，已选子账号列表保持单列；窄屏下全部降为单列。卡片字段分三组：账号标识、当前方向仓位、盈利和风险摘要。详细风控原因不放进卡片，统一在检测结果区展示。每张卡片必须展示数据更新时间或过期状态，例如 `刚刚`、`30秒前`、`已过期`。
+
+检测结果区默认收起或显示空状态。检测完成后展示：
+
+- 主账号空仓检查、承接容量和保证金缺口。
+- 自动方向结果、手动方向合法性和 `other_side_preview`。
+- 推荐链路摘要和 group 列表。
+- 每个 group 的 from/to、方向、计划数量、预计轮次、预计手续费和预计价差损耗。
+- planner 选择理由，例如首个 donor 来自盈利方向可平仓数量最高，后续 donor 按净释放收益、可转移数量、轮次和风险缓冲排序。
+- 阻断项和警告项；阻断禁用确认，警告需要用户明确确认。
+- 检测快照、价格快照、配置版本和过期时间。
+
+确认链路后，页面进入待执行状态。只要交易对、方向、主账号或子账号列表发生变化，确认状态立即失效。执行开始前系统自动轻量复检；复检通过才允许真正进入第一组。
+
+执行区以反馈为主，展示当前组、当前轮、已完成组数、已完成轮数、当前账号对、计划数量、已匹配数量和剩余数量。执行日志必须展示完整移仓过程，但默认用简洁日志行：
+
+```text
+第 2 组 / 第 4 轮  sub_02 -> sub_01  LONG 0.0500  平仓 2461.20  开仓 2461.35  手续费 0.18  已配平
+```
+
+详细原始事件、fills、残差账本、batch debt buffer 和恢复记录放在可展开明细里。完成后展示预计与实际消耗对比，包括手续费、手续费资产、平仓/开仓价差 PnL、保守价差损耗、残差数量和最终配平结果。
+
+执行期间锁定交易对、方向、主账号和子账号列表。页面可以继续查看账号池，但不能修改本次运行配置。暂停后页面提供 `重新检测`、`查看账本` 和 `进入人工恢复` 等动作；市场减仓建议只能作为单独确认流程出现。
+
 ## 展示文案与语言包
 
 亢龙模块新增的用户可见文本必须从语言包渲染，不允许在前端、后端报告、日志适配层或预检响应里硬编码中文展示文案。第一版默认语言为 `zh-CN`，但事件、状态、阻断原因和报告字段必须保留稳定的机器码，方便后续扩展其他语言。
@@ -656,6 +728,23 @@ operator_choice
 - 执行事件展示文案在 `i18n/registry/events.json` 注册，事件 payload 只携带 key 和参数。
 - 审计日志、恢复日志和操作日志展示文案在 `i18n/registry/logs.json` 注册。
 - 预检项和阻断原因分别在 `i18n/registry/precheck.json`、`i18n/registry/reasons.json` 注册。
+
+新增前端工作台文本也必须进入语言包，包括顶层页签、阶段名称、按钮、账号卡片字段、筛选项、空状态、阻断/警告标题、检测结果列名、执行日志列名、成本统计标题、复检提示和确认弹窗。建议保留以下 key 前缀：
+
+```text
+console.kanglong.nav
+console.kanglong.stage.*
+console.kanglong.account_pool.*
+console.kanglong.selected_accounts.*
+console.kanglong.card.*
+console.kanglong.precheck.*
+console.kanglong.plan.*
+console.kanglong.execution.*
+console.kanglong.costs.*
+runtime.kanglong.*
+```
+
+前端日志展示不得把中文模板写在 `app.js` 中；日志行应使用 `message_key + message_params` 渲染。账号卡片里的状态标签也必须通过 key 渲染，例如 `available`、`joined`、`stale`、`blocked`、`warning`、`main_not_flat` 和 `capacity_insufficient`。
 
 状态码和原因码必须作为结构化字段保存，例如 `blocked_main_not_flat`、`blocked_main_insufficient_capacity`、`blocked_initial_subaccount_unbalanced`、`paused_group_not_executable`、`needs_abort_recover`、`market_reduce_required` 和 `unsafe_dust_residual`。报告层展示时通过语言包 key 渲染，不能只保存已经渲染好的中文。
 
@@ -724,6 +813,19 @@ message_params:
 - 账号间无法闭合时只生成市场减仓建议。
 - 消耗统计正确区分 released profit、手续费、手续费资产、maker/taker、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
 - 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、realized PnL、手续费、手续费资产、成交明细、matched 数量、残差、交易规则不可用、配对腿 ID 和订单 ID。
+- 顶层导航包含 `亢龙有悔移仓模拟` 页签，切换后进入独立亢龙页面。
+- 原模拟盘页面不再渲染旧 `kanglongPanel`，避免同一功能两个入口。
+- 账号池支持多选批量加入子账号列表，主账号不能被加入，已加入账号不能重复加入。
+- 子账号列表支持移除和清空，但不允许用户手工决定最终执行链路顺序。
+- 主账号、账号池和已选子账号卡片展示当前交易对、当前方向、持仓数量、可平数量、未实现盈亏、均价、标记价、风险状态和数据更新时间。
+- 自动方向在检测前展示双向摘要，检测后高亮 `selected_side` 并展示 `other_side_preview`。
+- 修改交易对、方向、主账号或子账号列表后，既有检测结果和确认状态立即失效。
+- 检测结果区正确区分阻断和警告：阻断禁用确认，警告确认必须写入操作者确认记录。
+- 点击开始执行前必须轻量复检；复检失败进入 `blocked_plan_recheck_failed` 或 `blocked_plan_stale`。
+- 每组开始前必须复检；变化超过阈值进入 `paused_plan_recheck_changed` 或 `paused_group_not_executable`。
+- 执行期间交易对、方向、主账号和子账号列表被锁定，不能修改本次运行配置。
+- 执行日志展示 group、round、from/to、方向、数量、平仓价、开仓价、手续费、状态，并能展开原始事件和残差账本。
+- 完成后展示预计与实际消耗对比，包括手续费、手续费资产、价差 PnL、保守价差损耗、残差和最终配平结果。
 - 新增 UI、报告、日志、预检和阻断原因的用户可见文案必须通过 i18n key 渲染，不能硬编码中文。
 - 新增状态、原因、事件和日志 key 必须写入 `zh-CN` 语言包和对应 registry，参数占位符与事件数据保持一致。
 - 中文开发环境下保持 UTF-8，语言包使用完整模板和具名参数，不允许运行时拼接中文片段。
