@@ -161,6 +161,9 @@ class KanglongPlanResponse(BaseModel):
     plan_version: str
     snapshot_bundle_id: str
     result_grade: str | None = None
+    error_code: str | None = None
+    requested_plan_version: str | None = None
+    current_status: str | None = None
     available_actions: list[str] = Field(default_factory=list)
     report: dict[str, Any] = Field(default_factory=dict)
 

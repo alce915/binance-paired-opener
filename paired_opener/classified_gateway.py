@@ -247,6 +247,9 @@ class ClassifiedExchangeGateway(ExchangeGateway):
     async def get_quote(self, symbol: str) -> Quote:
         return await self._call("get_quote", lambda: self._delegate.get_quote(symbol), symbol=symbol)
 
+    async def get_unified_account_snapshot(self) -> dict[str, Any]:
+        return await self._call("get_unified_account_snapshot", lambda: self._delegate.get_unified_account_snapshot())
+
     async def refresh_quote(self, symbol: str) -> Quote:
         return await self._call("refresh_quote", lambda: self._delegate.refresh_quote(symbol), symbol=symbol)
 

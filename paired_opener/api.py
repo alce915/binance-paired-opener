@@ -3,6 +3,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,10 +14,12 @@ from fastapi.staticfiles import StaticFiles
 
 from app_i18n.runtime import DEFAULT_LOCALE, DEFAULT_TIMEZONE, format_copy, frontend_bootstrap_payload, make_api_detail
 from paired_opener.account_runtime import AccountRuntimeManager
-from paired_opener.config import Settings, settings
+from paired_opener.config import DEFAULT_LEVERAGE, Settings, settings
 from paired_opener.domain import ExchangeStateError, SessionConflictError
 from paired_opener.errors import TradingError, ensure_trading_error, http_status_for_error, invalid_parameter_error
+from paired_opener.kanglong.config import load_kanglong_symbol_config
 from paired_opener.kanglong.service import KanglongSimulationService
+from paired_opener.kanglong.snapshots import build_snapshot_bundle
 from paired_opener.market_stream import format_sse
 from paired_opener.schemas import (
     AccountListResponse,
@@ -24,8 +27,11 @@ from paired_opener.schemas import (
     AccountSelectResponse,
     AccountSummary,
     CloseSessionRequest,
+    KanglongActionRequest,
+    KanglongEventsResponse,
+    KanglongPlanRequest,
+    KanglongPlanResponse,
     KanglongSimulationRunRequest,
-    KanglongSimulationRunResponse,
     MarketConnectRequest,
     OpenSessionRequest,
     SessionActionResponse,
@@ -82,6 +88,77 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 def current_runtime(app: FastAPI):
     return app.state.runtime_manager.current()
+
+
+def _normalize_kanglong_account_id(account_id: str) -> str:
+    return account_id.strip().lower()
+
+
+def _validate_kanglong_account_ids(request: KanglongPlanRequest) -> None:
+    main_account_id = _normalize_kanglong_account_id(request.main_account_id)
+    seen_subaccounts: set[str] = set()
+    for subaccount_id in request.subaccount_ids:
+        normalized = _normalize_kanglong_account_id(subaccount_id)
+        if normalized == main_account_id or normalized in seen_subaccounts:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "kanglong_duplicate_account", "account_id": subaccount_id},
+            )
+        seen_subaccounts.add(normalized)
+
+
+async def _collect_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
+    _validate_kanglong_account_ids(request)
+    runtime_manager: AccountRuntimeManager = app.state.runtime_manager
+    account_ids = [request.main_account_id, *request.subaccount_ids]
+    gateways = []
+    account_payloads = []
+    operation_failed = False
+    try:
+        for account_id in account_ids:
+            gateway = runtime_manager.build_temporary_gateway(account_id)
+            gateways.append(gateway)
+            account_payloads.append(await gateway.get_unified_account_snapshot())
+        main_gateway = gateways[0]
+        rules = await main_gateway.get_symbol_rules(request.symbol)
+        quote = await main_gateway.get_quote(request.symbol)
+    except Exception:
+        operation_failed = True
+        raise
+    finally:
+        close_error: Exception | None = None
+        for gateway in gateways:
+            try:
+                await gateway.close()
+            except Exception as exc:
+                if not operation_failed and close_error is None:
+                    close_error = exc
+        if close_error is not None:
+            raise close_error
+    config = load_kanglong_symbol_config(app.state.settings, request.symbol)
+    snapshot_bundle = build_snapshot_bundle(
+        symbol=request.symbol,
+        accounts=account_payloads,
+        config_version="default",
+        symbol_rule_version=request.symbol,
+        price_version=f"{quote.bid_price}:{quote.ask_price}",
+        leverage=DEFAULT_LEVERAGE,
+    )
+    snapshots = snapshot_bundle["accounts"]
+    return {
+        "symbol": request.symbol,
+        "main_account_id": request.main_account_id,
+        "subaccount_ids": request.subaccount_ids,
+        "selected_side": request.selected_side,
+        "snapshot_bundle_id": snapshot_bundle["snapshot_bundle_id"],
+        "main_snapshot": snapshots[0],
+        "subaccount_snapshots": snapshots[1:],
+        "config": config,
+        "rules": rules,
+        "close_price": Decimal(str(quote.bid_price)),
+        "open_price": Decimal(str(quote.ask_price)),
+        "fee_rate": Decimal("0.0005"),
+    }
 
 
 def _static_file_response(name: str, *, media_type: str | None = None, cache_headers: dict[str, str] | None = None) -> FileResponse:
@@ -292,18 +369,62 @@ async def run_simulation(request: SimulationRunRequest) -> dict:
         _raise_api_error(exc, code='trading_request_failed', source='service')
 
 
-@app.post('/kanglong/simulation/run', response_model=KanglongSimulationRunResponse)
-async def run_kanglong_simulation(request: KanglongSimulationRunRequest) -> KanglongSimulationRunResponse:
+@app.post("/kanglong/simulation/plan", response_model=KanglongPlanResponse)
+async def create_kanglong_simulation_plan(request: KanglongPlanRequest) -> KanglongPlanResponse:
     if request.mode != "simulation":
         raise HTTPException(status_code=400, detail={"code": "kanglong_live_mode_not_supported"})
     run_id = str(uuid4())
-    payload = app.state.kanglong_service.create_draft_run(
+    try:
+        inputs = await _collect_kanglong_plan_inputs(request)
+        payload = app.state.kanglong_service.create_plan(run_id=run_id, **inputs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_api_error(exc, code="kanglong_plan_failed", source="service")
+    return KanglongPlanResponse.model_validate(payload)
+
+
+@app.post("/kanglong/simulation/plan/{run_id}/confirm", response_model=KanglongPlanResponse)
+async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
+    payload = app.state.kanglong_service.confirm_plan(
         run_id=run_id,
-        symbol=request.symbol,
-        main_account_id=request.main_account_id,
-        subaccount_ids=request.subaccount_ids,
+        plan_version=request.plan_version,
+        idempotency_key=request.idempotency_key,
+        operator=request.operator,
+        confirmed_warning_codes=request.confirmed_warning_codes,
     )
-    return KanglongSimulationRunResponse(run_id=run_id, status=payload["status"], report={})
+    return KanglongPlanResponse.model_validate(payload)
+
+
+@app.post("/kanglong/simulation/plan/{run_id}/execute", response_model=KanglongPlanResponse)
+async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
+    payload = app.state.kanglong_service.execute_plan(
+        run_id=run_id,
+        plan_version=request.plan_version,
+        idempotency_key=request.idempotency_key,
+        close_price=Decimal("3100.00"),
+        open_price=Decimal("3100.50"),
+        fee_rate=Decimal("0.0005"),
+    )
+    return KanglongPlanResponse.model_validate(payload)
+
+
+@app.get("/kanglong/simulation/run/{run_id}/events", response_model=KanglongEventsResponse)
+async def get_kanglong_simulation_events(
+    run_id: str,
+    after_event_id: int = 0,
+    limit: int = 200,
+) -> KanglongEventsResponse:
+    payload = app.state.kanglong_service.list_events(run_id, after_event_id=after_event_id, limit=limit)
+    return KanglongEventsResponse.model_validate(payload)
+
+
+@app.post("/kanglong/simulation/run", response_model=KanglongPlanResponse)
+async def run_kanglong_simulation(request: KanglongSimulationRunRequest) -> KanglongPlanResponse:
+    raise HTTPException(
+        status_code=410,
+        detail={"code": "kanglong_run_endpoint_deprecated", "replacement": "/kanglong/simulation/plan"},
+    )
 
 
 @app.get('/kanglong/simulation/run/{run_id}')
