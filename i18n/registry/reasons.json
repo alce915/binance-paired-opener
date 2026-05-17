@@ -42,5 +42,9 @@
   "session_resume_non_recoverable": {
     "key": "reasons.session_resume_non_recoverable",
     "params": []
+  },
+  "kanglong.blocked_main_not_flat": {
+    "key": "reasons.kanglong.blocked_main_not_flat",
+    "params": ["symbol", "long_qty", "short_qty", "qty_tolerance"]
   }
 }

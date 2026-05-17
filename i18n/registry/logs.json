@@ -10,5 +10,9 @@
   "log.simulation.round_completed": {
     "key": "log.simulation.round_completed",
     "params": ["round_index", "round_count", "symbol", "filled_qty", "avg_fill_price", "fee", "residual_qty"]
+  },
+  "kanglong.abort_recovered": {
+    "key": "log.kanglong.abort_recovered",
+    "params": ["run_id", "release_reason"]
   }
 }

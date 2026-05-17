@@ -4,5 +4,9 @@
     "statuses": {
       "fail_read_error": "precheck.system_open_orders.fail_read_error"
     }
+  },
+  "kanglong.main_flat": {
+    "label_key": "precheck.labels.kanglong.main_flat",
+    "fail_key": "precheck.kanglong.main_flat.fail"
   }
 }

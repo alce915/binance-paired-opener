@@ -338,5 +338,14 @@
   "runtime.symbol_switched": "已切换交易对：{symbol}",
   "runtime.whitelist_load_failed": "加载白名单失败：{error}",
   "runtime.whitelist_update_failed": "更新白名单失败：{error}",
+  "console.kanglong.title": "亢龙有悔移仓模拟",
+  "console.kanglong.run_simulation": "开始模拟",
+  "console.kanglong.report.result_grade": "结果等级：{result_grade}",
+  "runtime.kanglong.status.blocked_main_not_flat": "主账号本交易对不是空仓",
+  "reasons.kanglong.blocked_main_not_flat": "主账号当前 {symbol} 持仓未清空，多仓 {long_qty}，空仓 {short_qty}，容忍数量 {qty_tolerance}。",
+  "events.kanglong.round_completed": "亢龙第 {group_id} 组第 {round_id} 轮完成，配对数量 {matched_qty}",
+  "log.kanglong.abort_recovered": "亢龙运行 {run_id} 已完成人工恢复，释放锁原因：{release_reason}",
+  "precheck.labels.kanglong.main_flat": "主账号空仓",
+  "precheck.kanglong.main_flat.fail": "主账号存在本交易对持仓，需要先清空。",
   "runtime.whitelist_updated": "白名单已更新：{symbols}"
 }

@@ -73,6 +73,7 @@
   "single_close_market_fallback": { "key": "events.single_close_market_fallback", "level": "warn" },
   "single_close_session_completed": { "key": "events.single_close_session_completed", "level": "success" },
   "single_close_session_failed": { "key": "events.single_close_session_failed", "level": "error" },
+  "kanglong.round_completed": { "key": "events.kanglong.round_completed", "level": "success" },
   "quote_stale": { "key": "events.quote_stale", "level": "warn" },
   "extension_round_conflict_detected": { "key": "events.extension_round_conflict_detected", "level": "warn" }
 }
