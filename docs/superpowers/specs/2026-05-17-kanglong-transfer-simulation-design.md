@@ -18,6 +18,7 @@
 - 每一轮必须完成平仓、开仓、成交对账后才能进入下一轮。
 - 中间阶段允许子账号临时不配平，但最终所有子账号必须恢复到运行前基准仓位。
 - 主账号最终必须清空本交易对仓位，作为纯中转账户。
+- 主账号开始前也必须为空仓，避免亢龙流程误处理主账号既有仓位。
 - 最终配平优先账号间转移；只有无法闭合时才生成市场减仓建议，且必须单独确认。
 - 全流程统计手续费消耗、移仓/配平价差 PnL 和保守价差损耗。
 
@@ -39,6 +40,8 @@
 ### 盈利方向
 
 亢龙每次运行只处理一个全局方向 `selected_side`。默认自动选择所有参与子账号汇总后未实现盈利金额更多的方向。若 LONG 和 SHORT 汇总后都盈利，优先选择盈利金额更高的方向；如果盈利金额相同，再选择汇总可平仓数量更大的方向。
+
+自动方向报告必须同时生成 `other_side_preview`。`other_side_preview` 展示另一方向的汇总未实现盈利、可平仓数量、首选 donor、主账号承接能力是否满足和不可执行原因。第一版只做提示，不因为另一方向可执行而自动切换 `selected_side`。
 
 策略允许用户手动选择 LONG 或 SHORT。手动方向仍必须盈利，否则检测阶段阻断。
 
@@ -77,6 +80,8 @@
 `per_round_qty_limit` 是每一轮最多转移的标的数量。金额、保证金、最小名义金额和盈利覆盖成本作为风险检查，不作为主拆分单位。
 
 `max_chain_groups` 限制完整链路最多生成多少个账号组，避免最优化策略生成过长链路。`price_buffer_bps`、`margin_safety_ratio` 和 `min_liquidation_buffer_ratio` 用于主账号承接能力和组内风险检查。`snapshot_ttl_ms`、`price_ttl_ms` 和 `simulation_result_ttl_ms` 用于判断模拟结果和实盘启动前状态是否过期。`run_lock_ttl_ms` 用于清理异常中断后残留的运行锁；锁过期前不能启动同范围的新运行。
+
+所有仓位数量、价格、费用和 PnL 计算必须使用 Decimal，不允许使用浮点数。下单数量按交易所 step size 向下取整；任何取整差额都必须写入结构化 `residual_ledger`，最终按账号、方向和腿类型聚合校验。
 
 ## 统一执行事件模型
 
@@ -153,6 +158,15 @@ abs(baseline_long_qty - baseline_short_qty) <= qty_tolerance
 
 如果某个子账号运行前已经不配平，状态为 `blocked_initial_subaccount_unbalanced`，不在亢龙流程里顺手修复历史不平衡。
 
+第一版要求主账号在运行前对本交易对为空仓：
+
+```text
+abs(main_initial_long_qty) <= qty_tolerance
+abs(main_initial_short_qty) <= qty_tolerance
+```
+
+如果主账号已有本交易对仓位，状态为 `blocked_main_not_flat`。报告必须展示主账号当前 LONG/SHORT 数量、超出容忍范围的数量，以及需要先手动处理的方向。
+
 第一组有硬阻断规则：
 
 ```text
@@ -217,9 +231,11 @@ donor -> receiver
 
 接收账号按 FIFO 顺序从 `pending_debt_queue` 头部选择。若队首缺口大于 donor 可转移数量，则本组只填队首的一部分。
 
-如果 donor 可转移数量大于队首缺口，planner 可以生成 `donor_batch`。`donor_batch` 由同一个 donor 对多个 receiver 的多个两账号组组成，每个组仍然只包含一个 donor 和一个 receiver。批次内先按 FIFO 消化多个 receiver 缺口；只有整个批次结束后，才把 donor 的累计 `matched_qty` 作为一个新的待补回缺口入队。
+如果 donor 可转移数量大于队首缺口，planner 可以生成 `donor_batch`。`donor_batch` 由同一个 donor 对多个 receiver 的多个两账号组组成，每个组仍然只包含一个 donor 和一个 receiver。批次内先按 FIFO 消化多个 receiver 缺口；每个成功组立即把 donor 的 `matched_qty` 累计到 `batch_debt_buffer`。只有整个批次完成后，才把 `batch_debt_buffer` 合并为 donor 的新待补回缺口并入队。
 
-本组完成后，被接收账号的缺口按 `matched_qty` 减少。非批次组中，donor 按 `matched_qty` 新增同方向待补回缺口；批次组中，donor 只在批次结束后按累计 `batch_matched_qty` 入队。`pending_debt_queue` 的总量应始终等于主账号临时持有的 `main_buffer_qty` 加上按账号和腿可解释的残差，直到闭合阶段由主账号回填最后剩余的缺口。
+如果 `donor_batch` 中途失败，`batch_debt_buffer` 不能丢弃。已成功部分转为待修复缺口，进入 `round_pending_repair` 或 `needs_abort_recover` 路径，并写入审计记录。
+
+本组完成后，被接收账号的缺口按 `matched_qty` 减少。非批次组中，donor 按 `matched_qty` 新增同方向待补回缺口；批次组中，donor 只在批次结束后按累计 `batch_matched_qty` 入队。`pending_debt_queue` 的总量应始终等于主账号临时持有的 `main_buffer_qty` 加上按账号和腿可解释的残差、未合并的 `batch_debt_buffer`，直到闭合阶段由主账号回填最后剩余的缺口。
 
 第一版禁止已经存在未偿还缺口的账号继续作为 donor，避免链路绕圈。只有当该账号在 `pending_debt_queue` 中的缺口被完全填平后，才允许重新进入 donor 候选池。
 
@@ -245,6 +261,19 @@ candidate_transfer_qty = min(
   receiver_balance_capacity_qty
 )
 ```
+
+普通组的 `receiver_receivable_qty` 和 `receiver_balance_capacity_qty` 只取 FIFO 队首 receiver。`donor_batch` 必须按 FIFO receiver 逐段计算承接能力，每段数量为：
+
+```text
+batch_segment_qty = min(
+  donor_remaining_batch_qty,
+  receiver_pending_debt_qty,
+  receiver_receivable_qty,
+  receiver_balance_capacity_qty
+)
+```
+
+每个 `batch_segment_qty` 都生成一个独立两账号 group。任一 receiver 无法承接时，batch 在该 receiver 前停止，不跳过队列项。
 
 Planner 使用确定性的字典序评分选择下一个 donor：
 
@@ -501,6 +530,7 @@ completed
 
 ```text
 blocked_main_insufficient_capacity
+blocked_main_not_flat
 blocked_no_profitable_account
 blocked_manual_side_not_profitable
 blocked_initial_subaccount_unbalanced
@@ -518,6 +548,9 @@ paused_group_round_limit_exceeded
 paused_lock_heartbeat_lost
 round_pending_repair
 needs_market_reduce_confirmation
+needs_abort_recover
+abort_recovering
+aborted_recovered
 unsafe_unclosed
 unsafe_dust_residual
 ```
@@ -567,12 +600,17 @@ live_precheck_run_id
 lock_scope
 lock_heartbeat_history
 residual_ledger
+batch_debt_buffer_history
 abort_recover_history
+other_side_preview
+rounding_ledger
 event_sequence
 operator_choice
 ```
 
 每个组和每轮都引用同一个 `run_id`，并记录输入快照版本和输出事件。报告必须能从最终结果追溯到每一轮的计划数量、实际成交数量、成交均价、手续费、残差、配对订单、锁续期、暂停原因和实盘准入判断。
+
+`batch_debt_buffer_history` 记录每个 donor batch 的成功 group、失败点和转入待修复缺口的数量。`abort_recover_history` 必须记录操作者、恢复前快照、恢复后快照、处理动作、释放锁原因和确认时间。`rounding_ledger` 是 `residual_ledger` 的子集，用于专门追踪 step size 向下取整产生的数量差额。
 
 ## 复用现有规则
 
@@ -588,9 +626,11 @@ operator_choice
 
 - 起始账号选择：全局 `selected_side` 确定后，选择该方向可平仓数量最高的盈利子账号。
 - 自动方向先选全局 `selected_side`，后续起始账号和 donor 都只能扫描该方向。
+- 自动方向报告展示 `other_side_preview`，但第一版不自动切换到备选方向。
 - 手动方向选择：只扫描指定方向，方向不盈利时阻断。
 - 手动方向选择不能绕过释放数量、主账号承接和风险阻断规则。
 - 初始子账号未双向配平时阻断为 `blocked_initial_subaccount_unbalanced`。
+- 主账号初始本交易对非空仓时阻断为 `blocked_main_not_flat`。
 - 主账号承接不足：检测阶段阻断并给出保证金缺口。
 - 主账号承接能力同时覆盖临时数量上限、名义风险比例、保证金、手续费、价格漂移缓冲和爆仓距离。
 - 运行锁按逐仓、全仓或共享保证金模式选择正确范围。
@@ -598,8 +638,10 @@ operator_choice
 - 链路中暂停且账本未闭合时不能释放运行锁，必须通过人工 abort/recover 后释放。
 - 确定性 planner 按评分规则选择后续 donor，并用 account_id 稳定排序兜底。
 - 亏欠队列按 FIFO 消化，已有未偿还缺口的账号不能作为 donor。
-- donor 可一次覆盖多个 receiver 时生成 `donor_batch`，批次结束后再把 donor 累计缺口入队。
+- donor 可一次覆盖多个 receiver 时生成 `donor_batch`，每个成功 group 累计到 `batch_debt_buffer`，批次结束后再把 donor 累计缺口入队。
+- `donor_batch` 中途失败时，`batch_debt_buffer` 转为可审计待修复缺口。
 - Planner 计算候选数量时必须同时考虑 donor 可平仓能力和 receiver 承接能力。
+- Batch 覆盖多个 receiver 时，每个 receiver 的承接能力单独限制对应 group 数量，且不能跳过 FIFO 队首。
 - 亏欠队列链路用 `matched_qty` 推进，结构化残差进入 `residual_ledger`。
 - 亏欠队列链路保持 `pending_debt_queue` 总量等于 `main_buffer_qty` 加可解释残差。
 - Planner 到达 `max_chain_groups`、无正收益 donor 或风险阻断时进入闭合阶段。
@@ -612,7 +654,9 @@ operator_choice
 - 主账号最终必须清空。
 - 子账号恢复基准、主账号最终清空和全局账本不变量必须同时成立。
 - 残差超过容忍范围但低于最小下单规则时标记 `unsafe_dust_residual`。
+- 所有数量使用 Decimal，下单数量按 step size 向下取整，rounding 差额进入 `residual_ledger` 和 `rounding_ledger`。
 - 外部挂单、手动调仓、运行锁和快照版本异常会阻断或暂停。
+- 未闭合暂停进入 `needs_abort_recover`，人工恢复过程中为 `abort_recovering`，确认恢复后记录 `aborted_recovered`。
 - 账号间无法闭合时只生成市场减仓建议。
 - 消耗统计正确区分 released profit、手续费、手续费资产、maker/taker、带方向的价差 PnL 和保守价差损耗，并区分移仓阶段和配平阶段。
 - 模拟执行事件覆盖部分成交、拒单、超时、Market fallback、realized PnL、手续费、手续费资产、残差、交易规则不可用、配对腿 ID 和订单 ID。
