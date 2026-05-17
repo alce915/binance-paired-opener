@@ -29,7 +29,7 @@ for (const key of [
   "console.kanglong.plan.summary_title",
   "console.kanglong.execution.log_title",
 ]) {
-  assert.ok(indexSource.includes(key) || appSource.includes(key) || zhSource.includes(key), `${key} should be wired`);
+  assert.ok(indexSource.includes(key) || appSource.includes(key), `${key} should be wired in the Task 7 shell`);
 }
 
 const zhMessages = JSON.parse(zhSource);
