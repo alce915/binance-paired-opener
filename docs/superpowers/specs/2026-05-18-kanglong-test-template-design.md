@@ -91,10 +91,10 @@ data/kanglong_test_templates.json
 - `main_account.positions` 第一版默认为空；如果未来允许主账号模板仓位，仍必须经过亢龙主账号初始空仓预检。
 - `subaccounts[].qty` 表示自动生成 LONG/SHORT 双向配平仓位的数量。
 - `long_entry_price` 和 `short_entry_price` 分别用于计算 LONG/SHORT 未实现盈亏。
-- 每次模板保存后生成稳定的 `template_content_hash`。hash 基于规范化 JSON 内容计算，忽略字段顺序，但包含交易对、账号、保证金、杠杆、价格和数量等会影响快照的字段。
+- 每次模板保存后生成稳定的 `template_content_hash`。hash 基于规范化 JSON 内容计算，忽略字段顺序，但只包含会影响快照、计划和风险判断的字段。
 - 写入 JSON 文件必须使用原子写：先写入同目录 `.tmp` 文件，校验可读后替换正式文件；替换前保留 `.bak`。Windows 下同一时间只允许一个模板写操作，避免并发保存导致文件损坏。
 - 模板账号保存时可以使用用户可读的 `account_id`，但应用到运行时快照前必须改写为 `tpl:{template_id}:main` 和 `tpl:{template_id}:sub:{row_id}`。后端必须校验这些运行时 ID 与真实账号 ID 归一化后不冲突。
-- `template_content_hash` 只覆盖会影响模板快照和计划的字段：交易对、账号标识、账号名称、保证金、杠杆、开仓价、数量。仅修改列表排序、UI 折叠状态等不影响计划的前端状态不得改变 hash。
+- `template_content_hash` 只覆盖会影响模板快照和计划的字段：交易对、账号标识、保证金、杠杆、开仓价、数量。账号展示名称不进入 hash；仅修改名称、列表排序、UI 折叠状态等不影响计划的字段不得改变 hash。
 
 ## 后端接口
 
@@ -158,7 +158,7 @@ POST   /kanglong/simulation/test-templates/{template_id}/preview
 - `accounts` 必须是前端应用模板时替换账号池的唯一来源，前端不得自行重新拼装测试账号。
 - `snapshot_bundle_id` 覆盖模板输入、运行时账号 ID、交易对规则版本、价格快照和生成出的账号快照。
 - `warnings` 和 `blocks` 只携带结构化 code 和 params；展示文本由语言包或 registry 渲染。
-- `mark_price_source` 第一版允许 `exchange_mark_price`、`quote_mid`、`fallback_quote_mid`。优先使用交易所 mark price；没有账号级 mark price 或交易所 mark price 不可用时，才使用 quote mid。
+- `mark_price_source` 第一版默认使用 `quote_mid`。只有后端已经实现交易所 mark price 市场数据接口并通过测试后，才允许返回 `exchange_mark_price`；否则不得在响应中伪造交易所标记价来源。
 
 亢龙计划接口扩展请求字段：
 
@@ -166,8 +166,8 @@ POST   /kanglong/simulation/test-templates/{template_id}/preview
 {
   "mode": "simulation",
   "symbol": "ETHUSDC",
-  "main_account_id": "test-main",
-  "subaccount_ids": ["test-sub-1"],
+  "main_account_id": "tpl:tpl_eth_drop_001:main",
+  "subaccount_ids": ["tpl:tpl_eth_drop_001:sub:test-sub-1"],
   "selected_side": null,
   "account_source": "test_template",
   "test_template_id": "tpl_eth_drop_001",
@@ -181,8 +181,17 @@ POST   /kanglong/simulation/test-templates/{template_id}/preview
 - `account_source = test_template` 时，后端只允许使用该模板内账号，并且必须校验 `template_content_hash` 与当前模板内容一致。
 - 如果请求中出现模板之外的账号 ID，返回阻断错误 `kanglong_test_template_account_mismatch`。
 - 如果模板不存在、交易对不匹配或模板账号为空，返回明确错误码。
+- plan 请求中的 `main_account_id` 和 `subaccount_ids` 必须使用 `preview.accounts[].account_id` 返回的运行时账号 ID；模板原始账号 ID 只用于 `template_runtime_account_map` 审计和 UI 显示。
 - plan 创建时把 `account_source`、`test_template_id`、`template_content_hash`、模板输入摘要和生成出的 `snapshot_bundle_id` 一起写入 run state。
 - confirm、execute 和 recover 不要求前端重复传 `account_source` 或 `test_template_id`；后端必须从 run state 读取模板来源并执行校验。若当前模板被编辑、删除或 hash 不一致，返回 `blocked_plan_stale`，要求用户重新应用模板并重新检测。
+
+schema 与采集分流：
+
+- `KanglongPlanRequest` 需要新增可选字段 `account_source`、`test_template_id`、`template_content_hash`。
+- `account_source = runtime` 时沿用当前真实账号采集路径，可以调用 `runtime_manager.build_temporary_gateway(account_id)`。
+- `account_source = test_template` 时必须走测试模板快照提供者，按模板和当前行情生成 `KanglongAccountSnapshot`，不得调用真实账号 gateway 的查仓、撤单或下单方法。
+- `test_template` 模式下真实 gateway 仅能用于账号无关的市场数据方法：`get_symbol_rules`、`get_quote`、`get_order_book`，并且调用时不传测试账号 ID。
+- `_collect_kanglong_plan_inputs` 或后续同等采集函数必须以 `account_source` 作为第一层分支，避免测试账号 ID 被误送入真实账号运行时。
 
 run state 字段落点：
 
@@ -193,13 +202,20 @@ run state 字段落点：
 - `request_json.template_runtime_account_map` 保存模板账号 ID 到运行时账号 ID 的映射，用于日志、恢复和 UI 展示。
 - 后续如果需要按模板查询历史运行，再考虑把 `account_source`、`test_template_id` 单独升为列。
 
+execute / recover 复检规则：
+
+- execute 阶段重建复检请求时，必须从 `kanglong_runs.request_json.account_source` 读取账号来源，不得只使用 `main_account_id`、`subaccount_ids` 重新构造默认 runtime 请求。
+- `runtime` 模式下执行现有真实账号快照复检。
+- `test_template` 模式下读取 run state 中的 `test_template_id`、`template_content_hash` 和 `template_runtime_account_map`，重新生成模板快照并校验 hash；模板缺失、hash 漂移或运行时账号映射不一致时返回 `blocked_plan_stale`。
+- recover 阶段同样从 run state 读取模板来源；人工恢复审计需要记录模板 ID、模板 hash、复检前后 `snapshot_bundle_id` 和操作者。
+
 ## 行情与计算
 
 模板保存的是输入参数，不保存最终快照。每次加载、预览、检测和执行前复检都重新读取：
 
 - 交易对规则：step size、tick size、最小名义价值、最大杠杆。
 - 订单簿：当前 bid/ask。
-- 标记价格：优先使用交易所 mark price；不可用时使用 quote mid。前端必须展示 `mark_price_source`，让用户知道该价格是交易所标记价还是参考价。
+- 标记价格：第一版使用 quote mid。只有后端新增交易所 mark price 市场数据接口后，才可以优先使用交易所 mark price。前端必须展示 `mark_price_source`，让用户知道该价格是交易所标记价还是参考价。
 - 执行价格：用于模拟平仓/开仓成交，必须使用真实订单簿的 bid/ask 或订单簿深度，不得直接用 mid price 代替成交价。
 
 计算口径：
@@ -220,11 +236,11 @@ margin_deficit = max(margin - collateral, 0)
 
 执行价格第一版实现口径：
 
-- plan / preview 阶段读取 quote bid/ask 和 orderbook 顶档，用于展示、风险预估和价格快照。
-- execute 阶段每个 group 开始前重新读取 orderbook。若执行适配器已支持深度撮合，则按本轮 `submitted_qty` 穿透深度计算平均成交价；若当前实现仍只有 quote bid/ask，则必须把 `execution_price_source = quote_top` 写入报告和事件日志。
+- plan / preview 阶段可以读取 quote bid/ask 计算 `mark_price`，但执行价格预估必须读取 orderbook 顶档或深度。
+- execute 阶段每个 group 开始前重新调用 `get_order_book`。若执行适配器已支持深度撮合，则按本轮 `submitted_qty` 穿透深度计算平均成交价；若当前实现仍只支持顶档，则必须使用 orderbook 顶档并把 `execution_price_source = orderbook_top` 写入报告和事件日志。
 - LONG 平仓使用 bid 侧，LONG 开仓使用 ask 侧；SHORT 平仓使用 ask 侧，SHORT 开仓使用 bid 侧。
 - 任何情况下都不能把 `mark_price` 或 quote mid 当作成交价。
-- orderbook 为空、过期或深度不足时阻断当前检测或当前组执行，返回结构化原因，不自动降级到 mid price。
+- orderbook 为空、过期或深度不足时阻断当前检测或当前组执行，返回结构化原因，不自动降级到 quote 或 mid price。
 
 数量和价格规则：
 
@@ -264,8 +280,8 @@ test_template 使用当前测试模板账号池
 - 测试模板模式不允许切换到真实账号池后继续使用旧 plan。
 - 真实账号模式不允许引用 `test_template_id`。
 - 应用模板后如果用户在弹窗中编辑并保存同一个模板，当前账号池不自动变化；页面必须显示“模板已更新，当前快照已过期”，并禁用确认/执行，直到用户重新应用模板并重新检测。
-- 删除当前已应用模板时必须二次确认。确认删除后立即退出测试模板模式、清空当前 plan/日志/选择，并恢复真实账号池。
-- 如果存在引用该模板的 active run，影响 hash 的编辑和删除必须被阻断，返回 `kanglong_test_template_active_run_exists`，提示用户先完成、终止或恢复当前 run。
+- 无 active run 引用当前模板时，删除当前已应用模板必须二次确认；确认删除后立即退出测试模板模式、清空当前 plan/日志/选择，并恢复真实账号池。
+- 如果存在引用该模板的 active run，删除和影响 hash 的编辑必须被阻断，返回 `kanglong_test_template_active_run_exists`，提示用户先完成、终止或恢复当前 run。
 - 如果 active run 已进入 `plan_confirmed`、`execution_starting` 或更后状态，模板删除只能在 abort/recover 完成后进行。
 - 不影响 hash 的字段可以保存，但不能改变当前已应用快照；UI 仍应提示“当前快照来自旧版本预览”。
 
@@ -329,6 +345,8 @@ test_template 使用当前测试模板账号池
 
 模板账号永远不能通过 `runtime_manager.build_temporary_gateway(test_account_id)` 构造真实交易所 gateway。实现时应提供独立的测试模板快照提供者或 synthetic gateway，只输出 `KanglongAccountSnapshot` 和模拟执行需要的账号状态。真实 gateway 只允许在账号无关的市场数据路径中使用，例如读取 symbol rules、quote、orderbook。
 
+模板账号的 `snapshot_version` 必须由规范化模板输入、运行时账号 ID、价格快照、交易对规则版本和派生持仓内容计算。`snapshot_bundle_id` 必须基于这些模板 `snapshot_version` 生成，不能只依赖模板 ID 或更新时间。
+
 ## 错误处理
 
 - JSON 文件不存在：返回空模板列表，并在首次保存时创建文件。
@@ -353,13 +371,14 @@ test_template 使用当前测试模板账号池
 - preview 在保证金不足时返回 `margin_deficit`，不能只把 available balance 压成 0。
 - preview 返回 `template_content_hash`、`snapshot_bundle_id`、运行时账号 ID、模板账号 ID 映射、价格快照、交易对规则、warnings 和 blocks。
 - preview 账号池必须使用 `tpl:{template_id}:...` 运行时 ID，且不会和真实账号 ID 冲突。
-- execution 使用订单簿 bid/ask 或深度生成成交价，不把 `mark_price` 当作成交价。
-- execution 在事件日志和成本报告中记录 `execution_price_source`，至少区分 `orderbook_depth` 和 `quote_top`。
+- execution 使用订单簿 bid/ask 或深度生成成交价，不把 `mark_price`、quote mid 或单独 quote 当作成交价。
+- execution 在事件日志和成本报告中记录 `execution_price_source`，至少区分 `orderbook_depth` 和 `orderbook_top`。
 - preview 按交易对 step size / tick size 归一化数量和价格。
 - 加载测试模板后，前端账号池完全替换为模板账号，真实账号不再出现。
 - 退出测试模板模式后，真实账号池恢复。
 - `account_source = test_template` 时，plan 接口拒绝模板外账号。
 - `account_source = runtime` 时，plan 接口拒绝 `test_template_id`。
+- `account_source = test_template` 时，plan 和 execute recheck 不会调用真实账号 gateway 的账号级方法。
 - plan 写入模板 hash 后，模板被编辑或删除时 confirm/execute 阻断为 `blocked_plan_stale`。
 - active run 引用模板时，删除模板或修改影响 hash 的字段会被阻断。
 - `.bak` 可读时，模板存储恢复接口能恢复备份且不会静默覆盖当前损坏文件。
@@ -373,7 +392,7 @@ test_template 使用当前测试模板账号池
 - 模板快照转换应复用 `build_snapshot_bundle` 和现有 Decimal 规则。
 - 模板来源、模板 hash 和模板输入摘要应进入 run state，与 `snapshot_bundle_id`、`plan_version` 一起用于复检和审计。
 - 实现时优先新增 `paired_opener/kanglong/test_templates.py` 或同级存储/快照模块，不要把模板 JSON 读写、hash、预览转换逻辑堆进 `api.py`。
-- 若第一版执行适配器暂时不能按 orderbook depth 穿透成交，必须在文档化字段和 UI 中明确展示 `quote_top`，避免把轻量模拟误认为深度撮合。
+- 若第一版执行适配器暂时不能按 orderbook depth 穿透成交，必须在文档化字段和 UI 中明确展示 `orderbook_top`，避免把顶档模拟误认为深度撮合。
 - 前端弹窗状态应与亢龙账号池状态分离，关闭弹窗不应丢失已应用模板。
 - 保存模板不应自动应用；只有“保存并应用”或“加载”才进入测试模板模式。
 - 每次应用模板都必须 invalidate 当前 plan，避免旧链路继续执行。
