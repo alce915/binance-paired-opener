@@ -173,3 +173,52 @@ class KanglongPrecheckResult:
     planned_release_qty: Decimal
     other_side_preview: dict[str, Any]
     details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class KanglongPlanningAccount:
+    account_id: str
+    closeable_qty: Decimal
+    unrealized_profit: Decimal
+    receiver_capacity_qty: Decimal
+    risk_buffer: Decimal
+    has_pending_debt: bool = False
+
+
+@dataclass(slots=True)
+class PendingDebt:
+    account_id: str
+    qty: Decimal
+
+
+@dataclass(slots=True)
+class KanglongBatchDebtBuffer:
+    batch_id: str
+    donor_account_id: str
+    side: PositionSide
+    matched_qty: Decimal
+    completed_group_ids: list[str]
+    failed_group_id: str | None = None
+    repair_status: str = "open"
+
+
+@dataclass(slots=True)
+class KanglongGroupPlan:
+    group_id: str
+    from_account_id: str
+    to_account_id: str
+    symbol: str
+    side: PositionSide
+    target_qty: Decimal
+    round_qtys: list[Decimal]
+    batch_id: str | None = None
+
+
+@dataclass(slots=True)
+class KanglongPlan:
+    run_id: str
+    symbol: str
+    selected_side: PositionSide
+    main_account_id: str
+    groups: list[KanglongGroupPlan]
+    batch_debt_buffers: list[KanglongBatchDebtBuffer]
