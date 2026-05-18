@@ -9,7 +9,7 @@ import shutil
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +88,276 @@ def template_content_hash(template: dict[str, Any]) -> str:
     normalized = _normalize_hash_payload(template)
     raw = json.dumps(normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def build_template_preview_payload(
+    template: dict[str, Any],
+    quote: Any,
+    orderbook: Any,
+    rules: Any,
+    config: Any,
+) -> dict[str, Any]:
+    normalized = _normalize_loaded_template(template)
+    symbol = normalized["symbol"]
+    quote_bid, quote_ask = _quote_bid_ask(quote, symbol)
+    best_bid, best_ask = _orderbook_top_bid_ask(orderbook, symbol)
+    mark_price = (quote_bid + quote_ask) / Decimal("2")
+    ttl_ms = int(getattr(config, "snapshot_ttl_ms"))
+    fee_rate = _decimal_value(getattr(config, "fee_rate"), field_name="fee_rate")
+
+    accounts: list[dict[str, Any]] = []
+    rounding_residuals: list[dict[str, Any]] = []
+    blocks: list[dict[str, Any]] = []
+    main = normalized["main_account"]
+    main_account_id = runtime_main_account_id(normalized["id"])
+    main_collateral = _decimal_value(main["collateral"], field_name="main_account.collateral")
+    accounts.append(
+        {
+            "id": main_account_id,
+            "template_account_id": main["account_id"],
+            "role": "main",
+            "wallet_balance": _decimal_payload(main_collateral),
+            "total_unrealized_pnl": "0",
+            "equity": _decimal_payload(main_collateral),
+            "available_balance": _decimal_payload(main_collateral),
+            "margin": "0",
+            "margin_deficit": "0",
+            "positions": [],
+        }
+    )
+
+    for subaccount in normalized["subaccounts"]:
+        account_id = runtime_subaccount_id(normalized["id"], subaccount["row_id"])
+        raw_qty = _decimal_value(subaccount["qty"], field_name="subaccounts.qty")
+        rounded_qty = _round_down_to_step(raw_qty, rules.step_size)
+        leverage = int(subaccount["leverage"])
+        collateral = _decimal_value(subaccount["collateral"], field_name="subaccounts.collateral")
+        long_entry_price = _decimal_value(subaccount["long_entry_price"], field_name="subaccounts.long_entry_price")
+        short_entry_price = _decimal_value(subaccount["short_entry_price"], field_name="subaccounts.short_entry_price")
+
+        if rounded_qty != raw_qty:
+            rounding_residuals.append(
+                {
+                    "account_id": account_id,
+                    "side": "BOTH",
+                    "raw_qty": _decimal_payload(raw_qty),
+                    "rounded_qty": _decimal_payload(rounded_qty),
+                }
+            )
+        if rounded_qty <= 0:
+            blocks.append({"code": "kanglong_test_template_non_positive_qty", "account_id": account_id})
+        if rounded_qty < rules.min_qty:
+            blocks.append({"code": "kanglong_test_template_min_qty_not_met", "account_id": account_id})
+        if mark_price * rounded_qty < rules.min_notional:
+            blocks.append({"code": "kanglong_test_template_min_notional_not_met", "account_id": account_id})
+        if leverage > rules.max_leverage:
+            blocks.append({"code": "kanglong_test_template_leverage_exceeded", "account_id": account_id})
+        for side, entry_price in (("LONG", long_entry_price), ("SHORT", short_entry_price)):
+            if not _is_aligned_to_increment(entry_price, rules.tick_size):
+                blocks.append(
+                    {
+                        "code": "kanglong_test_template_invalid_price",
+                        "account_id": account_id,
+                        "side": side,
+                    }
+                )
+
+        long_position = _position_snapshot(
+            symbol=symbol,
+            side="LONG",
+            qty=rounded_qty,
+            entry_price=long_entry_price,
+            mark_price=mark_price,
+            leverage=leverage,
+        )
+        short_position = _position_snapshot(
+            symbol=symbol,
+            side="SHORT",
+            qty=rounded_qty,
+            entry_price=short_entry_price,
+            mark_price=mark_price,
+            leverage=leverage,
+        )
+        total_unrealized_pnl = _decimal_value(long_position["unrealized_pnl"], field_name="unrealized_pnl") + _decimal_value(
+            short_position["unrealized_pnl"],
+            field_name="unrealized_pnl",
+        )
+        margin = _decimal_value(long_position["margin"], field_name="margin") + _decimal_value(
+            short_position["margin"],
+            field_name="margin",
+        )
+        equity = collateral + total_unrealized_pnl
+        available_balance = max(equity - margin, Decimal("0"))
+        margin_deficit = abs(equity - margin) if equity - margin < 0 else Decimal("0")
+        accounts.append(
+            {
+                "id": account_id,
+                "template_account_id": subaccount["account_id"],
+                "role": "subaccount",
+                "wallet_balance": _decimal_payload(collateral),
+                "total_unrealized_pnl": _decimal_payload(total_unrealized_pnl),
+                "equity": _decimal_payload(equity),
+                "available_balance": _decimal_payload(available_balance),
+                "margin": _decimal_payload(margin),
+                "margin_deficit": _decimal_payload(margin_deficit),
+                "positions": [long_position, short_position],
+            }
+        )
+
+    payload = {
+        "template_id": normalized["id"],
+        "template_content_hash": normalized["template_content_hash"],
+        "symbol": symbol,
+        "account_source": "test_template",
+        "fee_rate_source": "kanglong_symbol_config",
+        "fee_rate": _decimal_payload(fee_rate),
+        "mark_price_snapshot": {
+            "mark_price": _decimal_payload(mark_price),
+            "mark_price_source": "quote_mid",
+            "quote_bid_price": _decimal_payload(quote_bid),
+            "quote_ask_price": _decimal_payload(quote_ask),
+            "ttl_ms": ttl_ms,
+        },
+        "execution_orderbook_snapshot": {
+            "source": "orderbook_top",
+            "best_bid_price": _decimal_payload(best_bid),
+            "best_ask_price": _decimal_payload(best_ask),
+            "ttl_ms": ttl_ms,
+        },
+        "symbol_rules": {
+            "step_size": _decimal_payload(rules.step_size),
+            "tick_size": _decimal_payload(rules.tick_size),
+            "min_qty": _decimal_payload(rules.min_qty),
+            "min_notional": _decimal_payload(rules.min_notional),
+            "max_leverage": int(rules.max_leverage),
+        },
+        "accounts": accounts,
+        "rounding_residuals": rounding_residuals,
+        "warnings": [],
+        "blocks": blocks,
+    }
+    payload["snapshot_bundle_id"] = _snapshot_bundle_id(payload)
+    return payload
+
+
+def _quote_bid_ask(quote: Any, symbol: str) -> tuple[Decimal, Decimal]:
+    bid = _maybe_decimal(_get_value(quote, "bid_price"))
+    ask = _maybe_decimal(_get_value(quote, "ask_price"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        raise TemplateStoreError(
+            "kanglong_test_template_quote_unavailable",
+            {
+                "symbol": symbol,
+                "bid_price": _optional_decimal_payload(bid),
+                "ask_price": _optional_decimal_payload(ask),
+            },
+        )
+    return bid, ask
+
+
+def _orderbook_top_bid_ask(orderbook: Any, symbol: str) -> tuple[Decimal, Decimal]:
+    bid = _top_level_price(_get_value(orderbook, "bids"))
+    ask = _top_level_price(_get_value(orderbook, "asks"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        raise TemplateStoreError(
+            "kanglong_test_template_orderbook_unavailable",
+            {
+                "symbol": symbol,
+                "best_bid_price": _optional_decimal_payload(bid),
+                "best_ask_price": _optional_decimal_payload(ask),
+            },
+        )
+    return bid, ask
+
+
+def _top_level_price(levels: Any) -> Decimal | None:
+    if not levels:
+        return None
+    try:
+        level = levels[0]
+    except (KeyError, TypeError, IndexError):
+        return None
+    if isinstance(level, dict):
+        return _maybe_decimal(level.get("price"))
+    if isinstance(level, (list, tuple)) and level:
+        return _maybe_decimal(level[0])
+    return _maybe_decimal(_get_value(level, "price"))
+
+
+def _get_value(source: Any, key: str) -> Any:
+    if isinstance(source, dict):
+        return source.get(key)
+    return getattr(source, key, None)
+
+
+def _maybe_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not decimal_value.is_finite():
+        return None
+    return decimal_value
+
+
+def _round_down_to_step(value: Decimal, step_size: Decimal) -> Decimal:
+    if step_size <= 0:
+        return value
+    return (value / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
+
+
+def _is_aligned_to_increment(value: Decimal, increment: Decimal) -> bool:
+    if increment <= 0:
+        return True
+    return value == _round_down_to_step(value, increment)
+
+
+def _position_snapshot(
+    *,
+    symbol: str,
+    side: str,
+    qty: Decimal,
+    entry_price: Decimal,
+    mark_price: Decimal,
+    leverage: int,
+) -> dict[str, Any]:
+    unrealized_pnl = (mark_price - entry_price) * qty if side == "LONG" else (entry_price - mark_price) * qty
+    notional = mark_price * qty
+    margin = abs(notional) / Decimal(leverage)
+    return {
+        "symbol": symbol,
+        "position_side": side,
+        "qty": _decimal_payload(qty),
+        "entry_price": _decimal_payload(entry_price),
+        "mark_price": _decimal_payload(mark_price),
+        "unrealized_pnl": _decimal_payload(unrealized_pnl),
+        "notional": _decimal_payload(notional),
+        "margin": _decimal_payload(margin),
+    }
+
+
+def _snapshot_bundle_id(payload: dict[str, Any]) -> str:
+    bundle_payload = {
+        "template_content_hash": payload["template_content_hash"],
+        "mark_price_snapshot": payload["mark_price_snapshot"],
+        "execution_orderbook_snapshot": payload["execution_orderbook_snapshot"],
+        "symbol_rules": payload["symbol_rules"],
+        "accounts": payload["accounts"],
+    }
+    raw = json.dumps(bundle_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _decimal_payload(value: Decimal) -> str:
+    return canonical_decimal_text(value)
+
+
+def _optional_decimal_payload(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return _decimal_payload(value)
 
 
 class KanglongTemplateStore:

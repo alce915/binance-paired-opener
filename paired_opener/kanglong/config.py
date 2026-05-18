@@ -10,6 +10,7 @@ from paired_opener.config import Settings
 
 @dataclass(frozen=True, slots=True)
 class KanglongSymbolConfig:
+    fee_rate: Decimal = Decimal("0.0005")
     per_round_qty_limit: Decimal = Decimal("0.05")
     qty_tolerance: Decimal = Decimal("0.0001")
     max_rounds_per_group: int = 30
@@ -42,6 +43,7 @@ def _int(value: Any, default: int) -> int:
 def _apply_overrides(base: KanglongSymbolConfig, payload: dict[str, Any]) -> KanglongSymbolConfig:
     return replace(
         base,
+        fee_rate=_decimal(payload.get("fee_rate"), base.fee_rate),
         per_round_qty_limit=_decimal(payload.get("per_round_qty_limit"), base.per_round_qty_limit),
         qty_tolerance=_decimal(payload.get("qty_tolerance"), base.qty_tolerance),
         max_rounds_per_group=_int(payload.get("max_rounds_per_group"), base.max_rounds_per_group),

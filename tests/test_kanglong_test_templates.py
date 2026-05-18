@@ -8,11 +8,14 @@ from decimal import Decimal
 import pytest
 
 from paired_opener.config import Settings
+from paired_opener.domain import Quote, SymbolRules
+from paired_opener.kanglong.config import KanglongSymbolConfig, load_kanglong_symbol_config
 from paired_opener.kanglong.test_templates import (
     KANGLONG_TEST_TEMPLATE_VERSION,
     KanglongTemplateStore,
     TemplateStoreError,
     TemplateValidationError,
+    build_template_preview_payload,
     canonical_decimal_text,
     runtime_main_account_id,
     runtime_subaccount_id,
@@ -48,10 +51,200 @@ def template_payload(template_id: str = "tpl_eth_drop_001") -> dict:
     }
 
 
+def preview_quote(bid: str = "2443.20", ask: str = "2443.22") -> Quote:
+    return Quote(symbol="ETHUSDC", bid_price=Decimal(bid), ask_price=Decimal(ask))
+
+
+def preview_orderbook(bid: str = "2443.19", ask: str = "2443.23") -> dict:
+    return {
+        "bids": [{"price": Decimal(bid), "qty": Decimal("12")}],
+        "asks": [{"price": Decimal(ask), "qty": Decimal("13")}],
+    }
+
+
+def preview_rules(
+    *,
+    step_size: str = "0.01",
+    tick_size: str = "0.01",
+    min_qty: str = "0.01",
+    min_notional: str = "5",
+    max_leverage: int = 125,
+) -> SymbolRules:
+    return SymbolRules(
+        symbol="ETHUSDC",
+        tick_size=Decimal(tick_size),
+        step_size=Decimal(step_size),
+        min_qty=Decimal(min_qty),
+        min_notional=Decimal(min_notional),
+        max_leverage=max_leverage,
+    )
+
+
+def as_decimal(value) -> Decimal:
+    return Decimal(str(value))
+
+
 def test_canonical_decimal_text_is_stable() -> None:
     assert canonical_decimal_text(Decimal("10.000")) == "10"
     assert canonical_decimal_text(Decimal("0.0100")) == "0.01"
     assert canonical_decimal_text(Decimal("123.4500")) == "123.45"
+
+
+def test_build_template_preview_payload_uses_quote_mid_and_orderbook_top_for_account_math() -> None:
+    payload = build_template_preview_payload(
+        template_payload(),
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(),
+        KanglongSymbolConfig(fee_rate=Decimal("0.0004")),
+    )
+
+    assert payload["template_id"] == "tpl_eth_drop_001"
+    assert payload["template_content_hash"] == template_content_hash(template_payload())
+    assert payload["symbol"] == "ETHUSDC"
+    assert payload["account_source"] == "test_template"
+    assert payload["fee_rate_source"] == "kanglong_symbol_config"
+    assert as_decimal(payload["fee_rate"]) == Decimal("0.0004")
+    assert len(payload["snapshot_bundle_id"]) == 24
+
+    assert as_decimal(payload["mark_price_snapshot"]["mark_price"]) == Decimal("2443.21")
+    assert payload["mark_price_snapshot"]["mark_price_source"] == "quote_mid"
+    assert as_decimal(payload["mark_price_snapshot"]["quote_bid_price"]) == Decimal("2443.20")
+    assert as_decimal(payload["mark_price_snapshot"]["quote_ask_price"]) == Decimal("2443.22")
+    assert payload["mark_price_snapshot"]["ttl_ms"] == 5000
+    assert payload["execution_orderbook_snapshot"]["source"] == "orderbook_top"
+    assert as_decimal(payload["execution_orderbook_snapshot"]["best_bid_price"]) == Decimal("2443.19")
+    assert as_decimal(payload["execution_orderbook_snapshot"]["best_ask_price"]) == Decimal("2443.23")
+    assert payload["execution_orderbook_snapshot"]["ttl_ms"] == 5000
+
+    assert payload["symbol_rules"] == {
+        "step_size": "0.01",
+        "tick_size": "0.01",
+        "min_qty": "0.01",
+        "min_notional": "5",
+        "max_leverage": 125,
+    }
+    assert payload["rounding_residuals"] == []
+    assert payload["warnings"] == []
+    assert payload["blocks"] == []
+
+    main, sub = payload["accounts"]
+    assert main["id"] == "tpl:tpl_eth_drop_001:main"
+    assert main["role"] == "main"
+    assert main["positions"] == []
+    assert as_decimal(main["wallet_balance"]) == Decimal("10000")
+    assert as_decimal(main["equity"]) == Decimal("10000")
+    assert as_decimal(main["available_balance"]) == Decimal("10000")
+    assert as_decimal(main["margin"]) == Decimal("0")
+    assert as_decimal(main["margin_deficit"]) == Decimal("0")
+
+    assert sub["id"] == "tpl:tpl_eth_drop_001:sub:sub-1"
+    assert sub["role"] == "subaccount"
+    assert as_decimal(sub["wallet_balance"]) == Decimal("5000")
+    assert as_decimal(sub["total_unrealized_pnl"]) == Decimal("-3100")
+    assert as_decimal(sub["equity"]) == Decimal("1900")
+    assert as_decimal(sub["margin"]) == Decimal("651.5226666666666666666666666")
+    assert as_decimal(sub["available_balance"]) == Decimal("1248.477333333333333333333333")
+    assert as_decimal(sub["margin_deficit"]) == Decimal("0")
+
+    long_position, short_position = sub["positions"]
+    assert long_position["position_side"] == "LONG"
+    assert as_decimal(long_position["qty"]) == Decimal("10")
+    assert as_decimal(long_position["entry_price"]) == Decimal("2440")
+    assert as_decimal(long_position["mark_price"]) == Decimal("2443.21")
+    assert as_decimal(long_position["unrealized_pnl"]) == Decimal("32.10")
+    assert as_decimal(long_position["notional"]) == Decimal("24432.10")
+    assert as_decimal(long_position["margin"]) == Decimal("325.7613333333333333333333333")
+    assert short_position["position_side"] == "SHORT"
+    assert as_decimal(short_position["unrealized_pnl"]) == Decimal("-3132.10")
+
+
+def test_load_kanglong_symbol_config_supports_fee_rate_override(tmp_path) -> None:
+    config_path = tmp_path / "kanglong_symbol_configs.json"
+    config_path.write_text(json.dumps({"ETHUSDC": {"fee_rate": "0.0004"}}), encoding="utf-8")
+    settings = Settings(_env_file=None, kanglong_symbol_configs_file=config_path)
+
+    assert load_kanglong_symbol_config(settings, "ethusdc").fee_rate == Decimal("0.0004")
+
+
+def test_build_template_preview_payload_rounds_qty_down_and_reports_residual() -> None:
+    template = template_payload()
+    template["subaccounts"][0]["qty"] = "10.09"
+
+    payload = build_template_preview_payload(
+        template,
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(step_size="0.1"),
+        KanglongSymbolConfig(),
+    )
+
+    sub = payload["accounts"][1]
+    assert [as_decimal(position["qty"]) for position in sub["positions"]] == [Decimal("10"), Decimal("10")]
+    assert payload["rounding_residuals"] == [
+        {
+            "account_id": "tpl:tpl_eth_drop_001:sub:sub-1",
+            "side": "BOTH",
+            "raw_qty": "10.09",
+            "rounded_qty": "10",
+        }
+    ]
+    assert payload["blocks"] == []
+
+
+def test_build_template_preview_payload_blocks_tick_size_misaligned_manual_prices() -> None:
+    template = template_payload()
+    template["subaccounts"][0]["long_entry_price"] = "2440.01"
+
+    payload = build_template_preview_payload(
+        template,
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(tick_size="0.05"),
+        KanglongSymbolConfig(),
+    )
+
+    assert any(block["code"] == "kanglong_test_template_invalid_price" for block in payload["blocks"])
+
+
+def test_build_template_preview_payload_returns_quantity_notional_and_leverage_blocks() -> None:
+    template = template_payload()
+    template["subaccounts"][0]["qty"] = "0.04"
+    template["subaccounts"][0]["leverage"] = 75
+
+    payload = build_template_preview_payload(
+        template,
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(step_size="0.01", min_qty="0.05", min_notional="1000", max_leverage=50),
+        KanglongSymbolConfig(),
+    )
+
+    codes = [block["code"] for block in payload["blocks"]]
+    assert "kanglong_test_template_min_qty_not_met" in codes
+    assert "kanglong_test_template_min_notional_not_met" in codes
+    assert "kanglong_test_template_leverage_exceeded" in codes
+
+
+@pytest.mark.parametrize(
+    ("quote", "orderbook", "code"),
+    [
+        (Quote(symbol="ETHUSDC", bid_price=Decimal("0"), ask_price=Decimal("2443.22")), preview_orderbook(), "kanglong_test_template_quote_unavailable"),
+        (preview_quote(), {"bids": [], "asks": [{"price": Decimal("2443.23"), "qty": Decimal("13")}]}, "kanglong_test_template_orderbook_unavailable"),
+    ],
+)
+def test_build_template_preview_payload_raises_for_missing_quote_or_orderbook(quote, orderbook, code) -> None:
+    with pytest.raises(TemplateStoreError) as excinfo:
+        build_template_preview_payload(
+            template_payload(),
+            quote,
+            orderbook,
+            preview_rules(),
+            KanglongSymbolConfig(),
+        )
+
+    assert excinfo.value.code == code
+    assert excinfo.value.detail["symbol"] == "ETHUSDC"
 
 
 def test_canonical_decimal_text_rejects_invalid_decimal() -> None:
