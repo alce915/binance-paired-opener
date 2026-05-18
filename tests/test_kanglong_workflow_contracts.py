@@ -457,6 +457,88 @@ def test_execute_before_confirm_does_not_poison_idempotency_key(tmp_path) -> Non
     assert executed["status"] == "completed"
 
 
+def test_service_recover_run_records_audit_history_and_releases_locks(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    lock_scope = "kanglong:ETHUSDC:account:main"
+    try:
+        repository.create_kanglong_run(
+            {
+                "run_id": "run-needs-recover",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1"],
+                "status": KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+                "plan_version": "plan-recover",
+                "snapshot_bundle_id": "snap-recover",
+                "available_actions": ["recover"],
+                "report": {
+                    "summary": {"group_count": 1},
+                    "synthetic_account_state": {"account_source": "test_template", "accounts": []},
+                },
+                "created_at": "2026-05-17T01:00:00+00:00",
+                "updated_at": "2026-05-17T01:00:00+00:00",
+            }
+        )
+        assert repository.acquire_kanglong_locks(run_id="run-needs-recover", lock_scopes=[lock_scope], ttl_ms=60_000) is None
+
+        recovered = service.recover_run(
+            run_id="run-needs-recover",
+            idempotency_key="recover-run-0001",
+            operator="tester",
+            release_reason="manual recovery after abort",
+        )
+        stored = repository.get_kanglong_run("run-needs-recover")
+        events = service.list_events("run-needs-recover", after_event_id=0, limit=10)
+        lock_after_recover = repository.acquire_kanglong_locks(
+            run_id="other-run",
+            lock_scopes=[lock_scope],
+            ttl_ms=60_000,
+        )
+    finally:
+        repository.close()
+
+    assert recovered["status"] == "aborted_recovered"
+    assert recovered["result_grade"] == "unsafe_unclosed"
+    assert recovered["available_actions"] == ["refresh_plan"]
+    assert stored is not None
+    assert stored["status"] == "aborted_recovered"
+    assert stored["report"]["synthetic_account_state"] == {"account_source": "test_template", "accounts": []}
+    history = stored["report"]["abort_recover_history"]
+    assert len(history) == 1
+    assert history[0]["operator"] == "tester"
+    assert history[0]["release_reason"] == "manual recovery after abort"
+    assert history[0]["previous_status"] == "needs_abort_recover"
+    assert events["events"][0]["event_type"] == "kanglong_abort_recovered"
+    assert lock_after_recover is None
+
+
+def test_service_recover_run_blocks_non_recoverable_status_without_releasing_locks(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    lock_scope = "kanglong:ETHUSDC:account:main"
+    try:
+        ready = _create_ready_plan(service, run_id="run-not-recoverable")
+        assert repository.acquire_kanglong_locks(run_id="run-not-recoverable", lock_scopes=[lock_scope], ttl_ms=60_000) is None
+        blocked = service.recover_run(
+            run_id="run-not-recoverable",
+            idempotency_key="recover-blocked-0001",
+            operator="tester",
+            release_reason="not recoverable",
+        )
+        lock_conflict = repository.acquire_kanglong_locks(run_id="other-run", lock_scopes=[lock_scope], ttl_ms=60_000)
+        stored = repository.get_kanglong_run("run-not-recoverable")
+    finally:
+        repository.close()
+
+    assert ready["status"] == "chain_ready"
+    assert blocked["status"] == "blocked_plan_recheck_failed"
+    assert blocked["current_status"] == "chain_ready"
+    assert lock_conflict is not None
+    assert stored is not None
+    assert stored["status"] == "chain_ready"
+
+
 def test_execute_blocks_when_recheck_price_drift_exceeds_threshold(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)

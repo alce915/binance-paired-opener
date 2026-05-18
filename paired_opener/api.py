@@ -43,6 +43,7 @@ from paired_opener.schemas import (
     KanglongEventsResponse,
     KanglongPlanRequest,
     KanglongPlanResponse,
+    KanglongRecoverRequest,
     KanglongSimulationRunRequest,
     KanglongTemplateDeleteResponse,
     KanglongTemplateListResponse,
@@ -1102,6 +1103,21 @@ async def get_kanglong_simulation_events(
         raise HTTPException(status_code=404, detail={"code": "kanglong_run_not_found", "run_id": run_id})
     payload = app.state.kanglong_service.list_events(run_id, after_event_id=after_event_id, limit=limit)
     return KanglongEventsResponse.model_validate(payload)
+
+
+@app.post("/kanglong/simulation/run/{run_id}/recover", response_model=KanglongPlanResponse)
+async def recover_kanglong_simulation_run(run_id: str, request: KanglongRecoverRequest) -> KanglongPlanResponse:
+    service = app.state.kanglong_service
+    stored = service.get_run(run_id)
+    if stored is not None:
+        _validate_template_run_not_stale(stored)
+    payload = service.recover_run(
+        run_id=run_id,
+        idempotency_key=request.idempotency_key,
+        operator=request.operator,
+        release_reason=request.release_reason,
+    )
+    return KanglongPlanResponse.model_validate(payload)
 
 
 @app.post("/kanglong/simulation/run", response_model=KanglongPlanResponse)

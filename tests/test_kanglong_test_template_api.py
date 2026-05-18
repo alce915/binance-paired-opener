@@ -284,6 +284,45 @@ def test_kanglong_template_execute_blocks_when_template_changed_after_confirm(mo
     assert stored["status"] == "plan_confirmed"
 
 
+def test_kanglong_template_recover_blocks_when_template_changed_without_mutating_or_releasing_locks(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    repository, _, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    lock_scope = "kanglong:ETHUSDC:account:tpl:tpl_eth_drop_001:main"
+    try:
+        created = create_template_backed_plan(client, template)
+        repository.update_kanglong_run(
+            created["run_id"],
+            status="needs_abort_recover",
+            available_actions=["recover"],
+        )
+        assert repository.acquire_kanglong_locks(run_id=created["run_id"], lock_scopes=[lock_scope], ttl_ms=60_000) is None
+        before = repository.get_kanglong_run(created["run_id"])
+        KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(stale_template())
+
+        response = client.post(
+            f"/kanglong/simulation/run/{created['run_id']}/recover",
+            json={"idempotency_key": "recover-stale-template-0001", "release_reason": "operator review"},
+        )
+        after = repository.get_kanglong_run(created["run_id"])
+        lock_conflict = repository.acquire_kanglong_locks(run_id="other-run", lock_scopes=[lock_scope], ttl_ms=60_000)
+        events = repository.list_kanglong_events(created["run_id"], after_event_id=0, limit=10)
+    finally:
+        repository.close()
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "blocked_plan_stale"
+    assert before is not None
+    assert after is not None
+    assert after["status"] == before["status"]
+    assert after["report"] == before["report"]
+    assert lock_conflict is not None
+    assert lock_conflict["run_id"] == created["run_id"]
+    assert events["events"] == []
+
+
 def test_kanglong_template_execute_uses_market_data_without_rebuilding_template_accounts(monkeypatch, tmp_path) -> None:
     repository, runtime_manager, template = install_template_api_runtime(monkeypatch, tmp_path)
     client = TestClient(api_module.app)

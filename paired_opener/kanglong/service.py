@@ -691,6 +691,78 @@ class KanglongSimulationService:
         )
         return self._remember_idempotency(idempotency_key, request_hash, response)
 
+    def recover_run(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        operator: str,
+        release_reason: str,
+    ) -> dict[str, Any]:
+        request_hash = _request_hash(
+            {
+                "action": "recover",
+                "run_id": run_id,
+                "operator": operator,
+                "release_reason": release_reason,
+            }
+        )
+        existing = self._repository.get_kanglong_idempotency(idempotency_key, request_hash)
+        if existing is not None:
+            if existing["conflict"]:
+                return self._idempotency_conflict(run_id)
+            return existing["response"]
+
+        stored = self._repository.get_kanglong_run(run_id)
+        if stored is None:
+            return self._not_found(run_id, "")
+        if stored.get("status") not in {
+            KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+            KanglongRunStatus.ABORT_RECOVERING.value,
+        }:
+            return self._blocked_plan_recheck_failed(run_id, stored.get("plan_version") or "", stored)
+
+        recovered_at = _now_text()
+        report = copy.deepcopy(stored.get("report") or {})
+        history = list(report.get("abort_recover_history") or [])
+        history.append(
+            {
+                "operator": operator,
+                "release_reason": release_reason,
+                "previous_status": stored.get("status"),
+                "recovered_at": recovered_at,
+            }
+        )
+        report["abort_recover_history"] = history
+        available_actions = ["refresh_plan"]
+        event_payload = {
+            "message_key": "events.kanglong.abort_recovered",
+            "operator": operator,
+            "release_reason": release_reason,
+            "previous_status": stored.get("status"),
+            "recovered_at": recovered_at,
+        }
+        self._repository.update_kanglong_run_and_events(
+            run_id,
+            status=KanglongRunStatus.ABORTED_RECOVERED.value,
+            report=report,
+            result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+            available_actions=available_actions,
+            events=[{"event_type": "kanglong_abort_recovered", "payload": event_payload}],
+        )
+        self._repository.release_kanglong_locks(run_id)
+        response = _response_base(
+            run_id,
+            KanglongRunStatus.ABORTED_RECOVERED.value,
+            plan_version=stored.get("plan_version"),
+            snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+            available_actions=available_actions,
+            report=report,
+            result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+            latest_event_id=self._repository.latest_kanglong_event_id(run_id),
+        )
+        return self._remember_idempotency(idempotency_key, request_hash, response)
+
     def _execute_recheck(
         self,
         *,
