@@ -357,6 +357,45 @@ def test_kanglong_template_execute_uses_market_data_without_rebuilding_template_
     ]
 
 
+def test_kanglong_template_execute_blocks_when_frozen_account_snapshot_missing(monkeypatch, tmp_path) -> None:
+    repository, runtime_manager, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template)
+        confirmed = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/confirm",
+            json={"plan_version": created["plan_version"], "idempotency_key": "confirm-missing-snapshot-0001"},
+        )
+        stored = repository.get_kanglong_run(created["run_id"])
+        assert stored is not None
+        report = dict(stored["report"])
+        report.pop("account_snapshot", None)
+        report.pop("synthetic_account_state", None)
+        repository.update_kanglong_run(
+            created["run_id"],
+            status=stored["status"],
+            report=report,
+        )
+
+        response = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/execute",
+            json={"plan_version": created["plan_version"], "idempotency_key": "execute-missing-snapshot-0001"},
+        )
+        after = repository.get_kanglong_run(created["run_id"])
+        events = repository.list_kanglong_events(created["run_id"], after_event_id=0, limit=10)
+    finally:
+        repository.close()
+
+    assert confirmed.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "blocked_plan_recheck_failed"
+    assert runtime_manager.build_calls == ["market-main", "market-main"]
+    assert after is not None
+    assert after["status"] == "plan_confirmed"
+    assert "synthetic_account_state" not in after["report"]
+    assert events["events"] == []
+
+
 def test_kanglong_test_template_preview_uses_market_data_account_only(monkeypatch, tmp_path) -> None:
     install_template_settings(monkeypatch, tmp_path)
     KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(template_payload())

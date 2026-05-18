@@ -45,6 +45,7 @@ _ACTIVE_KANGLONG_RUN_STATUSES = (
     "plan_confirmed",
     "execution_starting",
     "group_ready",
+    "group_completed",
     "paused_group_round_limit_exceeded",
     "paused_group_not_executable",
     "paused_plan_recheck_changed",

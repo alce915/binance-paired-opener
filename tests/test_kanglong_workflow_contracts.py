@@ -9,7 +9,7 @@ from paired_opener import api as api_module
 from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
 from paired_opener.kanglong.models import KanglongRunStatus
-from paired_opener.kanglong.service import KanglongSimulationService
+from paired_opener.kanglong.service import KanglongSimulationService, _apply_group_result_to_synthetic_accounts
 from paired_opener.schemas import (
     KanglongActionRequest,
     KanglongEventsResponse,
@@ -297,6 +297,101 @@ def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
     assert main["positions"][0]["qty"] == "0.00"
 
 
+def test_apply_group_result_does_not_open_receiver_when_donor_side_missing() -> None:
+    accounts = [
+        {
+            "account_id": "donor",
+            "wallet_balance": "1000",
+            "total_unrealized_pnl": "0",
+            "equity": "1000",
+            "available_balance": "1000",
+            "margin": "0",
+            "margin_deficit": "0",
+            "positions": [{"symbol": "ETHUSDC", "position_side": "SHORT", "qty": "1"}],
+        },
+        {
+            "account_id": "receiver",
+            "wallet_balance": "1000",
+            "total_unrealized_pnl": "0",
+            "equity": "1000",
+            "available_balance": "1000",
+            "margin": "0",
+            "margin_deficit": "0",
+            "positions": [],
+        },
+    ]
+
+    updated = _apply_group_result_to_synthetic_accounts(
+        accounts,
+        {
+            "from_account_id": "donor",
+            "to_account_id": "receiver",
+            "side": "LONG",
+            "symbol": "ETHUSDC",
+        },
+        matched_qty=Decimal("1"),
+        close_price=Decimal("3100"),
+        open_price=Decimal("3101"),
+    )
+
+    receiver = next(account for account in updated if account["account_id"] == "receiver")
+    assert receiver["positions"] == []
+
+
+def test_apply_group_result_caps_receiver_open_by_donor_available_qty() -> None:
+    accounts = [
+        {
+            "account_id": "donor",
+            "wallet_balance": "1000",
+            "total_unrealized_pnl": "0",
+            "equity": "1000",
+            "available_balance": "1000",
+            "margin": "10",
+            "margin_deficit": "0",
+            "positions": [
+                {
+                    "symbol": "ETHUSDC",
+                    "position_side": "LONG",
+                    "qty": "0.25",
+                    "mark_price": "3100",
+                    "unrealized_pnl": "0",
+                    "notional": "775",
+                    "margin": "10",
+                    "leverage": 75,
+                }
+            ],
+        },
+        {
+            "account_id": "receiver",
+            "wallet_balance": "1000",
+            "total_unrealized_pnl": "0",
+            "equity": "1000",
+            "available_balance": "1000",
+            "margin": "0",
+            "margin_deficit": "0",
+            "positions": [],
+        },
+    ]
+
+    updated = _apply_group_result_to_synthetic_accounts(
+        accounts,
+        {
+            "from_account_id": "donor",
+            "to_account_id": "receiver",
+            "side": "LONG",
+            "symbol": "ETHUSDC",
+        },
+        matched_qty=Decimal("1"),
+        close_price=Decimal("3100"),
+        open_price=Decimal("3101"),
+    )
+
+    donor = next(account for account in updated if account["account_id"] == "donor")
+    receiver = next(account for account in updated if account["account_id"] == "receiver")
+    assert Decimal(donor["positions"][0]["qty"]) == Decimal("0")
+    assert receiver["positions"][0]["qty"] == "0.25"
+
+
 def test_service_active_run_returns_latest_restorable_run_with_actions(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)
@@ -353,6 +448,36 @@ def test_service_active_run_returns_latest_restorable_run_with_actions(tmp_path)
     assert active["status"] == "plan_confirmed"
     assert active["available_actions"] == ["execute", "refresh_plan"]
     assert active["report_summary"]["group_count"] == 2
+
+
+def test_service_active_run_returns_group_completed_run_for_restore(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        repository.create_kanglong_run(
+            {
+                "run_id": "group-completed-open",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1"],
+                "status": KanglongRunStatus.GROUP_COMPLETED.value,
+                "plan_version": "plan-group",
+                "available_actions": [],
+                "progress": {"groups_completed": 1, "group_count": 2},
+                "report": {"summary": {"group_count": 2, "round_count": 8, "planned_release_qty": "1"}},
+                "created_at": "2026-05-17T04:00:00+00:00",
+                "updated_at": "2026-05-17T04:00:00+00:00",
+            }
+        )
+
+        active = service.active_run()
+    finally:
+        repository.close()
+
+    assert active is not None
+    assert active["run_id"] == "group-completed-open"
+    assert active["status"] == "group_completed"
+    assert active["progress"] == {"groups_completed": 1, "group_count": 2}
 
 
 def test_service_does_not_confirm_blocked_plan_or_store_idempotency(tmp_path) -> None:

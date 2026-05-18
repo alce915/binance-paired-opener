@@ -221,12 +221,17 @@ def _apply_group_result_to_synthetic_accounts(
     side = str(group.get("side") or "").strip().upper()
     from_account = _find_synthetic_account(accounts, str(group.get("from_account_id") or ""))
     to_account = _find_synthetic_account(accounts, str(group.get("to_account_id") or ""))
-    if from_account is not None:
-        from_position = _find_synthetic_position(from_account, side)
-        if from_position is not None:
-            next_qty = max(_decimal_payload_value(from_position.get("qty")) - matched_qty, Decimal("0"))
-            _update_existing_position_qty(from_position, next_qty, close_price)
-            _refresh_synthetic_account_totals(from_account)
+    if from_account is None:
+        return accounts
+    from_position = _find_synthetic_position(from_account, side)
+    if from_position is None:
+        return accounts
+    effective_matched_qty = min(matched_qty, _decimal_payload_value(from_position.get("qty")))
+    if effective_matched_qty <= Decimal("0"):
+        return accounts
+    next_qty = max(_decimal_payload_value(from_position.get("qty")) - effective_matched_qty, Decimal("0"))
+    _update_existing_position_qty(from_position, next_qty, close_price)
+    _refresh_synthetic_account_totals(from_account)
     if to_account is not None:
         to_position = _find_synthetic_position(to_account, side)
         if to_position is None:
@@ -234,7 +239,7 @@ def _apply_group_result_to_synthetic_accounts(
             to_position = _new_synthetic_position(to_account, group, Decimal("0"), open_price)
             positions.append(to_position)
             to_account["positions"] = positions
-        next_qty = _decimal_payload_value(to_position.get("qty")) + matched_qty
+        next_qty = _decimal_payload_value(to_position.get("qty")) + effective_matched_qty
         _update_existing_position_qty(to_position, next_qty, open_price)
         _refresh_synthetic_account_totals(to_account)
     return accounts

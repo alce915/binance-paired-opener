@@ -932,6 +932,15 @@ async def _collect_template_execution_market_inputs(stored: dict[str, Any]) -> d
     close_price, open_price = _orderbook_best_bid_ask(orderbook)
     config = load_kanglong_symbol_config(app.state.settings, symbol)
     main_snapshot, subaccount_snapshots = _template_execution_snapshots(stored)
+    if main_snapshot is None or subaccount_snapshots is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "blocked_plan_recheck_failed",
+                "reason_code": "template_account_snapshot_missing",
+                "run_id": stored.get("run_id"),
+            },
+        )
     selected_side_value = (stored.get("plan") or {}).get("selected_side")
     return {
         "close_price": close_price,
