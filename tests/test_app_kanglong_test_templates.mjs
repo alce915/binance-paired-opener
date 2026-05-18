@@ -5,6 +5,7 @@ import vm from "node:vm";
 
 const appSource = fs.readFileSync(path.join(process.cwd(), "paired_opener", "static", "app.js"), "utf8");
 const indexSource = fs.readFileSync(path.join(process.cwd(), "paired_opener", "static", "index.html"), "utf8");
+const zhSource = fs.readFileSync(path.join(process.cwd(), "i18n", "messages", "zh-CN.json"), "utf8");
 
 for (const id of [
   "kanglongTestTemplateButton",
@@ -32,6 +33,15 @@ assert.equal(
   false,
   "stale template copy should render through i18n instead of hard-coded JS text",
 );
+
+assert.match(
+  indexSource,
+  /id="kanglongTestTemplateCloseButton"[^>]*data-i18n-aria-label="console\.kanglong\.test_template\.close"[^>]*aria-label="关闭"/,
+  "template modal close button should localize its aria-label with UTF-8 fallback text",
+);
+assert.ok(appSource.includes("data-i18n-aria-label"), "app.js should apply localized aria-label attributes");
+const zhMessages = JSON.parse(zhSource);
+assert.equal(zhMessages["console.kanglong.test_template.close"], "关闭", "template close label should be localized in zh-CN");
 
 function appSlice(start, end) {
   const startIndex = appSource.indexOf(start);

@@ -824,6 +824,11 @@ function applyStaticI18n(root = document) {
     if (!key) return;
     element.textContent = copyOrDefault(key, key);
   });
+  root.querySelectorAll("[data-i18n-aria-label]").forEach((element) => {
+    const key = element.dataset.i18nAriaLabel;
+    if (!key) return;
+    element.setAttribute("aria-label", copyOrDefault(key, element.getAttribute("aria-label") || key));
+  });
 }
 
 function statusLabel(status) {
