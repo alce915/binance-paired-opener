@@ -54,5 +54,101 @@
   "kanglong.idempotency_conflict": {
     "key": "reasons.kanglong.idempotency_conflict",
     "params": []
+  },
+  "kanglong_test_template_not_found": {
+    "key": "reasons.kanglong.test_template.not_found",
+    "params": ["template_id", "backup"]
+  },
+  "kanglong_test_template_symbol_mismatch": {
+    "key": "reasons.kanglong.test_template.symbol_mismatch",
+    "params": ["template_symbol", "request_symbol"]
+  },
+  "kanglong_test_template_accounts_required": {
+    "key": "reasons.kanglong.test_template.accounts_required",
+    "params": []
+  },
+  "kanglong_test_template_account_mismatch": {
+    "key": "reasons.kanglong.test_template.account_mismatch",
+    "params": ["account_ids"]
+  },
+  "kanglong_test_template_market_data_account_required": {
+    "key": "reasons.kanglong.test_template.market_data_account_required",
+    "params": []
+  },
+  "kanglong_test_template_market_data_account_unavailable": {
+    "key": "reasons.kanglong.test_template.market_data_account_unavailable",
+    "params": ["account_id"]
+  },
+  "kanglong_test_template_invalid_id": {
+    "key": "reasons.kanglong.test_template.invalid_id",
+    "params": ["field", "value"]
+  },
+  "kanglong_test_template_invalid_decimal": {
+    "key": "reasons.kanglong.test_template.invalid_decimal",
+    "params": ["field", "value"]
+  },
+  "kanglong_test_template_negative_collateral": {
+    "key": "reasons.kanglong.test_template.negative_collateral",
+    "params": ["field", "value"]
+  },
+  "kanglong_test_template_invalid_leverage": {
+    "key": "reasons.kanglong.test_template.invalid_leverage",
+    "params": ["field", "value"]
+  },
+  "kanglong_test_template_non_positive_qty": {
+    "key": "reasons.kanglong.test_template.non_positive_qty",
+    "params": ["account_id", "field", "value"]
+  },
+  "kanglong_test_template_min_qty_not_met": {
+    "key": "reasons.kanglong.test_template.min_qty_not_met",
+    "params": ["account_id", "qty", "min_qty"]
+  },
+  "kanglong_test_template_min_notional_not_met": {
+    "key": "reasons.kanglong.test_template.min_notional_not_met",
+    "params": ["account_id", "notional", "min_notional"]
+  },
+  "kanglong_test_template_invalid_price": {
+    "key": "reasons.kanglong.test_template.invalid_price",
+    "params": ["account_id", "side", "field", "value"]
+  },
+  "kanglong_test_template_leverage_exceeded": {
+    "key": "reasons.kanglong.test_template.leverage_exceeded",
+    "params": ["account_id", "leverage", "max_leverage"]
+  },
+  "kanglong_test_template_quote_unavailable": {
+    "key": "reasons.kanglong.test_template.quote_unavailable",
+    "params": ["symbol"]
+  },
+  "kanglong_test_template_orderbook_unavailable": {
+    "key": "reasons.kanglong.test_template.orderbook_unavailable",
+    "params": ["symbol"]
+  },
+  "kanglong_test_template_store_corrupted": {
+    "key": "reasons.kanglong.test_template.store_corrupted",
+    "params": ["path", "error"]
+  },
+  "kanglong_test_template_store_write_conflict": {
+    "key": "reasons.kanglong.test_template.store_write_conflict",
+    "params": ["path"]
+  },
+  "kanglong_test_template_unsupported_version": {
+    "key": "reasons.kanglong.test_template.unsupported_version",
+    "params": ["path", "version"]
+  },
+  "kanglong_test_template_migration_failed": {
+    "key": "reasons.kanglong.test_template.migration_failed",
+    "params": ["path", "error"]
+  },
+  "kanglong_test_template_active_run_exists": {
+    "key": "reasons.kanglong.test_template.active_run_exists",
+    "params": ["run_id"]
+  },
+  "blocked_plan_stale": {
+    "key": "reasons.kanglong.blocked_plan_stale",
+    "params": ["run_id", "template_id", "current_template_content_hash", "requested_template_content_hash"]
+  },
+  "blocked_plan_recheck_failed": {
+    "key": "reasons.kanglong.blocked_plan_recheck_failed",
+    "params": ["run_id", "reason_code"]
   }
 }

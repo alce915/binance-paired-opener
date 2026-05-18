@@ -7,6 +7,47 @@ from app_i18n.runtime import event_registry, log_registry, messages, precheck_re
 from paired_opener.kanglong.models import KanglongRunStatus
 
 
+KANGLONG_TEMPLATE_MESSAGE_COPY = {
+    "console.kanglong.test_template.button": "测试模板",
+    "console.kanglong.test_template.modal_title": "亢龙测试账号模板",
+    "console.kanglong.test_template.library_title": "模板库",
+    "console.kanglong.test_template.market_data_account": "行情源账号",
+    "console.kanglong.test_template.save": "保存模板",
+    "console.kanglong.test_template.save_and_apply": "保存并应用",
+    "console.kanglong.test_template.preview": "预览快照",
+    "console.kanglong.test_template.exit_mode": "退出测试模板",
+    "console.kanglong.test_template.applied": "已应用测试模板",
+    "console.kanglong.test_template.snapshot_stale": "模板已更新，当前快照已过期",
+}
+
+KANGLONG_TEMPLATE_REASON_KEYS = {
+    "kanglong_test_template_not_found": "reasons.kanglong.test_template.not_found",
+    "kanglong_test_template_symbol_mismatch": "reasons.kanglong.test_template.symbol_mismatch",
+    "kanglong_test_template_accounts_required": "reasons.kanglong.test_template.accounts_required",
+    "kanglong_test_template_account_mismatch": "reasons.kanglong.test_template.account_mismatch",
+    "kanglong_test_template_market_data_account_required": "reasons.kanglong.test_template.market_data_account_required",
+    "kanglong_test_template_market_data_account_unavailable": "reasons.kanglong.test_template.market_data_account_unavailable",
+    "kanglong_test_template_invalid_id": "reasons.kanglong.test_template.invalid_id",
+    "kanglong_test_template_invalid_decimal": "reasons.kanglong.test_template.invalid_decimal",
+    "kanglong_test_template_negative_collateral": "reasons.kanglong.test_template.negative_collateral",
+    "kanglong_test_template_invalid_leverage": "reasons.kanglong.test_template.invalid_leverage",
+    "kanglong_test_template_non_positive_qty": "reasons.kanglong.test_template.non_positive_qty",
+    "kanglong_test_template_min_qty_not_met": "reasons.kanglong.test_template.min_qty_not_met",
+    "kanglong_test_template_min_notional_not_met": "reasons.kanglong.test_template.min_notional_not_met",
+    "kanglong_test_template_invalid_price": "reasons.kanglong.test_template.invalid_price",
+    "kanglong_test_template_leverage_exceeded": "reasons.kanglong.test_template.leverage_exceeded",
+    "kanglong_test_template_quote_unavailable": "reasons.kanglong.test_template.quote_unavailable",
+    "kanglong_test_template_orderbook_unavailable": "reasons.kanglong.test_template.orderbook_unavailable",
+    "kanglong_test_template_store_corrupted": "reasons.kanglong.test_template.store_corrupted",
+    "kanglong_test_template_store_write_conflict": "reasons.kanglong.test_template.store_write_conflict",
+    "kanglong_test_template_unsupported_version": "reasons.kanglong.test_template.unsupported_version",
+    "kanglong_test_template_migration_failed": "reasons.kanglong.test_template.migration_failed",
+    "kanglong_test_template_active_run_exists": "reasons.kanglong.test_template.active_run_exists",
+    "blocked_plan_stale": "reasons.kanglong.blocked_plan_stale",
+    "blocked_plan_recheck_failed": "reasons.kanglong.blocked_plan_recheck_failed",
+}
+
+
 def load_messages() -> dict[str, str]:
     return json.loads(Path("i18n/messages/zh-CN.json").read_text(encoding="utf-8"))
 
@@ -77,6 +118,22 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
     assert group_simulated["level"] == "info"
     assert reason_registry()["kanglong.blocked_plan_stale"]["key"] == "reasons.kanglong.blocked_plan_stale"
     assert reason_registry()["kanglong.idempotency_conflict"]["key"] == "reasons.kanglong.idempotency_conflict"
+
+
+def test_kanglong_test_template_ui_messages_exist() -> None:
+    catalog = load_messages()
+
+    for key, expected_copy in KANGLONG_TEMPLATE_MESSAGE_COPY.items():
+        assert catalog[key] == expected_copy
+
+
+def test_kanglong_test_template_reason_registry_entries_have_messages() -> None:
+    catalog = load_messages()
+    registry = reason_registry()
+
+    for code, message_key in KANGLONG_TEMPLATE_REASON_KEYS.items():
+        assert registry[code]["key"] == message_key
+        assert message_key in catalog
 
 
 def test_all_kanglong_run_statuses_have_display_copy() -> None:
