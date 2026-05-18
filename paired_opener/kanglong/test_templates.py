@@ -113,9 +113,11 @@ def build_template_preview_payload(
     main_collateral = _decimal_value(main["collateral"], field_name="main_account.collateral")
     accounts.append(
         {
-            "id": main_account_id,
+            "account_id": main_account_id,
             "template_account_id": main["account_id"],
+            "name": main["name"],
             "role": "main",
+            "collateral": _decimal_payload(main_collateral),
             "wallet_balance": _decimal_payload(main_collateral),
             "total_unrealized_pnl": "0",
             "equity": _decimal_payload(main_collateral),
@@ -191,9 +193,12 @@ def build_template_preview_payload(
         margin_deficit = abs(equity - margin) if equity - margin < 0 else Decimal("0")
         accounts.append(
             {
-                "id": account_id,
+                "account_id": account_id,
                 "template_account_id": subaccount["account_id"],
+                "row_id": subaccount["row_id"],
+                "name": subaccount["name"],
                 "role": "subaccount",
+                "collateral": _decimal_payload(collateral),
                 "wallet_balance": _decimal_payload(collateral),
                 "total_unrealized_pnl": _decimal_payload(total_unrealized_pnl),
                 "equity": _decimal_payload(equity),

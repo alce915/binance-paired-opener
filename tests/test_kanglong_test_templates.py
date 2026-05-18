@@ -91,8 +91,9 @@ def test_canonical_decimal_text_is_stable() -> None:
 
 
 def test_build_template_preview_payload_uses_quote_mid_and_orderbook_top_for_account_math() -> None:
+    template = template_payload()
     payload = build_template_preview_payload(
-        template_payload(),
+        template,
         preview_quote(),
         preview_orderbook(),
         preview_rules(),
@@ -129,17 +130,27 @@ def test_build_template_preview_payload_uses_quote_mid_and_orderbook_top_for_acc
     assert payload["blocks"] == []
 
     main, sub = payload["accounts"]
-    assert main["id"] == "tpl:tpl_eth_drop_001:main"
+    assert "id" not in main
+    assert main["account_id"] == "tpl:tpl_eth_drop_001:main"
+    assert main["template_account_id"] == "test-main"
+    assert main["name"] == template["main_account"]["name"]
     assert main["role"] == "main"
+    assert as_decimal(main["collateral"]) == Decimal("10000")
     assert main["positions"] == []
     assert as_decimal(main["wallet_balance"]) == Decimal("10000")
+    assert as_decimal(main["total_unrealized_pnl"]) == Decimal("0")
     assert as_decimal(main["equity"]) == Decimal("10000")
     assert as_decimal(main["available_balance"]) == Decimal("10000")
     assert as_decimal(main["margin"]) == Decimal("0")
     assert as_decimal(main["margin_deficit"]) == Decimal("0")
 
-    assert sub["id"] == "tpl:tpl_eth_drop_001:sub:sub-1"
+    assert "id" not in sub
+    assert sub["account_id"] == "tpl:tpl_eth_drop_001:sub:sub-1"
+    assert sub["template_account_id"] == "test-sub-1"
+    assert sub["row_id"] == "sub-1"
+    assert sub["name"] == template["subaccounts"][0]["name"]
     assert sub["role"] == "subaccount"
+    assert as_decimal(sub["collateral"]) == Decimal("5000")
     assert as_decimal(sub["wallet_balance"]) == Decimal("5000")
     assert as_decimal(sub["total_unrealized_pnl"]) == Decimal("-3100")
     assert as_decimal(sub["equity"]) == Decimal("1900")
