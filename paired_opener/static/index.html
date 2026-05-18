@@ -232,6 +232,81 @@
         color: #fffaf3;
         border-color: var(--ink);
       }
+      .modal.hidden { display: none; }
+      .modal {
+        position: fixed;
+        inset: 0;
+        z-index: 60;
+        display: grid;
+        place-items: center;
+        padding: 18px;
+        background: rgba(29, 26, 22, 0.42);
+      }
+      .modal-panel {
+        width: min(980px, 100%);
+        max-height: min(760px, calc(100vh - 36px));
+        overflow: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--surface);
+        box-shadow: 0 18px 52px rgba(29, 26, 22, 0.2);
+      }
+      .modal-header,
+      .modal-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--border);
+      }
+      .modal-footer {
+        justify-content: flex-end;
+        border-top: 1px solid var(--border);
+        border-bottom: none;
+      }
+      .modal-header h2 {
+        margin: 0;
+        font-size: 20px;
+      }
+      .modal-header button,
+      .modal-footer button,
+      .kanglong-template-library button {
+        width: auto;
+      }
+      .icon-button {
+        min-width: 38px;
+        min-height: 38px;
+        padding: 8px 10px;
+        background: #6e6253;
+      }
+      .kanglong-template-grid {
+        display: grid;
+        grid-template-columns: 220px minmax(0, 1fr) minmax(240px, 0.8fr);
+        gap: 12px;
+        padding: 16px;
+      }
+      .kanglong-template-library,
+      .kanglong-template-editor,
+      .kanglong-template-preview {
+        min-width: 0;
+        display: grid;
+        align-content: start;
+        gap: 10px;
+      }
+      .kanglong-template-editor textarea {
+        min-height: 320px;
+        resize: vertical;
+        font-family: Consolas, Monaco, monospace;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      .kanglong-template-preview {
+        padding: 10px;
+        border: 1px solid rgba(216, 197, 170, 0.8);
+        border-radius: 8px;
+        background: #fffdf8;
+      }
       .compact-actions {
         display: grid;
         gap: 10px;
@@ -727,7 +802,8 @@
       .mono { font-variant-numeric: tabular-nums; font-family: Consolas, Monaco, monospace; }
       @media (max-width: 860px) {
         .kanglong-layout,
-        .kanglong-toolbar { grid-template-columns: 1fr; }
+        .kanglong-toolbar,
+        .kanglong-template-grid { grid-template-columns: 1fr; }
       }
       @media (max-width: 1240px) {
         .dashboard,
@@ -784,7 +860,10 @@
         </div>
         <div class="kanglong-layout">
           <section class="card kanglong-account-section">
-            <h2 class="card-title" data-i18n="console.kanglong.account_pool.title"></h2>
+            <div class="card-header">
+              <h2 class="card-title" data-i18n="console.kanglong.account_pool.title"></h2>
+              <button id="kanglongTestTemplateButton" class="inline-btn secondary" type="button" data-i18n="console.kanglong.test_template.button">测试模板</button>
+            </div>
             <div id="kanglongMainAccountCard" class="kanglong-compact-list"></div>
             <div class="kanglong-account-toolbar">
               <button id="kanglongAddSelectedBtn" class="inline-btn success" type="button" data-i18n="console.kanglong.actions.add_selected" disabled></button>
@@ -806,6 +885,24 @@
           <div id="kanglongExecutionLog" class="kanglong-execution-log"></div>
         </section>
       </section>
+
+      <div id="kanglongTestTemplateModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="kanglongTestTemplateTitle">
+        <div class="modal-panel kanglong-template-modal">
+          <header class="modal-header">
+            <h2 id="kanglongTestTemplateTitle" data-i18n="console.kanglong.test_template.modal_title">亢龙测试账号模板</h2>
+            <button id="kanglongTestTemplateCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+          </header>
+          <section class="kanglong-template-grid">
+            <aside id="kanglongTemplateLibrary" class="kanglong-template-library" aria-labelledby="kanglongTestTemplateTitle"></aside>
+            <section id="kanglongTemplateEditor" class="kanglong-template-editor"></section>
+            <section id="kanglongTemplatePreview" class="kanglong-template-preview" aria-live="polite"></section>
+          </section>
+          <footer class="modal-footer">
+            <button id="kanglongTemplateSaveButton" class="secondary" type="button" data-i18n="console.kanglong.test_template.save">保存模板</button>
+            <button id="kanglongTemplateSaveApplyButton" class="success" type="button" data-i18n="console.kanglong.test_template.save_and_apply">保存并应用</button>
+          </footer>
+        </div>
+      </div>
 
       <section class="dashboard" data-trading-only>
         <div class="left-col">

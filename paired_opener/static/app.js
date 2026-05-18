@@ -55,6 +55,14 @@ const kanglongSelectedSubaccounts = document.getElementById("kanglongSelectedSub
 const kanglongPlanSummary = document.getElementById("kanglongPlanSummary");
 const kanglongLogFilters = document.getElementById("kanglongLogFilters");
 const kanglongExecutionLog = document.getElementById("kanglongExecutionLog");
+const kanglongTestTemplateButton = document.getElementById("kanglongTestTemplateButton");
+const kanglongTestTemplateModal = document.getElementById("kanglongTestTemplateModal");
+const kanglongTestTemplateCloseButton = document.getElementById("kanglongTestTemplateCloseButton");
+const kanglongTemplateLibrary = document.getElementById("kanglongTemplateLibrary");
+const kanglongTemplateEditor = document.getElementById("kanglongTemplateEditor");
+const kanglongTemplatePreview = document.getElementById("kanglongTemplatePreview");
+const kanglongTemplateSaveButton = document.getElementById("kanglongTemplateSaveButton");
+const kanglongTemplateSaveApplyButton = document.getElementById("kanglongTemplateSaveApplyButton");
 const executionSummaryBanner = document.getElementById("executionSummaryBanner");
 const executionSummaryText = document.getElementById("executionSummaryText");
 const executionRiskBanner = document.getElementById("executionRiskBanner");
@@ -85,6 +93,8 @@ const modePanels = {
 };
 const DEFAULT_SYMBOL = "ETHUSDC";
 const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
+const KANGLONG_ACCOUNT_SOURCE_RUNTIME = "runtime";
+const KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE = "test_template";
 const KANGLONG_LOG_FILTERS = ["all", "warning", "error", "current_group", "cost", "ledger"];
 let eventSource = null;
 let executionMode = "paired_open";
@@ -107,10 +117,18 @@ const kanglongState = {
   confirmedPlanVersion: "",
   latestEventId: 0,
   seenEventIds: new Set(),
+  events: [],
   logFilter: "all",
   accountSnapshotRefreshTimer: null,
   accountSnapshotsLoading: false,
   accountSnapshotsLoaded: false,
+  accountSource: KANGLONG_ACCOUNT_SOURCE_RUNTIME,
+  testTemplates: [],
+  activeTestTemplateId: null,
+  activeTemplateContentHash: null,
+  marketDataAccountId: null,
+  templatePreview: null,
+  realAccountPoolSnapshot: null,
 };
 let kanglongActiveRunRestored = false;
 let whitelistSymbols = [];
@@ -943,6 +961,30 @@ function request(path, options = {}) {
   });
 }
 
+function fetchKanglongTestTemplates() {
+  return request("/kanglong/simulation/test-templates");
+}
+
+function saveKanglongTestTemplate(template = {}) {
+  const templateId = String(template.id || "").trim();
+  const url = templateId
+    ? `/kanglong/simulation/test-templates/${encodeURIComponent(templateId)}`
+    : "/kanglong/simulation/test-templates";
+  return request(url, {
+    method: templateId ? "PUT" : "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(template),
+  });
+}
+
+function previewKanglongTestTemplate(templateId, marketDataAccountId) {
+  return request(`/kanglong/simulation/test-templates/${encodeURIComponent(templateId)}/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ market_data_account_id: marketDataAccountId }),
+  });
+}
+
 function formatNumber(value, digits = 8) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "0";
@@ -1457,14 +1499,64 @@ function ensureKanglongMainAccount(accounts = availableAccounts) {
   return kanglongState.mainAccountId;
 }
 
+function renderKanglongWorkspace() {
+  renderKanglongAccountPool(availableAccounts);
+  renderKanglongLogFilters();
+  if (kanglongState.plan) {
+    renderKanglongPlanSummary(kanglongState.plan);
+  }
+  syncKanglongWorkflowButtons(kanglongState.plan);
+}
+
 function invalidateKanglongPlan() {
   kanglongState.plan = null;
   kanglongState.confirmedPlanVersion = "";
   kanglongState.latestEventId = 0;
   kanglongState.seenEventIds.clear();
+  kanglongState.events = [];
   if (kanglongConfirmPlanBtn) kanglongConfirmPlanBtn.disabled = true;
   if (kanglongExecutePlanBtn) kanglongExecutePlanBtn.disabled = true;
   if (kanglongPlanSummary) kanglongPlanSummary.replaceChildren();
+}
+
+function applyKanglongTemplatePreview(preview = {}) {
+  const previewAccounts = Array.isArray(preview.accounts) ? preview.accounts : [];
+  if (kanglongState.accountSource !== KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    kanglongState.realAccountPoolSnapshot = [...availableAccounts];
+  }
+  kanglongState.accountSource = KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE;
+  kanglongState.activeTestTemplateId = preview.template_id || preview.templateId || null;
+  kanglongState.activeTemplateContentHash = preview.template_content_hash || preview.templateContentHash || null;
+  kanglongState.marketDataAccountId = preview.market_data_account_id || preview.marketDataAccountId || kanglongState.marketDataAccountId || currentAccount.id || null;
+  kanglongState.templatePreview = preview;
+  availableAccounts = previewAccounts;
+  const mainAccount = previewAccounts.find((account) => String(account?.role || "").toLowerCase() === "main") || previewAccounts[0];
+  kanglongState.mainAccountId = kanglongAccountId(mainAccount);
+  kanglongState.selectedSubaccountIds.clear();
+  kanglongState.checkedPoolAccountIds.clear();
+  invalidateKanglongPlan();
+  if (kanglongExecutionLog) {
+    setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
+  }
+  renderKanglongWorkspace();
+  return preview;
+}
+
+function exitKanglongTemplateMode() {
+  kanglongState.accountSource = KANGLONG_ACCOUNT_SOURCE_RUNTIME;
+  kanglongState.activeTestTemplateId = null;
+  kanglongState.activeTemplateContentHash = null;
+  kanglongState.marketDataAccountId = null;
+  kanglongState.templatePreview = null;
+  availableAccounts = Array.isArray(kanglongState.realAccountPoolSnapshot)
+    ? kanglongState.realAccountPoolSnapshot
+    : [];
+  kanglongState.realAccountPoolSnapshot = null;
+  kanglongState.mainAccountId = "";
+  kanglongState.selectedSubaccountIds.clear();
+  kanglongState.checkedPoolAccountIds.clear();
+  invalidateKanglongPlan();
+  renderKanglongWorkspace();
 }
 
 function newKanglongIdempotencyKey(prefix) {
@@ -1637,16 +1729,24 @@ async function createKanglongPlan() {
   if (!mainAccountId || subaccountIds.length === 0) {
     throw new Error(copyOrDefault("runtime.kanglong.account_selection_required", "请选择主账号和至少一个子账号。"));
   }
+  const accountSource = kanglongState.accountSource || KANGLONG_ACCOUNT_SOURCE_RUNTIME;
+  const requestBody = {
+    mode: "simulation",
+    symbol: kanglongSymbol?.value || DEFAULT_SYMBOL,
+    main_account_id: mainAccountId,
+    subaccount_ids: subaccountIds,
+    selected_side: kanglongSide?.value || null,
+    account_source: accountSource,
+  };
+  if (accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    requestBody.test_template_id = kanglongState.activeTestTemplateId;
+    requestBody.template_content_hash = kanglongState.activeTemplateContentHash;
+    requestBody.market_data_account_id = kanglongState.marketDataAccountId;
+  }
   const payload = await request(KANGLONG_PLAN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      mode: "simulation",
-      symbol: kanglongSymbol?.value || DEFAULT_SYMBOL,
-      main_account_id: mainAccountId,
-      subaccount_ids: subaccountIds,
-      selected_side: kanglongSide?.value || null,
-    }),
+    body: JSON.stringify(requestBody),
   });
   kanglongState.plan = payload;
   kanglongState.confirmedPlanVersion = "";
@@ -1749,6 +1849,39 @@ function restoreKanglongSelectionFromPayload(payload = {}) {
   }
 }
 
+function restoreKanglongTemplateModeFromActive(payload = {}) {
+  const requestPayload = payload.request && typeof payload.request === "object" ? payload.request : {};
+  if (requestPayload.account_source !== KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    return false;
+  }
+  const report = payload.report && typeof payload.report === "object" ? payload.report : {};
+  const syntheticState = report.synthetic_account_state && typeof report.synthetic_account_state === "object"
+    ? report.synthetic_account_state
+    : {};
+  const accountSnapshot = report.account_snapshot && typeof report.account_snapshot === "object"
+    ? report.account_snapshot
+    : {};
+  const syntheticAccounts = Array.isArray(syntheticState.accounts) ? syntheticState.accounts : [];
+  const snapshotAccounts = Array.isArray(accountSnapshot.accounts) ? accountSnapshot.accounts : [];
+  const restoredAccounts = syntheticAccounts.length ? syntheticAccounts : snapshotAccounts;
+  if (!restoredAccounts.length) return false;
+  if (kanglongState.accountSource !== KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    kanglongState.realAccountPoolSnapshot = [...availableAccounts];
+  }
+  kanglongState.accountSource = KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE;
+  kanglongState.activeTestTemplateId = requestPayload.test_template_id || accountSnapshot.template_id || payload.test_template_id || null;
+  kanglongState.activeTemplateContentHash = requestPayload.template_content_hash || accountSnapshot.template_content_hash || syntheticState.template_content_hash || null;
+  kanglongState.marketDataAccountId = requestPayload.market_data_account_id || payload.market_data_account_id || null;
+  kanglongState.templatePreview = {
+    template_id: kanglongState.activeTestTemplateId,
+    template_content_hash: kanglongState.activeTemplateContentHash,
+    market_data_account_id: kanglongState.marketDataAccountId,
+    accounts: restoredAccounts,
+  };
+  availableAccounts = restoredAccounts;
+  return true;
+}
+
 async function restoreActiveKanglongRun() {
   if (kanglongActiveRunRestored) return kanglongState.plan;
   let payload = null;
@@ -1780,6 +1913,7 @@ async function restoreActiveKanglongRun() {
   ) ? planVersion : "";
   kanglongState.latestEventId = 0;
   kanglongState.seenEventIds.clear();
+  restoreKanglongTemplateModeFromActive(payload);
   restoreKanglongSelectionFromPayload(payload);
   renderKanglongAccountPool(availableAccounts);
   if (kanglongExecutionLog) {
@@ -1911,6 +2045,10 @@ async function loadAccounts() {
 }
 
 async function refreshKanglongAccountSnapshots() {
+  if (kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    renderKanglongAccountPool(availableAccounts);
+    return availableAccounts;
+  }
   const symbol = selectedKanglongSymbol();
   kanglongState.accountSnapshotsLoading = true;
   kanglongState.accountSnapshotsLoaded = false;
@@ -3602,6 +3740,185 @@ async function applyAppPage(page) {
   return true;
 }
 
+function selectedKanglongTemplate() {
+  const templateId = kanglongState.activeTestTemplateId;
+  if (!templateId) return kanglongState.testTemplates[0] || null;
+  return kanglongState.testTemplates.find((template) => template.id === templateId) || kanglongState.testTemplates[0] || null;
+}
+
+function readKanglongTemplateEditorPayload() {
+  const editor = document.getElementById("kanglongTemplateEditorText");
+  if (!editor) return selectedKanglongTemplate() || {};
+  return JSON.parse(editor.value || "{}");
+}
+
+function kanglongMarketDataAccountOptions() {
+  const realSnapshot = Array.isArray(kanglongState.realAccountPoolSnapshot)
+    ? kanglongState.realAccountPoolSnapshot
+    : [];
+  if (kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE && realSnapshot.length) {
+    return realSnapshot;
+  }
+  return availableAccounts;
+}
+
+function renderKanglongTemplateLibrary() {
+  if (!kanglongTemplateLibrary) return;
+  kanglongTemplateLibrary.replaceChildren();
+  const title = document.createElement("strong");
+  title.textContent = copyOrDefault("console.kanglong.test_template.library_title", "模板库");
+  kanglongTemplateLibrary.appendChild(title);
+  const templates = Array.isArray(kanglongState.testTemplates) ? kanglongState.testTemplates : [];
+  if (!templates.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = copyOrDefault("console.kanglong.test_template.library_empty", "暂无测试模板");
+    kanglongTemplateLibrary.appendChild(empty);
+    return;
+  }
+  templates.forEach((template) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = template.id === kanglongState.activeTestTemplateId ? "inline-btn success" : "inline-btn secondary";
+    button.textContent = template.name || template.id || "--";
+    button.addEventListener("click", () => {
+      kanglongState.activeTestTemplateId = template.id || null;
+      kanglongState.activeTemplateContentHash = template.template_content_hash || null;
+      renderKanglongTestTemplateModal();
+    });
+    kanglongTemplateLibrary.appendChild(button);
+  });
+}
+
+function renderKanglongTemplateEditor() {
+  if (!kanglongTemplateEditor) return;
+  kanglongTemplateEditor.replaceChildren();
+  const template = selectedKanglongTemplate() || {};
+  const marketField = document.createElement("div");
+  marketField.className = "field";
+  const marketLabel = document.createElement("label");
+  marketLabel.htmlFor = "kanglongTemplateMarketDataAccount";
+  marketLabel.textContent = copyOrDefault("console.kanglong.test_template.market_data_account", "行情源账号");
+  const marketSelect = document.createElement("select");
+  marketSelect.id = "kanglongTemplateMarketDataAccount";
+  let marketAccounts = kanglongMarketDataAccountOptions();
+  if (!marketAccounts.length && currentAccount?.id) {
+    marketAccounts = [currentAccount];
+  }
+  marketAccounts.forEach((account) => {
+    const option = document.createElement("option");
+    option.value = account.id || account.account_id || "";
+    option.textContent = account.name || account.account_id || account.id || "--";
+    marketSelect.appendChild(option);
+  });
+  marketSelect.value = kanglongState.marketDataAccountId || currentAccount.id || marketSelect.value;
+  marketSelect.addEventListener("change", () => {
+    kanglongState.marketDataAccountId = marketSelect.value || null;
+  });
+  marketField.append(marketLabel, marketSelect);
+
+  const editorField = document.createElement("div");
+  editorField.className = "field";
+  const editorLabel = document.createElement("label");
+  editorLabel.htmlFor = "kanglongTemplateEditorText";
+  editorLabel.textContent = copyOrDefault("console.kanglong.test_template.modal_title", "亢龙测试账号模板");
+  const textarea = document.createElement("textarea");
+  textarea.id = "kanglongTemplateEditorText";
+  textarea.spellcheck = false;
+  textarea.value = JSON.stringify(template, null, 2);
+  editorField.append(editorLabel, textarea);
+  kanglongTemplateEditor.append(marketField, editorField);
+}
+
+function renderKanglongTemplatePreviewPanel() {
+  if (!kanglongTemplatePreview) return;
+  kanglongTemplatePreview.replaceChildren();
+  const preview = kanglongState.templatePreview;
+  if (preview) {
+    const hashChanged = kanglongState.activeTemplateContentHash
+      && preview.template_content_hash
+      && preview.template_content_hash !== kanglongState.activeTemplateContentHash;
+    const status = document.createElement("div");
+    status.textContent = hashChanged
+      ? copyOrDefault("console.kanglong.test_template.snapshot_stale", "console.kanglong.test_template.snapshot_stale")
+      : copyOrDefault("console.kanglong.test_template.applied", "已应用测试模板");
+    kanglongTemplatePreview.appendChild(status);
+    const accounts = Array.isArray(preview.accounts) ? preview.accounts : [];
+    accounts.forEach((account) => {
+      const row = document.createElement("div");
+      row.className = "kanglong-account-detail";
+      row.textContent = `${account.role || "--"} · ${account.name || account.account_id || account.id || "--"}`;
+      kanglongTemplatePreview.appendChild(row);
+    });
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = copyOrDefault("console.kanglong.test_template.preview", "预览快照");
+    kanglongTemplatePreview.appendChild(empty);
+  }
+  if (kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    const exitButton = document.createElement("button");
+    exitButton.type = "button";
+    exitButton.className = "inline-btn secondary";
+    exitButton.textContent = copyOrDefault("console.kanglong.test_template.exit_mode", "退出测试模板");
+    exitButton.addEventListener("click", () => {
+      exitKanglongTemplateMode();
+      renderKanglongTestTemplateModal();
+    });
+    kanglongTemplatePreview.appendChild(exitButton);
+  }
+}
+
+function renderKanglongTestTemplateModal() {
+  renderKanglongTemplateLibrary();
+  renderKanglongTemplateEditor();
+  renderKanglongTemplatePreviewPanel();
+}
+
+async function openKanglongTestTemplateModal() {
+  if (!kanglongTestTemplateModal) return;
+  kanglongTestTemplateModal.classList.remove("hidden");
+  try {
+    const payload = await fetchKanglongTestTemplates();
+    kanglongState.testTemplates = Array.isArray(payload?.templates) ? payload.templates : [];
+    const activeTemplate = selectedKanglongTemplate();
+    if (activeTemplate) {
+      kanglongState.activeTestTemplateId = activeTemplate.id || null;
+      kanglongState.activeTemplateContentHash = activeTemplate.template_content_hash || kanglongState.activeTemplateContentHash;
+    }
+  } catch (error) {
+    appendLog("error", "", undefined, {
+      messageCode: "runtime.kanglong.request_failed",
+      messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+    });
+  }
+  renderKanglongTestTemplateModal();
+}
+
+function closeKanglongTestTemplateModal() {
+  kanglongTestTemplateModal?.classList.add("hidden");
+}
+
+async function saveCurrentKanglongTemplate({ applyPreview = false } = {}) {
+  const template = readKanglongTemplateEditorPayload();
+  const payload = await saveKanglongTestTemplate(template);
+  const savedTemplate = payload?.template || payload;
+  const savedTemplateId = savedTemplate?.id || template.id;
+  kanglongState.testTemplates = [
+    ...kanglongState.testTemplates.filter((item) => item.id !== savedTemplateId),
+    savedTemplate,
+  ].filter(Boolean);
+  kanglongState.activeTestTemplateId = savedTemplateId || null;
+  kanglongState.activeTemplateContentHash = savedTemplate?.template_content_hash || null;
+  if (applyPreview && savedTemplateId) {
+    const marketDataAccountId = kanglongState.marketDataAccountId || document.getElementById("kanglongTemplateMarketDataAccount")?.value || currentAccount.id;
+    const preview = await previewKanglongTestTemplate(savedTemplateId, marketDataAccountId);
+    applyKanglongTemplatePreview({ ...preview, market_data_account_id: marketDataAccountId });
+  }
+  renderKanglongTestTemplateModal();
+  return savedTemplate;
+}
+
 function buildSimulationRunPayload(mode = executionMode) {
   switch (normalizeSessionKind(mode)) {
     case "paired_close":
@@ -5219,6 +5536,25 @@ kanglongAddSelectedBtn?.addEventListener("click", addSelectedKanglongAccounts);
 kanglongDetectPlanBtn?.addEventListener("click", () => runKanglongWorkflowAction(kanglongDetectPlanBtn, createKanglongPlan));
 kanglongConfirmPlanBtn?.addEventListener("click", () => runKanglongWorkflowAction(kanglongConfirmPlanBtn, confirmKanglongPlan));
 kanglongExecutePlanBtn?.addEventListener("click", () => runKanglongWorkflowAction(kanglongExecutePlanBtn, executeKanglongPlan));
+kanglongTestTemplateButton?.addEventListener("click", () => {
+  openKanglongTestTemplateModal().catch((error) => appendLog("error", "", undefined, {
+    messageCode: "runtime.kanglong.request_failed",
+    messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+  }));
+});
+kanglongTestTemplateCloseButton?.addEventListener("click", closeKanglongTestTemplateModal);
+kanglongTemplateSaveButton?.addEventListener("click", () => {
+  saveCurrentKanglongTemplate().catch((error) => appendLog("error", "", undefined, {
+    messageCode: "runtime.kanglong.request_failed",
+    messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+  }));
+});
+kanglongTemplateSaveApplyButton?.addEventListener("click", () => {
+  saveCurrentKanglongTemplate({ applyPreview: true }).catch((error) => appendLog("error", "", undefined, {
+    messageCode: "runtime.kanglong.request_failed",
+    messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+  }));
+});
 kanglongSymbol?.addEventListener("input", () => {
   invalidateKanglongPlan();
   renderKanglongAccountPool();

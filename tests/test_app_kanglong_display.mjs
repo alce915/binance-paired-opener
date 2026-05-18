@@ -17,6 +17,11 @@ for (const id of [
   "kanglongPlanSummary",
   "kanglongLogFilters",
   "kanglongExecutionLog",
+  "kanglongTestTemplateButton",
+  "kanglongTestTemplateModal",
+  "kanglongTemplateLibrary",
+  "kanglongTemplateEditor",
+  "kanglongTemplatePreview",
 ]) {
   assert.ok(indexSource.includes(`id="${id}"`), `${id} should exist in index.html`);
 }
@@ -46,6 +51,11 @@ for (const symbol of [
   "formatKanglongStatus",
   "appendKanglongExecutionEvent",
   "newKanglongIdempotencyKey",
+  "fetchKanglongTestTemplates",
+  "saveKanglongTestTemplate",
+  "previewKanglongTestTemplate",
+  "applyKanglongTemplatePreview",
+  "exitKanglongTemplateMode",
 ]) {
   assert.ok(appSource.includes(symbol), `${symbol} should be implemented in app.js`);
 }
@@ -148,6 +158,8 @@ function makeKanglongHarness(requestImpl) {
   const script = `
     const DEFAULT_SYMBOL = "ETHUSDC";
     const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
+    const KANGLONG_ACCOUNT_SOURCE_RUNTIME = "runtime";
+    const KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE = "test_template";
     const KANGLONG_LOG_FILTERS = ["all", "warning", "error", "current_group", "cost", "ledger"];
     const APP_LOCALE = "zh-CN";
     const APP_TIMEZONE = "Asia/Shanghai";
@@ -178,7 +190,7 @@ function makeKanglongHarness(requestImpl) {
       "runtime.kanglong.account_selection_required": "请选择主账号和至少一个子账号。",
     };
     const currentAccount = { id: "main" };
-    const availableAccounts = [];
+    let availableAccounts = [];
     const kanglongState = {
       mainAccountId: "main",
       selectedSubaccountIds: new Set(["sub1"]),
@@ -192,7 +204,15 @@ function makeKanglongHarness(requestImpl) {
       confirmedPlanVersion: "old-plan",
       latestEventId: 0,
       seenEventIds: new Set(),
+      events: [],
       logFilter: "all",
+      accountSource: KANGLONG_ACCOUNT_SOURCE_RUNTIME,
+      testTemplates: [],
+      activeTestTemplateId: null,
+      activeTemplateContentHash: null,
+      marketDataAccountId: null,
+      templatePreview: null,
+      realAccountPoolSnapshot: null,
     };
     let kanglongActiveRunRestored = false;
     const kanglongConfirmPlanBtn = { disabled: false };
@@ -513,6 +533,58 @@ for (const [status, label] of Object.entries(kanglongStatusLabels)) {
   assert.equal(JSON.stringify(api.renderAccountPoolCalls[0].selectedSubaccountIds), JSON.stringify(["sub-active"]), "account pool rerender should see restored subaccounts");
   assert.equal(api.renderAccountPoolCalls[0].symbol, "BTCUSDC", "account pool rerender should see restored symbol");
   assert.equal(api.renderAccountPoolCalls[0].side, "SHORT", "account pool rerender should see restored side");
+}
+
+{
+  const api = makeKanglongHarness(async (requestPath) => {
+    if (requestPath === "/kanglong/simulation/run/active") {
+      return {
+        run_id: "active-template-run",
+        status: "plan_confirmed",
+        plan_version: "plan-template",
+        latest_event_id: 0,
+        available_actions: ["execute"],
+        request: {
+          account_source: "test_template",
+          test_template_id: "tpl_eth_drop_001",
+          template_content_hash: "sha256:template-v1",
+          market_data_account_id: "market-main",
+          main_account_id: "tpl:tpl_eth_drop_001:main",
+          subaccount_ids: ["tpl:tpl_eth_drop_001:sub:sub-1"],
+        },
+        report: {
+          synthetic_account_state: {
+            accounts: [
+              { account_id: "tpl:tpl_eth_drop_001:main", name: "Synthetic Main", role: "main" },
+              { account_id: "tpl:tpl_eth_drop_001:sub:sub-1", name: "Synthetic Sub", role: "subaccount" },
+            ],
+          },
+          account_snapshot: {
+            accounts: [
+              { account_id: "tpl:tpl_eth_drop_001:main", name: "Snapshot Main", role: "main" },
+            ],
+          },
+        },
+      };
+    }
+    return {
+      run_id: "active-template-run",
+      events: [],
+      next_after_event_id: 0,
+      latest_event_id: 0,
+      has_more: false,
+    };
+  });
+
+  await api.restoreActiveKanglongRun();
+
+  assert.equal(api.state.accountSource, "test_template", "active template run should restore template account source");
+  assert.equal(api.state.activeTestTemplateId, "tpl_eth_drop_001", "active template run should restore template id");
+  assert.equal(api.state.activeTemplateContentHash, "sha256:template-v1", "active template run should restore template hash");
+  assert.equal(api.state.marketDataAccountId, "market-main", "active template run should restore market data account id");
+  assert.equal(api.state.mainAccountId, "tpl:tpl_eth_drop_001:main", "template main account should be resolved after replacing the account pool");
+  assert.deepEqual(Array.from(api.state.selectedSubaccountIds), ["tpl:tpl_eth_drop_001:sub:sub-1"], "template subaccount should be restored after replacing the account pool");
+  assert.equal(api.renderAccountPoolCalls[0].accounts[0].name, "Synthetic Main", "active restore should prefer synthetic account state over the original snapshot");
 }
 
 {
