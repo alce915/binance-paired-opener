@@ -53,6 +53,47 @@ function appSlice(start, end) {
   return appSource.slice(startIndex, endIndex);
 }
 
+{
+  const applyStaticI18nSource = appSlice("function applyStaticI18n", "function statusLabel");
+  function makeElement(key, textContent = "", ariaLabel = "") {
+    return {
+      dataset: { i18n: key, i18nAriaLabel: key },
+      textContent,
+      attributes: { "aria-label": ariaLabel },
+      getAttribute(name) {
+        return this.attributes[name] || "";
+      },
+      setAttribute(name, value) {
+        this.attributes[name] = value;
+      },
+    };
+  }
+  const missingTextElement = makeElement("console.kanglong.test_template.button", "测试模板");
+  const localizedTextElement = makeElement("console.kanglong.test_template.save", "保存模板");
+  const missingAriaElement = makeElement("console.kanglong.test_template.close", "", "关闭");
+  const sandbox = {
+    document: {},
+    copyOrDefault(key, fallback) {
+      const messages = {
+        "console.kanglong.test_template.save": "保存测试模板",
+      };
+      return messages[key] || fallback || key;
+    },
+    root: {
+      querySelectorAll(selector) {
+        if (selector === "[data-i18n]") return [missingTextElement, localizedTextElement];
+        if (selector === "[data-i18n-aria-label]") return [missingAriaElement];
+        return [];
+      },
+    },
+  };
+  vm.runInNewContext(`${applyStaticI18nSource}; applyStaticI18n(root);`, sandbox);
+
+  assert.equal(missingTextElement.textContent, "测试模板", "missing static i18n should preserve existing UTF-8 fallback text");
+  assert.equal(localizedTextElement.textContent, "保存测试模板", "existing static i18n message should replace fallback text");
+  assert.equal(missingAriaElement.attributes["aria-label"], "关闭", "missing aria i18n should preserve existing aria fallback text");
+}
+
 function makeTemplateHarness() {
   const helpers = appSlice("function renderKanglongWorkspace()", "function renderKanglongSelectedSubaccounts");
   const modalHelpers = appSlice("function selectedKanglongTemplate()", "function buildSimulationRunPayload");
