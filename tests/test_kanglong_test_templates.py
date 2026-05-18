@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+import json
+from decimal import Decimal
+
+import pytest
+
+from paired_opener.config import Settings
+from paired_opener.kanglong.test_templates import (
+    KANGLONG_TEST_TEMPLATE_VERSION,
+    KanglongTemplateStore,
+    TemplateStoreError,
+    TemplateValidationError,
+    canonical_decimal_text,
+    runtime_main_account_id,
+    runtime_subaccount_id,
+    template_content_hash,
+    validate_template_identifier,
+)
+
+
+def template_payload(template_id: str = "tpl_eth_drop_001") -> dict:
+    return {
+        "id": template_id,
+        "name": "ETH 测试场景",
+        "symbol": "ETHUSDC",
+        "main_account": {
+            "account_id": "test-main",
+            "name": "测试主账号",
+            "collateral": "10000",
+            "leverage": 75,
+            "positions": [],
+        },
+        "subaccounts": [
+            {
+                "row_id": "sub-1",
+                "account_id": "test-sub-1",
+                "name": "测试子账号 1",
+                "collateral": "5000",
+                "leverage": 75,
+                "long_entry_price": "2440",
+                "short_entry_price": "2130",
+                "qty": "10",
+            }
+        ],
+    }
+
+
+def test_canonical_decimal_text_is_stable() -> None:
+    assert canonical_decimal_text(Decimal("10.000")) == "10"
+    assert canonical_decimal_text(Decimal("0.0100")) == "0.01"
+    assert canonical_decimal_text(Decimal("123.4500")) == "123.45"
+
+
+def test_canonical_decimal_text_rejects_invalid_decimal() -> None:
+    with pytest.raises(TemplateValidationError) as excinfo:
+        canonical_decimal_text("not-a-decimal")
+
+    assert excinfo.value.code == "kanglong_test_template_invalid_decimal"
+    assert excinfo.value.field == "decimal"
+    assert "kanglong_test_template_invalid_decimal" in str(excinfo.value)
+
+
+def test_identifier_rejects_runtime_unsafe_characters() -> None:
+    assert validate_template_identifier(" tpl_eth_drop_001 ", field_name="template_id") == "tpl_eth_drop_001"
+
+    with pytest.raises(TemplateValidationError) as excinfo:
+        validate_template_identifier("tpl eth/001", field_name="template_id")
+
+    assert excinfo.value.code == "kanglong_test_template_invalid_id"
+    assert excinfo.value.field == "template_id"
+
+
+def test_identifier_rejects_missing_values() -> None:
+    with pytest.raises(TemplateValidationError) as excinfo:
+        validate_template_identifier(None, field_name="template_id")
+
+    assert excinfo.value.code == "kanglong_test_template_invalid_id"
+
+
+def test_template_hash_ignores_display_name_and_decimal_format() -> None:
+    first = {
+        "id": "tpl_eth_drop_001",
+        "name": "展示名称 A",
+        "symbol": "ethusdc",
+        "main_account": {
+            "account_id": "test-main",
+            "name": "主账号 A",
+            "collateral": "10000.0",
+            "leverage": 75,
+            "positions": [],
+        },
+        "subaccounts": [
+            {
+                "row_id": "sub-1",
+                "account_id": "test-sub-1",
+                "name": "子账号 A",
+                "collateral": "5000.00",
+                "leverage": 75,
+                "long_entry_price": "2440.0",
+                "short_entry_price": "2130.00",
+                "qty": "10.000",
+            }
+        ],
+    }
+    second = {
+        **first,
+        "name": "展示名称 B",
+        "main_account": {**first["main_account"], "name": "主账号 B", "collateral": "10000"},
+        "subaccounts": [{**first["subaccounts"][0], "name": "子账号 B", "qty": "10"}],
+    }
+
+    assert template_content_hash(first) == template_content_hash(second)
+
+
+def test_runtime_account_ids_are_derived_from_template_ids() -> None:
+    assert runtime_main_account_id("tpl_eth_drop_001") == "tpl:tpl_eth_drop_001:main"
+    assert runtime_subaccount_id("tpl_eth_drop_001", "sub-1") == "tpl:tpl_eth_drop_001:sub:sub-1"
+
+
+def test_store_missing_file_lists_empty_templates(tmp_path) -> None:
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    assert store.list_templates() == []
+
+
+def test_store_creates_file_and_backup_on_second_save(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    store = KanglongTemplateStore(path)
+
+    created = store.upsert_template(template_payload())
+    updated = store.upsert_template({**created, "name": "ETH 测试场景改名"})
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["version"] == KANGLONG_TEST_TEMPLATE_VERSION
+    assert payload["templates"][0]["id"] == "tpl_eth_drop_001"
+    assert payload["templates"][0]["created_at"] == created["created_at"]
+    assert updated["updated_at"] != created["updated_at"]
+    assert updated["template_content_hash"].startswith("sha256:")
+    assert path.with_suffix(path.suffix + ".bak").exists()
+
+
+def test_store_rejects_corrupted_json(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    path.write_text("{", encoding="utf-8")
+    store = KanglongTemplateStore(path)
+
+    with pytest.raises(TemplateStoreError) as excinfo:
+        store.list_templates()
+
+    assert excinfo.value.code == "kanglong_test_template_store_corrupted"
+
+
+def test_store_rejects_higher_version(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    path.write_text(json.dumps({"version": KANGLONG_TEST_TEMPLATE_VERSION + 1, "templates": []}), encoding="utf-8")
+    store = KanglongTemplateStore(path)
+
+    with pytest.raises(TemplateStoreError) as excinfo:
+        store.list_templates()
+
+    assert excinfo.value.code == "kanglong_test_template_unsupported_version"
+
+
+def test_clone_generates_new_template_id_and_row_ids(tmp_path) -> None:
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+    created = store.upsert_template(template_payload())
+
+    cloned = store.clone_template(created["id"])
+
+    assert cloned["id"] != created["id"]
+    assert cloned["main_account"]["account_id"] == "test-main"
+    assert cloned["subaccounts"][0]["row_id"] != created["subaccounts"][0]["row_id"]
+    assert {item["id"] for item in store.list_templates()} == {created["id"], cloned["id"]}
+
+
+def test_recover_backup_restores_readable_backup(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    store = KanglongTemplateStore(path)
+    created = store.upsert_template(template_payload())
+    store.upsert_template({**created, "name": "ETH 测试场景改名"})
+    path.write_text("{", encoding="utf-8")
+
+    recovered = store.recover_backup()
+
+    assert recovered[0]["id"] == "tpl_eth_drop_001"
+    assert json.loads(path.read_text(encoding="utf-8"))["templates"][0]["id"] == "tpl_eth_drop_001"
+
+
+def test_settings_exposes_kanglong_test_templates_file(monkeypatch, tmp_path) -> None:
+    settings = Settings(_env_file=None)
+    assert settings.kanglong_test_templates_file.as_posix().endswith("data/kanglong_test_templates.json")
+
+    custom_path = tmp_path / "templates.json"
+    monkeypatch.setenv("PAIRED_OPENER_KANGLONG_TEST_TEMPLATES_FILE", str(custom_path))
+
+    assert Settings(_env_file=None).kanglong_test_templates_file == custom_path

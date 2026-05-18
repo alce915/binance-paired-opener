@@ -1,10 +1,12 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -87,6 +89,7 @@ class Settings(BaseSettings):
     symbol_whitelist: list[str] = Field(default_factory=lambda: ["ETHUSDC", "BTCUSDC"])
     symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"
     kanglong_symbol_configs_file: Path = CONFIG_DIR / "kanglong_symbol_configs.json"
+    kanglong_test_templates_file: Path = DATA_DIR / "kanglong_test_templates.json"
     session_event_retention_days: int = 30
     session_event_retention_per_session: int = 2_000
     runtime_log_max_bytes: int = 20 * 1024 * 1024
@@ -113,6 +116,11 @@ class Settings(BaseSettings):
 
     accounts: dict[str, AccountConfig] = Field(default_factory=dict)
     active_account_id: str = "default"
+
+    def model_post_init(self, __context: Any) -> None:
+        env_value = os.getenv("PAIRED_OPENER_KANGLONG_TEST_TEMPLATES_FILE")
+        if env_value and "kanglong_test_templates_file" not in self.model_fields_set:
+            self.kanglong_test_templates_file = Path(env_value)
 
     @property
     def rest_base_url(self) -> str:
