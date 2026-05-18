@@ -370,6 +370,7 @@
   "console.kanglong.test_template.modal_title": "亢龙测试账号模板",
   "console.kanglong.test_template.close": "关闭",
   "console.kanglong.test_template.library_title": "模板库",
+  "console.kanglong.test_template.library_empty": "暂无测试模板",
   "console.kanglong.test_template.market_data_account": "行情源账号",
   "console.kanglong.test_template.save": "保存模板",
   "console.kanglong.test_template.save_and_apply": "保存并应用",

@@ -24,6 +24,7 @@ for (const fragment of [
   "test_template",
   "/kanglong/simulation/test-templates",
   "console.kanglong.test_template.snapshot_stale",
+  "console.kanglong.test_template.library_empty",
 ]) {
   assert.ok(appSource.includes(fragment), `${fragment} should be wired in app.js`);
 }
@@ -42,6 +43,7 @@ assert.match(
 assert.ok(appSource.includes("data-i18n-aria-label"), "app.js should apply localized aria-label attributes");
 const zhMessages = JSON.parse(zhSource);
 assert.equal(zhMessages["console.kanglong.test_template.close"], "关闭", "template close label should be localized in zh-CN");
+assert.equal(zhMessages["console.kanglong.test_template.library_empty"], "暂无测试模板", "empty template library text should be localized in zh-CN");
 
 function appSlice(start, end) {
   const startIndex = appSource.indexOf(start);
@@ -53,21 +55,31 @@ function appSlice(start, end) {
 
 function makeTemplateHarness() {
   const helpers = appSlice("function renderKanglongWorkspace()", "function renderKanglongSelectedSubaccounts");
+  const modalHelpers = appSlice("function selectedKanglongTemplate()", "function buildSimulationRunPayload");
+  const requestCalls = [];
   const sandbox = {
     console,
     Array,
+    Error,
+    JSON,
     Object,
+    Promise,
     Set,
     String,
+    encodeURIComponent,
   };
   const script = `
     const KANGLONG_ACCOUNT_SOURCE_RUNTIME = "runtime";
     const KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE = "test_template";
     const KANGLONG_LOG_FILTERS = ["all", "warning", "error", "current_group", "cost", "ledger"];
+    const DEFAULT_SYMBOL = "ETHUSDC";
+    const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
+    const requestCalls = globalThis.__requestCalls;
     let availableAccounts = [
       { id: "runtime-main", account_id: "runtime-main", name: "Runtime Main", role: "main" },
       { id: "runtime-sub", account_id: "runtime-sub", name: "Runtime Sub", role: "subaccount" },
     ];
+    const currentAccount = { id: "runtime-main", name: "Runtime Main" };
     const kanglongState = {
       mainAccountId: "runtime-main",
       selectedSubaccountIds: new Set(["runtime-sub"]),
@@ -91,17 +103,32 @@ function makeTemplateHarness() {
     const kanglongExecutePlanBtn = { disabled: false };
     const kanglongPlanSummary = { replaceChildren() { this.cleared = true; } };
     const kanglongExecutionLog = { replaceChildren() { this.cleared = true; } };
-    const kanglongTemplatePreview = { textContent: "" };
     function makeContainer() {
       return {
         children: [],
         replaceChildren(...nodes) {
           this.children = nodes;
         },
+        appendChild(node) {
+          this.children.push(node);
+        },
+        append(...nodes) {
+          this.children.push(...nodes);
+        },
       };
     }
     const kanglongLogFilters = makeContainer();
+    const kanglongTemplateLibrary = makeContainer();
+    const kanglongTemplateEditor = makeContainer();
+    const kanglongTemplatePreview = makeContainer();
+    const elementById = new Map([
+      ["kanglongTemplateEditorText", null],
+      ["kanglongTemplateMarketDataAccount", { value: "market-main" }],
+    ]);
     const document = {
+      getElementById(id) {
+        return elementById.get(id) || null;
+      },
       createElement(tagName) {
         return {
           tagName,
@@ -109,6 +136,15 @@ function makeTemplateHarness() {
           dataset: {},
           hidden: false,
           textContent: "",
+          value: "",
+          appendChild(child) {
+            this.children = this.children || [];
+            this.children.push(child);
+          },
+          append(...nodes) {
+            this.children = this.children || [];
+            this.children.push(...nodes);
+          },
           addEventListener(eventName, handler) {
             this["on" + eventName] = handler;
           },
@@ -117,6 +153,12 @@ function makeTemplateHarness() {
     };
     function copyOrDefault(key, fallback) { return key || fallback; }
     function setEmptyState(container, className, text) { container.emptyState = { className, text }; }
+    function userVisibleErrorMessage(error, fallback = "") { return error?.message || fallback || "error"; }
+    function appendLog() {}
+    async function request(path, options = {}) {
+      requestCalls.push({ path, options });
+      return { run_id: "captured-plan", available_actions: [] };
+    }
     function kanglongAccountId(account) {
       if (typeof account === "string") return account.trim().toLowerCase();
       return String(account?.account_id || account?.id || "").trim().toLowerCase();
@@ -131,14 +173,20 @@ function makeTemplateHarness() {
     function renderKanglongLogFilters() {}
     function syncKanglongWorkflowButtons() {}
     ${helpers}
+    ${modalHelpers}
     globalThis.api = {
       applyKanglongTemplatePreview,
+      createKanglongPlan,
       exitKanglongTemplateMode,
+      renderKanglongTemplateLibrary,
       state: kanglongState,
       get availableAccounts() { return availableAccounts; },
+      library: kanglongTemplateLibrary,
       renderCalls,
+      requestCalls,
     };
   `;
+  sandbox.__requestCalls = requestCalls;
   vm.runInNewContext(script, sandbox);
   return sandbox.api;
 }
@@ -167,4 +215,40 @@ function makeTemplateHarness() {
   assert.equal(api.state.plan, null, "preview apply should clear stale plan");
   assert.equal(api.state.events.length, 0, "preview apply should clear stale events");
   assert.equal(api.renderCalls.length > 0, true, "preview apply should rerender the workspace");
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplates = [
+    { id: "tpl_a", name: "Template A", template_content_hash: "sha256:a" },
+    { id: "tpl_b", name: "Template B", template_content_hash: "sha256:b" },
+  ];
+  api.applyKanglongTemplatePreview({
+    template_id: "tpl_a",
+    template_content_hash: "sha256:a",
+    market_data_account_id: "market-main",
+    accounts: [
+      { account_id: "tpl:tpl_a:main", name: "Template A Main", role: "main" },
+      { account_id: "tpl:tpl_a:sub:sub-1", name: "Template A Sub", role: "subaccount" },
+    ],
+  });
+  api.state.selectedSubaccountIds.add("tpl:tpl_a:sub:sub-1");
+
+  api.renderKanglongTemplateLibrary();
+  const templateBButton = api.library.children.find((node) => node.textContent === "Template B");
+  assert.ok(templateBButton, "template B should render in the library");
+  templateBButton.onclick();
+
+  let createError = null;
+  try {
+    await api.createKanglongPlan();
+  } catch (error) {
+    createError = error;
+  }
+
+  assert.equal(api.state.accountSource, "runtime", "selecting another library template should exit the applied template account mode");
+  assert.equal(api.state.activeTestTemplateId, "tpl_b", "selecting another library template should keep the new template selected for editing");
+  assert.equal(api.availableAccounts[0].account_id, "runtime-main", "selecting another library template should restore the real account pool");
+  assert.equal(api.requestCalls.length, 0, "plan request should not be sent with old tpl accounts and new template metadata");
+  assert.ok(createError, "plan creation should require a fresh runtime/template selection after switching templates");
 }

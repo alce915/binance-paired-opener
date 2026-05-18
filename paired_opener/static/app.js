@@ -3787,12 +3787,24 @@ function renderKanglongTemplateLibrary() {
     button.className = template.id === kanglongState.activeTestTemplateId ? "inline-btn success" : "inline-btn secondary";
     button.textContent = template.name || template.id || "--";
     button.addEventListener("click", () => {
-      kanglongState.activeTestTemplateId = template.id || null;
-      kanglongState.activeTemplateContentHash = template.template_content_hash || null;
+      selectKanglongTestTemplate(template);
       renderKanglongTestTemplateModal();
     });
     kanglongTemplateLibrary.appendChild(button);
   });
+}
+
+function selectKanglongTestTemplate(template = {}) {
+  const nextTemplateId = template.id || null;
+  if (
+    kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE
+    && kanglongState.templatePreview?.template_id
+    && kanglongState.templatePreview.template_id !== nextTemplateId
+  ) {
+    exitKanglongTemplateMode();
+  }
+  kanglongState.activeTestTemplateId = nextTemplateId;
+  kanglongState.activeTemplateContentHash = template.template_content_hash || null;
 }
 
 function renderKanglongTemplateEditor() {
