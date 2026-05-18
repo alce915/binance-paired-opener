@@ -212,7 +212,6 @@ def _kanglong_account_totals_payload(snapshot: dict) -> dict:
 
 
 async def _collect_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
-    _validate_kanglong_account_ids(request)
     if request.account_source == "test_template":
         return await _collect_template_kanglong_plan_inputs(request)
     return await _collect_runtime_kanglong_plan_inputs(request)
@@ -227,6 +226,7 @@ def _reject_runtime_template_fields(request: KanglongPlanRequest) -> None:
 
 
 async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
+    _validate_kanglong_account_ids(request)
     _reject_runtime_template_fields(request)
     runtime_manager: AccountRuntimeManager = app.state.runtime_manager
     account_ids = [request.main_account_id, *request.subaccount_ids]
@@ -344,6 +344,37 @@ def _is_template_runtime_account_id(account_id: str) -> bool:
     return account_id.strip().lower().startswith("tpl:")
 
 
+def _validate_template_account_role_shape(request: KanglongPlanRequest, accounts_by_id: dict[str, dict[str, Any]]) -> None:
+    requested_account_ids = [request.main_account_id, *request.subaccount_ids]
+    mismatched_account_ids = [
+        account_id
+        for account_id in requested_account_ids
+        if account_id not in accounts_by_id
+    ]
+    main_account = accounts_by_id.get(request.main_account_id)
+    if main_account is not None and main_account.get("role") != "main":
+        mismatched_account_ids.append(request.main_account_id)
+    seen_subaccount_ids: set[str] = set()
+    for subaccount_id in request.subaccount_ids:
+        subaccount = accounts_by_id.get(subaccount_id)
+        if (
+            subaccount is None
+            or subaccount.get("role") != "subaccount"
+            or subaccount_id == request.main_account_id
+            or subaccount_id in seen_subaccount_ids
+        ):
+            mismatched_account_ids.append(subaccount_id)
+        seen_subaccount_ids.add(subaccount_id)
+    if mismatched_account_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "kanglong_test_template_account_mismatch",
+                "account_ids": list(dict.fromkeys(mismatched_account_ids)),
+            },
+        )
+
+
 async def _collect_template_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
     template_id = _require_template_plan_field(
         request.test_template_id,
@@ -383,15 +414,7 @@ async def _collect_template_kanglong_plan_inputs(request: KanglongPlanRequest) -
     accounts = preview_payload.get("accounts") or []
     accounts_by_id = {str(account.get("account_id") or ""): account for account in accounts}
     requested_account_ids = [request.main_account_id, *request.subaccount_ids]
-    outside_account_ids = [account_id for account_id in requested_account_ids if account_id not in accounts_by_id]
-    if outside_account_ids:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "kanglong_test_template_account_mismatch",
-                "account_ids": outside_account_ids,
-            },
-        )
+    _validate_template_account_role_shape(request, accounts_by_id)
 
     leverage_by_account_id = _preview_account_leverage_map(template, preview_payload)
     snapshots_by_id = {
@@ -862,6 +885,8 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
             )
             try:
                 inputs = await _collect_kanglong_plan_inputs(plan_request)
+            except HTTPException:
+                raise
             except Exception as exc:
                 _raise_api_error(exc, code="kanglong_plan_failed", source="service")
             execute_kwargs.update(

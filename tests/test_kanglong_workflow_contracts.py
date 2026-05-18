@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from fastapi import HTTPException
 
 from paired_opener import api as api_module
 from paired_opener.domain import PositionSide, SymbolRules
@@ -508,6 +509,56 @@ async def test_execute_recheck_restores_template_account_source_from_stored_requ
     assert captured_requests[0].test_template_id == "tpl_eth_drop_001"
     assert captured_requests[0].template_content_hash == "sha256:abc"
     assert captured_requests[0].market_data_account_id == "market-main"
+
+
+@pytest.mark.asyncio
+async def test_execute_recheck_propagates_template_collector_http_exception(monkeypatch) -> None:
+    async def stale_template_collector(request: KanglongPlanRequest) -> dict:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "blocked_plan_stale", "template_id": request.test_template_id},
+        )
+
+    class TemplateExecuteService:
+        def get_run(self, run_id: str) -> dict:
+            return {
+                "run_id": run_id,
+                "symbol": "ETHUSDC",
+                "status": "plan_confirmed",
+                "plan_version": "plan-1",
+                "plan": {"selected_side": "LONG"},
+                "request": {
+                    "mode": "simulation",
+                    "symbol": "ETHUSDC",
+                    "main_account_id": "tpl:tpl_eth_drop_001:main",
+                    "subaccount_ids": ["tpl:tpl_eth_drop_001:sub:sub-1"],
+                    "account_source": "test_template",
+                    "test_template_id": "tpl_eth_drop_001",
+                    "template_content_hash": "sha256:stale",
+                    "market_data_account_id": "market-main",
+                },
+            }
+
+        def execute_plan(self, **kwargs) -> dict:
+            raise AssertionError("execute_plan should not run when recheck collection raises HTTPException")
+
+    original_collector = api_module._collect_kanglong_plan_inputs
+    original_service = getattr(api_module.app.state, "kanglong_service", None)
+    monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", stale_template_collector)
+    monkeypatch.setattr(api_module.app.state, "kanglong_service", TemplateExecuteService(), raising=False)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await api_module.execute_kanglong_simulation_plan(
+                "run-template",
+                KanglongActionRequest(plan_version="plan-1", idempotency_key="execute-template-0002"),
+            )
+    finally:
+        monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", original_collector)
+        if original_service is not None:
+            monkeypatch.setattr(api_module.app.state, "kanglong_service", original_service, raising=False)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == {"code": "blocked_plan_stale", "template_id": "tpl_eth_drop_001"}
 
 
 def test_service_blocks_overlapping_ready_plan_until_lock_is_released(tmp_path) -> None:
