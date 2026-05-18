@@ -121,7 +121,11 @@ def test_runtime_account_ids_are_derived_from_template_ids() -> None:
 def test_store_missing_file_lists_empty_templates(tmp_path) -> None:
     store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
 
-    assert store.list_templates() == []
+    assert store.list_templates() == {
+        "version": KANGLONG_TEST_TEMPLATE_VERSION,
+        "templates": [],
+        "recoverable_backup": False,
+    }
 
 
 def test_list_templates_normalizes_legacy_templates_and_adds_hash(tmp_path) -> None:
@@ -137,8 +141,11 @@ def test_list_templates_normalizes_legacy_templates_and_adds_hash(tmp_path) -> N
     )
     store = KanglongTemplateStore(path)
 
-    [loaded] = store.list_templates()
+    listed = store.list_templates()
+    [loaded] = listed["templates"]
 
+    assert listed["version"] == KANGLONG_TEST_TEMPLATE_VERSION
+    assert listed["recoverable_backup"] is False
     assert loaded["template_content_hash"].startswith("sha256:")
     assert loaded["main_account"]["collateral"] == "10000"
     assert loaded["subaccounts"][0]["row_id"] == "test-sub-1"
@@ -176,6 +183,7 @@ def test_store_creates_file_and_backup_on_second_save(tmp_path) -> None:
     assert updated["updated_at"] != created["updated_at"]
     assert updated["template_content_hash"].startswith("sha256:")
     assert path.with_suffix(path.suffix + ".bak").exists()
+    assert store.list_templates()["recoverable_backup"] is True
 
 
 def test_store_rejects_corrupted_json(tmp_path) -> None:
@@ -213,6 +221,59 @@ def test_get_template_not_found_uses_structured_detail(tmp_path) -> None:
     assert excinfo.value.detail == {"template_id": "missing_tpl"}
 
 
+@pytest.mark.parametrize(
+    ("section", "field", "value", "code"),
+    [
+        ("main", "collateral", "-0.01", "kanglong_test_template_negative_collateral"),
+        ("main", "leverage", 0, "kanglong_test_template_invalid_leverage"),
+        ("sub", "collateral", "-0.01", "kanglong_test_template_negative_collateral"),
+        ("sub", "leverage", 0, "kanglong_test_template_invalid_leverage"),
+        ("sub", "qty", "0", "kanglong_test_template_non_positive_qty"),
+        ("sub", "long_entry_price", "0", "kanglong_test_template_invalid_price"),
+        ("sub", "short_entry_price", "-1", "kanglong_test_template_invalid_price"),
+    ],
+)
+def test_upsert_rejects_invalid_numeric_template_values(tmp_path, section, field, value, code) -> None:
+    template = template_payload()
+    target = template["main_account"] if section == "main" else template["subaccounts"][0]
+    target[field] = value
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    with pytest.raises(TemplateValidationError) as excinfo:
+        store.upsert_template(template)
+
+    assert excinfo.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "code"),
+    [
+        ("main", "collateral", "-0.01", "kanglong_test_template_negative_collateral"),
+        ("main", "leverage", -1, "kanglong_test_template_invalid_leverage"),
+        ("sub", "collateral", "-0.01", "kanglong_test_template_negative_collateral"),
+        ("sub", "leverage", 0, "kanglong_test_template_invalid_leverage"),
+        ("sub", "qty", "-0.01", "kanglong_test_template_non_positive_qty"),
+        ("sub", "long_entry_price", "-1", "kanglong_test_template_invalid_price"),
+        ("sub", "short_entry_price", "0", "kanglong_test_template_invalid_price"),
+    ],
+)
+def test_list_templates_rejects_invalid_numeric_legacy_templates(tmp_path, section, field, value, code) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    template = template_payload()
+    target = template["main_account"] if section == "main" else template["subaccounts"][0]
+    target[field] = value
+    path.write_text(
+        json.dumps({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": [template]}),
+        encoding="utf-8",
+    )
+    store = KanglongTemplateStore(path)
+
+    with pytest.raises(TemplateValidationError) as excinfo:
+        store.list_templates()
+
+    assert excinfo.value.code == code
+
+
 def test_clone_generates_new_template_id_and_row_ids(tmp_path) -> None:
     store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
     created = store.upsert_template(template_payload())
@@ -222,7 +283,7 @@ def test_clone_generates_new_template_id_and_row_ids(tmp_path) -> None:
     assert cloned["id"] != created["id"]
     assert cloned["main_account"]["account_id"] == "test-main"
     assert cloned["subaccounts"][0]["row_id"] != created["subaccounts"][0]["row_id"]
-    assert {item["id"] for item in store.list_templates()} == {created["id"], cloned["id"]}
+    assert {item["id"] for item in store.list_templates()["templates"]} == {created["id"], cloned["id"]}
 
 
 def test_recover_backup_restores_readable_backup(tmp_path) -> None:
@@ -234,8 +295,21 @@ def test_recover_backup_restores_readable_backup(tmp_path) -> None:
 
     recovered = store.recover_backup()
 
-    assert recovered[0]["id"] == "tpl_eth_drop_001"
+    assert recovered["version"] == KANGLONG_TEST_TEMPLATE_VERSION
+    assert recovered["recoverable_backup"] is True
+    assert recovered["templates"][0]["id"] == "tpl_eth_drop_001"
     assert json.loads(path.read_text(encoding="utf-8"))["templates"][0]["id"] == "tpl_eth_drop_001"
+
+
+def test_recover_backup_missing_file_uses_not_found_detail(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    store = KanglongTemplateStore(path)
+
+    with pytest.raises(TemplateStoreError) as excinfo:
+        store.recover_backup()
+
+    assert excinfo.value.code == "kanglong_test_template_not_found"
+    assert excinfo.value.detail == {"backup": str(path.with_suffix(path.suffix + ".bak"))}
 
 
 def test_settings_exposes_kanglong_test_templates_file(monkeypatch, tmp_path) -> None:

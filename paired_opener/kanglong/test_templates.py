@@ -85,13 +85,17 @@ class KanglongTemplateStore:
     def backup_path(self) -> Path:
         return self.path.with_suffix(self.path.suffix + ".bak")
 
-    def list_templates(self) -> list[dict[str, Any]]:
+    def list_templates(self) -> dict[str, Any]:
         document = self._read_document()
-        return copy.deepcopy(document["templates"])
+        return {
+            "version": document["version"],
+            "templates": copy.deepcopy(document["templates"]),
+            "recoverable_backup": self.backup_path.exists(),
+        }
 
     def get_template(self, template_id: str) -> dict[str, Any]:
         normalized_id = validate_template_identifier(template_id, field_name="template_id")
-        for template in self.list_templates():
+        for template in self.list_templates()["templates"]:
             if template.get("id") == normalized_id:
                 return template
         raise TemplateStoreError("kanglong_test_template_not_found", {"template_id": normalized_id})
@@ -137,7 +141,12 @@ class KanglongTemplateStore:
         self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": remaining})
         return copy.deepcopy(deleted)
 
-    def recover_backup(self) -> list[dict[str, Any]]:
+    def recover_backup(self) -> dict[str, Any]:
+        if not self.backup_path.exists():
+            raise TemplateStoreError(
+                "kanglong_test_template_not_found",
+                {"backup": str(self.backup_path)},
+            )
         self._read_document_from_path(self.backup_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self._temp_path()
@@ -207,25 +216,31 @@ def _normalize_hash_payload(template: dict[str, Any]) -> dict[str, Any]:
         "symbol": str(template.get("symbol", "")).strip().upper(),
         "main_account": {
             "account_id": validate_template_identifier(main_account.get("account_id"), field_name="main_account.account_id"),
-            "collateral": canonical_decimal_text(main_account.get("collateral", "0"), field_name="main_account.collateral"),
-            "leverage": int(main_account.get("leverage", 0)),
+            "collateral": _collateral_text(main_account.get("collateral", "0"), field_name="main_account.collateral"),
+            "leverage": _positive_int(main_account.get("leverage", 0), field_name="main_account.leverage"),
         },
         "subaccounts": sorted(
             (
                 {
                     "row_id": validate_template_identifier(item.get("row_id"), field_name="subaccounts.row_id"),
                     "account_id": validate_template_identifier(item.get("account_id"), field_name="subaccounts.account_id"),
-                    "collateral": canonical_decimal_text(item.get("collateral", "0"), field_name="subaccounts.collateral"),
-                    "leverage": int(item.get("leverage", 0)),
-                    "long_entry_price": canonical_decimal_text(
+                    "collateral": _collateral_text(item.get("collateral", "0"), field_name="subaccounts.collateral"),
+                    "leverage": _positive_int(item.get("leverage", 0), field_name="subaccounts.leverage"),
+                    "long_entry_price": _positive_decimal_text(
                         item.get("long_entry_price", "0"),
                         field_name="subaccounts.long_entry_price",
+                        code="kanglong_test_template_invalid_price",
                     ),
-                    "short_entry_price": canonical_decimal_text(
+                    "short_entry_price": _positive_decimal_text(
                         item.get("short_entry_price", "0"),
                         field_name="subaccounts.short_entry_price",
+                        code="kanglong_test_template_invalid_price",
                     ),
-                    "qty": canonical_decimal_text(item.get("qty", "0"), field_name="subaccounts.qty"),
+                    "qty": _positive_decimal_text(
+                        item.get("qty", "0"),
+                        field_name="subaccounts.qty",
+                        code="kanglong_test_template_non_positive_qty",
+                    ),
                 }
                 for item in _require_list(template.get("subaccounts"), "subaccounts")
             ),
@@ -274,8 +289,8 @@ def _normalize_main_account(value: Any) -> dict[str, Any]:
     return {
         "account_id": validate_template_identifier(account.get("account_id"), field_name="main_account.account_id"),
         "name": str(account.get("name", "")),
-        "collateral": canonical_decimal_text(account.get("collateral", "0"), field_name="main_account.collateral"),
-        "leverage": int(account.get("leverage", 0)),
+        "collateral": _collateral_text(account.get("collateral", "0"), field_name="main_account.collateral"),
+        "leverage": _positive_int(account.get("leverage", 0), field_name="main_account.leverage"),
         "positions": copy.deepcopy(account.get("positions", [])),
     }
 
@@ -297,20 +312,60 @@ def _normalize_subaccounts(value: Any) -> list[dict[str, Any]]:
                     field_name="subaccounts.account_id",
                 ),
                 "name": str(subaccount.get("name", "")),
-                "collateral": canonical_decimal_text(subaccount.get("collateral", "0"), field_name="subaccounts.collateral"),
-                "leverage": int(subaccount.get("leverage", 0)),
-                "long_entry_price": canonical_decimal_text(
+                "collateral": _collateral_text(subaccount.get("collateral", "0"), field_name="subaccounts.collateral"),
+                "leverage": _positive_int(subaccount.get("leverage", 0), field_name="subaccounts.leverage"),
+                "long_entry_price": _positive_decimal_text(
                     subaccount.get("long_entry_price", "0"),
                     field_name="subaccounts.long_entry_price",
+                    code="kanglong_test_template_invalid_price",
                 ),
-                "short_entry_price": canonical_decimal_text(
+                "short_entry_price": _positive_decimal_text(
                     subaccount.get("short_entry_price", "0"),
                     field_name="subaccounts.short_entry_price",
+                    code="kanglong_test_template_invalid_price",
                 ),
-                "qty": canonical_decimal_text(subaccount.get("qty", "0"), field_name="subaccounts.qty"),
+                "qty": _positive_decimal_text(
+                    subaccount.get("qty", "0"),
+                    field_name="subaccounts.qty",
+                    code="kanglong_test_template_non_positive_qty",
+                ),
             }
         )
     return normalized
+
+
+def _collateral_text(value: Any, *, field_name: str) -> str:
+    decimal_value = _decimal_value(value, field_name=field_name)
+    if decimal_value < 0:
+        raise TemplateValidationError("kanglong_test_template_negative_collateral", field_name, value)
+    return canonical_decimal_text(decimal_value, field_name=field_name)
+
+
+def _positive_decimal_text(value: Any, *, field_name: str, code: str) -> str:
+    decimal_value = _decimal_value(value, field_name=field_name)
+    if decimal_value <= 0:
+        raise TemplateValidationError(code, field_name, value)
+    return canonical_decimal_text(decimal_value, field_name=field_name)
+
+
+def _positive_int(value: Any, *, field_name: str) -> int:
+    try:
+        integer_value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TemplateValidationError("kanglong_test_template_invalid_leverage", field_name, value) from exc
+    if integer_value <= 0:
+        raise TemplateValidationError("kanglong_test_template_invalid_leverage", field_name, value)
+    return integer_value
+
+
+def _decimal_value(value: Any, *, field_name: str) -> Decimal:
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise TemplateValidationError("kanglong_test_template_invalid_decimal", field_name, value) from exc
+    if not decimal_value.is_finite():
+        raise TemplateValidationError("kanglong_test_template_invalid_decimal", field_name, value)
+    return decimal_value
 
 
 def _unique_row_id(row_id: str, used_row_ids: set[str]) -> str:
