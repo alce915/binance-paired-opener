@@ -569,6 +569,17 @@ class BinanceFuturesGateway(ExchangeGateway):
             "total_interest": Decimal("0"),
         }
 
+    @staticmethod
+    def _position_notional(item: dict[str, Any]) -> Decimal:
+        return abs(Decimal(item.get("notional") or "0"))
+
+    @staticmethod
+    def _position_mark_price(item: dict[str, Any], position_amt: Decimal, notional: Decimal) -> Decimal:
+        mark_price = Decimal(item.get("markPrice") or "0")
+        if mark_price == Decimal("0") and position_amt != Decimal("0") and notional != Decimal("0"):
+            return notional / abs(position_amt)
+        return mark_price
+
     def _parse_unified_positions(self, payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
         positions: list[dict[str, Any]] = []
         for item in payload:
@@ -576,6 +587,7 @@ class BinanceFuturesGateway(ExchangeGateway):
             pnl = Decimal(item.get("unrealizedProfit") or item.get("unRealizedProfit") or "0")
             if position_amt == Decimal("0") and pnl == Decimal("0"):
                 continue
+            notional = self._position_notional(item)
             position_side = item.get("positionSide") or ("LONG" if position_amt > 0 else "SHORT")
             positions.append(
                 {
@@ -583,9 +595,9 @@ class BinanceFuturesGateway(ExchangeGateway):
                     "position_side": position_side,
                     "qty": abs(position_amt),
                     "entry_price": Decimal(item.get("entryPrice") or "0"),
-                    "mark_price": Decimal(item.get("markPrice") or "0"),
+                    "mark_price": self._position_mark_price(item, position_amt, notional),
                     "unrealized_pnl": pnl,
-                    "notional": abs(Decimal(item.get("notional") or "0")),
+                    "notional": notional,
                     "leverage": int(item.get("leverage") or 0),
                     "liquidation_price": Decimal(item.get("liquidationPrice") or "0"),
                 }
@@ -684,6 +696,7 @@ class BinanceFuturesGateway(ExchangeGateway):
             pnl = Decimal(item.get("unRealizedProfit") or item.get("unrealizedProfit") or "0")
             if position_amt == Decimal("0") and pnl == Decimal("0"):
                 continue
+            notional = self._position_notional(item)
             position_side = item.get("positionSide") or ("LONG" if position_amt > 0 else "SHORT")
             positions.append(
                 {
@@ -691,9 +704,9 @@ class BinanceFuturesGateway(ExchangeGateway):
                     "position_side": position_side,
                     "qty": abs(position_amt),
                     "entry_price": Decimal(item.get("entryPrice") or "0"),
-                    "mark_price": Decimal(item.get("markPrice") or "0"),
+                    "mark_price": self._position_mark_price(item, position_amt, notional),
                     "unrealized_pnl": pnl,
-                    "notional": abs(Decimal(item.get("notional") or "0")),
+                    "notional": notional,
                     "leverage": int(item.get("leverage") or 0),
                     "liquidation_price": Decimal(item.get("liquidationPrice") or "0"),
                 }
@@ -720,6 +733,7 @@ class BinanceFuturesGateway(ExchangeGateway):
             position_amt = Decimal(item.get("positionAmt") or "0")
             if position_amt == Decimal("0"):
                 continue
+            notional = self._position_notional(item)
             position_side = item.get("positionSide") or ("LONG" if position_amt > 0 else "SHORT")
             positions.append(
                 {
@@ -727,9 +741,9 @@ class BinanceFuturesGateway(ExchangeGateway):
                     "position_side": position_side,
                     "qty": abs(position_amt),
                     "entry_price": Decimal(item.get("entryPrice") or "0"),
-                    "mark_price": Decimal(item.get("markPrice") or "0"),
+                    "mark_price": self._position_mark_price(item, position_amt, notional),
                     "unrealized_pnl": Decimal(item.get("unrealizedProfit") or "0"),
-                    "notional": abs(Decimal(item.get("notional") or "0")),
+                    "notional": notional,
                     "leverage": int(item.get("leverage") or 0),
                     "liquidation_price": Decimal(item.get("liquidationPrice") or "0"),
                 }

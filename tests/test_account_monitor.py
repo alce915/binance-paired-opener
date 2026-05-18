@@ -154,7 +154,6 @@ async def test_get_unified_account_snapshot_aggregates_income_and_interest() -> 
                         "positionSide": "SHORT",
                         "positionAmt": "-0.5",
                         "entryPrice": "2000",
-                        "markPrice": "1995",
                         "unrealizedProfit": "2.5",
                         "notional": "997.5",
                         "leverage": "5",
@@ -185,6 +184,7 @@ async def test_get_unified_account_snapshot_aggregates_income_and_interest() -> 
     assert snapshot["totals"]["total_income"] == Decimal("6.0")
     assert snapshot["totals"]["total_interest"] == Decimal("0.9")
     assert len(snapshot["positions"]) == 2
+    assert snapshot["positions"][1]["mark_price"] == Decimal("1995")
     assert snapshot["income_summary"]["by_type"]["FUNDING_FEE"] == Decimal("7.2")
 
 
