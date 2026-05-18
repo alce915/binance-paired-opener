@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -16,6 +17,17 @@ from typing import Any
 KANGLONG_TEST_TEMPLATE_VERSION = 1
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_STORE_LOCK = threading.RLock()
+_TEMPLATE_KNOWN_FIELDS = {
+    "id",
+    "name",
+    "symbol",
+    "main_account",
+    "subaccounts",
+    "created_at",
+    "updated_at",
+    "template_content_hash",
+}
 
 
 class TemplateValidationError(ValueError):
@@ -101,62 +113,66 @@ class KanglongTemplateStore:
         raise TemplateStoreError("kanglong_test_template_not_found", {"template_id": normalized_id})
 
     def upsert_template(self, template: dict[str, Any]) -> dict[str, Any]:
-        document = self._read_document()
-        templates = document["templates"]
-        template_id = validate_template_identifier(template.get("id"), field_name="template_id")
-        existing_index = next((index for index, item in enumerate(templates) if item.get("id") == template_id), None)
-        existing = templates[existing_index] if existing_index is not None else None
-        normalized = _normalize_template(template, existing=existing)
-        if existing_index is None:
-            templates.append(normalized)
-        else:
-            templates[existing_index] = normalized
-        self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": templates})
-        return copy.deepcopy(normalized)
+        with _STORE_LOCK:
+            document = self._read_document()
+            templates = document["templates"]
+            template_id = validate_template_identifier(template.get("id"), field_name="template_id")
+            existing_index = next((index for index, item in enumerate(templates) if item.get("id") == template_id), None)
+            existing = templates[existing_index] if existing_index is not None else None
+            normalized = _normalize_template(template, existing=existing)
+            if existing_index is None:
+                templates.append(normalized)
+            else:
+                templates[existing_index] = normalized
+            self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": templates})
+            return copy.deepcopy(normalized)
 
     def clone_template(self, template_id: str, new_id: str | None = None) -> dict[str, Any]:
-        source = self.get_template(template_id)
-        document = self._read_document()
-        existing_ids = {item.get("id") for item in document["templates"]}
-        clone_id = validate_template_identifier(new_id, field_name="template_id") if new_id else _next_clone_id(source["id"], existing_ids)
-        if clone_id in existing_ids:
-            raise TemplateValidationError("kanglong_test_template_invalid_id", "template_id", clone_id)
-        cloned = copy.deepcopy(source)
-        cloned["id"] = clone_id
-        cloned["name"] = f'{source.get("name", source["id"])} Copy'
-        cloned.pop("created_at", None)
-        cloned.pop("updated_at", None)
-        cloned.pop("template_content_hash", None)
-        for subaccount in cloned.get("subaccounts", []):
-            subaccount["row_id"] = f"row_{uuid.uuid4().hex[:12]}"
-        return self.upsert_template(cloned)
+        with _STORE_LOCK:
+            source = self.get_template(template_id)
+            document = self._read_document()
+            existing_ids = {item.get("id") for item in document["templates"]}
+            clone_id = validate_template_identifier(new_id, field_name="template_id") if new_id else _next_clone_id(source["id"], existing_ids)
+            if clone_id in existing_ids:
+                raise TemplateValidationError("kanglong_test_template_invalid_id", "template_id", clone_id)
+            cloned = copy.deepcopy(source)
+            cloned["id"] = clone_id
+            cloned["name"] = f'{source.get("name", source["id"])} Copy'
+            cloned.pop("created_at", None)
+            cloned.pop("updated_at", None)
+            cloned.pop("template_content_hash", None)
+            for subaccount in cloned.get("subaccounts", []):
+                subaccount["row_id"] = f"row_{uuid.uuid4().hex[:12]}"
+            return self.upsert_template(cloned)
 
     def delete_template(self, template_id: str) -> dict[str, Any]:
-        normalized_id = validate_template_identifier(template_id, field_name="template_id")
-        document = self._read_document()
-        remaining = [item for item in document["templates"] if item.get("id") != normalized_id]
-        if len(remaining) == len(document["templates"]):
-            raise TemplateStoreError("kanglong_test_template_not_found", {"template_id": normalized_id})
-        deleted = next(item for item in document["templates"] if item.get("id") == normalized_id)
-        self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": remaining})
-        return copy.deepcopy(deleted)
+        with _STORE_LOCK:
+            normalized_id = validate_template_identifier(template_id, field_name="template_id")
+            document = self._read_document()
+            remaining = [item for item in document["templates"] if item.get("id") != normalized_id]
+            if len(remaining) == len(document["templates"]):
+                raise TemplateStoreError("kanglong_test_template_not_found", {"template_id": normalized_id})
+            deleted = next(item for item in document["templates"] if item.get("id") == normalized_id)
+            self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": remaining})
+            return copy.deepcopy(deleted)
 
     def recover_backup(self) -> dict[str, Any]:
-        if not self.backup_path.exists():
-            raise TemplateStoreError(
-                "kanglong_test_template_not_found",
-                {"backup": str(self.backup_path)},
-            )
-        self._read_document_from_path(self.backup_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._temp_path()
-        try:
-            shutil.copy2(self.backup_path, tmp_path)
-            os.replace(tmp_path, self.path)
-        finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        return self.list_templates()
+        with _STORE_LOCK:
+            if not self.backup_path.exists():
+                raise TemplateStoreError(
+                    "kanglong_test_template_not_found",
+                    {"backup": str(self.backup_path)},
+                )
+            self._read_document_from_path(self.backup_path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._temp_path()
+            try:
+                shutil.copy2(self.backup_path, tmp_path)
+                os.replace(tmp_path, self.path)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            return self.list_templates()
 
     def _read_document(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -255,7 +271,9 @@ def _normalize_template(template: dict[str, Any], *, existing: dict[str, Any] | 
     now = _fresh_timestamp(existing.get("updated_at") if existing else None)
     template_id = validate_template_identifier(template.get("id"), field_name="template_id")
     created_at = existing.get("created_at") if existing else template.get("created_at")
-    normalized = {
+    normalized = _preserved_template_fields(existing, template)
+    normalized.update(
+        {
         "id": template_id,
         "name": str(template.get("name", template_id)),
         "symbol": str(template.get("symbol", "")).strip().upper(),
@@ -263,7 +281,8 @@ def _normalize_template(template: dict[str, Any], *, existing: dict[str, Any] | 
         "subaccounts": _normalize_subaccounts(template.get("subaccounts")),
         "created_at": str(created_at) if created_at else now,
         "updated_at": now,
-    }
+        }
+    )
     normalized["template_content_hash"] = template_content_hash(normalized)
     return normalized
 
@@ -271,7 +290,9 @@ def _normalize_template(template: dict[str, Any], *, existing: dict[str, Any] | 
 def _normalize_loaded_template(template: Any) -> dict[str, Any]:
     source = _require_mapping(template, "templates[]")
     timestamp = str(source.get("updated_at") or source.get("created_at") or _fresh_timestamp(None))
-    normalized = {
+    normalized = {key: copy.deepcopy(value) for key, value in source.items() if key not in _TEMPLATE_KNOWN_FIELDS}
+    normalized.update(
+        {
         "id": validate_template_identifier(source.get("id"), field_name="template_id"),
         "name": str(source.get("name", source.get("id", ""))),
         "symbol": str(source.get("symbol", "")).strip().upper(),
@@ -279,20 +300,25 @@ def _normalize_loaded_template(template: Any) -> dict[str, Any]:
         "subaccounts": _normalize_subaccounts(source.get("subaccounts")),
         "created_at": str(source.get("created_at") or timestamp),
         "updated_at": timestamp,
-    }
+        }
+    )
     normalized["template_content_hash"] = template_content_hash(normalized)
     return normalized
 
 
 def _normalize_main_account(value: Any) -> dict[str, Any]:
     account = _require_mapping(value, "main_account")
-    return {
+    normalized = copy.deepcopy(account)
+    normalized.update(
+        {
         "account_id": validate_template_identifier(account.get("account_id"), field_name="main_account.account_id"),
         "name": str(account.get("name", "")),
         "collateral": _collateral_text(account.get("collateral", "0"), field_name="main_account.collateral"),
         "leverage": _positive_int(account.get("leverage", 0), field_name="main_account.leverage"),
         "positions": copy.deepcopy(account.get("positions", [])),
-    }
+        }
+    )
+    return normalized
 
 
 def _normalize_subaccounts(value: Any) -> list[dict[str, Any]]:
@@ -301,10 +327,16 @@ def _normalize_subaccounts(value: Any) -> list[dict[str, Any]]:
     used_row_ids: set[str] = set()
     for index, item in enumerate(subaccounts, start=1):
         subaccount = _require_mapping(item, f"subaccounts[{index - 1}]")
-        raw_row_id = subaccount.get("row_id") or subaccount.get("account_id") or f"row-{index}"
-        row_id = _unique_row_id(validate_template_identifier(raw_row_id, field_name="subaccounts.row_id"), used_row_ids)
+        if "row_id" in subaccount and subaccount.get("row_id") is not None:
+            row_id = validate_template_identifier(subaccount.get("row_id"), field_name="subaccounts.row_id")
+            if row_id in used_row_ids:
+                raise TemplateValidationError("kanglong_test_template_invalid_id", "subaccounts.row_id", row_id)
+        else:
+            raw_row_id = subaccount.get("account_id") or f"row-{index}"
+            row_id = _unique_row_id(validate_template_identifier(raw_row_id, field_name="subaccounts.row_id"), used_row_ids)
         used_row_ids.add(row_id)
-        normalized.append(
+        normalized_subaccount = copy.deepcopy(subaccount)
+        normalized_subaccount.update(
             {
                 "row_id": row_id,
                 "account_id": validate_template_identifier(
@@ -331,7 +363,16 @@ def _normalize_subaccounts(value: Any) -> list[dict[str, Any]]:
                 ),
             }
         )
+        normalized.append(normalized_subaccount)
     return normalized
+
+
+def _preserved_template_fields(existing: dict[str, Any] | None, template: dict[str, Any]) -> dict[str, Any]:
+    preserved: dict[str, Any] = {}
+    if existing:
+        preserved.update({key: copy.deepcopy(value) for key, value in existing.items() if key not in _TEMPLATE_KNOWN_FIELDS})
+    preserved.update({key: copy.deepcopy(value) for key, value in template.items() if key not in _TEMPLATE_KNOWN_FIELDS})
+    return preserved
 
 
 def _collateral_text(value: Any, *, field_name: str) -> str:
@@ -349,10 +390,14 @@ def _positive_decimal_text(value: Any, *, field_name: str, code: str) -> str:
 
 
 def _positive_int(value: Any, *, field_name: str) -> int:
-    try:
-        integer_value = int(value)
-    except (TypeError, ValueError) as exc:
-        raise TemplateValidationError("kanglong_test_template_invalid_leverage", field_name, value) from exc
+    if isinstance(value, bool):
+        raise TemplateValidationError("kanglong_test_template_invalid_leverage", field_name, value)
+    if isinstance(value, int):
+        integer_value = value
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        integer_value = int(value.strip())
+    else:
+        raise TemplateValidationError("kanglong_test_template_invalid_leverage", field_name, value)
     if integer_value <= 0:
         raise TemplateValidationError("kanglong_test_template_invalid_leverage", field_name, value)
     return integer_value

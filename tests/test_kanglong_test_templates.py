@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from decimal import Decimal
 
 import pytest
@@ -186,6 +188,56 @@ def test_store_creates_file_and_backup_on_second_save(tmp_path) -> None:
     assert store.list_templates()["recoverable_backup"] is True
 
 
+def test_concurrent_upserts_from_separate_store_instances_preserve_all_templates(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    original_read_document = KanglongTemplateStore._read_document
+
+    def slow_read_document(self):
+        document = original_read_document(self)
+        time.sleep(0.05)
+        return document
+
+    monkeypatch.setattr(KanglongTemplateStore, "_read_document", slow_read_document)
+    errors: list[BaseException] = []
+
+    def write_template(index: int) -> None:
+        try:
+            KanglongTemplateStore(path).upsert_template(template_payload(f"tpl_eth_drop_{index}"))
+        except BaseException as exc:  # pragma: no cover - assertion reports collected errors
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write_template, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert {item["id"] for item in KanglongTemplateStore(path).list_templates()["templates"]} == {
+        f"tpl_eth_drop_{index}" for index in range(8)
+    }
+
+
+def test_upsert_preserves_unknown_fields_on_unrelated_templates(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    first = template_payload("tpl_eth_drop_001")
+    first["notes"] = "operator note"
+    first["ui_collapsed"] = True
+    second = template_payload("tpl_btc_drop_001")
+    second["symbol"] = "BTCUSDC"
+    path.write_text(
+        json.dumps({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": [first, second]}),
+        encoding="utf-8",
+    )
+    store = KanglongTemplateStore(path)
+
+    store.upsert_template({**second, "name": "BTC renamed"})
+
+    by_id = {item["id"]: item for item in store.list_templates()["templates"]}
+    assert by_id["tpl_eth_drop_001"]["notes"] == "operator note"
+    assert by_id["tpl_eth_drop_001"]["ui_collapsed"] is True
+
+
 def test_store_rejects_corrupted_json(tmp_path) -> None:
     path = tmp_path / "kanglong_test_templates.json"
     path.write_text("{", encoding="utf-8")
@@ -272,6 +324,41 @@ def test_list_templates_rejects_invalid_numeric_legacy_templates(tmp_path, secti
         store.list_templates()
 
     assert excinfo.value.code == code
+
+
+@pytest.mark.parametrize("value", [True, False, 1.9, "1.9", Decimal("2.5"), "0", 0, -1])
+def test_upsert_rejects_non_integer_or_non_positive_leverage(tmp_path, value) -> None:
+    template = template_payload()
+    template["main_account"]["leverage"] = value
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    with pytest.raises(TemplateValidationError) as excinfo:
+        store.upsert_template(template)
+
+    assert excinfo.value.code == "kanglong_test_template_invalid_leverage"
+
+
+def test_missing_row_id_collision_is_derived_and_uniquified(tmp_path) -> None:
+    template = template_payload()
+    template["subaccounts"][0].pop("row_id")
+    template["subaccounts"].append({**template["subaccounts"][0]})
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    created = store.upsert_template(template)
+
+    assert [item["row_id"] for item in created["subaccounts"]] == ["test-sub-1", "test-sub-1-2"]
+
+
+def test_explicit_duplicate_row_id_rejects_template(tmp_path) -> None:
+    template = template_payload()
+    template["subaccounts"].append({**template["subaccounts"][0], "account_id": "test-sub-2"})
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    with pytest.raises(TemplateValidationError) as excinfo:
+        store.upsert_template(template)
+
+    assert excinfo.value.code == "kanglong_test_template_invalid_id"
+    assert excinfo.value.field == "subaccounts.row_id"
 
 
 def test_clone_generates_new_template_id_and_row_ids(tmp_path) -> None:
