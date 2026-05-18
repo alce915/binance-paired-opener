@@ -340,6 +340,10 @@ def _template_account_snapshot_payload(
     }
 
 
+def _is_template_runtime_account_id(account_id: str) -> bool:
+    return account_id.strip().lower().startswith("tpl:")
+
+
 async def _collect_template_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
     template_id = _require_template_plan_field(
         request.test_template_id,
@@ -713,6 +717,14 @@ async def _preview_template_from_market_data(template: dict[str, Any], market_da
         raise HTTPException(
             status_code=400,
             detail={"code": "kanglong_test_template_market_data_account_required"},
+        )
+    if _is_template_runtime_account_id(market_data_account_id):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "kanglong_test_template_market_data_account_unavailable",
+                "account_id": market_data_account_id,
+            },
         )
     runtime_manager: AccountRuntimeManager = app.state.runtime_manager
     gateway = None

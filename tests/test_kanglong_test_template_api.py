@@ -355,6 +355,39 @@ async def test_collect_template_plan_inputs_rejects_stale_hash(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_collect_template_plan_inputs_rejects_synthetic_market_data_account_before_gateway(monkeypatch, tmp_path) -> None:
+    install_template_settings(monkeypatch, tmp_path)
+    template = KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(template_payload())
+
+    class RecordingRuntimeManager:
+        def __init__(self) -> None:
+            self.build_calls: list[str] = []
+
+        def build_temporary_gateway(self, account_id: str):
+            self.build_calls.append(account_id)
+            raise AssertionError("synthetic market data account must be rejected before gateway construction")
+
+    runtime_manager = RecordingRuntimeManager()
+    monkeypatch.setattr(api_module.app.state, "runtime_manager", runtime_manager, raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await api_module._collect_kanglong_plan_inputs(
+            KanglongPlanRequest(
+                main_account_id="tpl:tpl_eth_drop_001:main",
+                subaccount_ids=["tpl:tpl_eth_drop_001:sub:sub-1"],
+                account_source="test_template",
+                test_template_id=template["id"],
+                template_content_hash=template["template_content_hash"],
+                market_data_account_id=" tpl:tpl_eth_drop_001:main ",
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "kanglong_test_template_market_data_account_unavailable"
+    assert runtime_manager.build_calls == []
+
+
+@pytest.mark.asyncio
 async def test_collect_runtime_plan_inputs_rejects_template_fields_before_building_gateways(monkeypatch) -> None:
     runtime_manager = FakeTemplateRuntimeManager(FakeTemplateMarketGateway())
     monkeypatch.setattr(api_module.app.state, "runtime_manager", runtime_manager, raising=False)
