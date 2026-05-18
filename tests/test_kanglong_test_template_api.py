@@ -9,8 +9,10 @@ from fastapi.testclient import TestClient
 from paired_opener import api as api_module
 from paired_opener.config import Settings
 from paired_opener.domain import Quote, SymbolRules
+from paired_opener.kanglong.service import KanglongSimulationService
 from paired_opener.kanglong.test_templates import KanglongTemplateStore
 from paired_opener.schemas import KanglongPlanRequest
+from paired_opener.storage import SqliteRepository
 
 
 def template_payload(template_id: str = "tpl_eth_drop_001") -> dict:
@@ -181,6 +183,139 @@ class FakeTemplateRuntimeManager:
             raise AssertionError("preview must not build gateways for template runtime account ids")
         self.build_calls.append(account_id)
         return self.gateway
+
+
+def install_template_api_runtime(monkeypatch, tmp_path):
+    install_template_settings(monkeypatch, tmp_path)
+    repository = SqliteRepository(tmp_path / "kanglong.sqlite3")
+    monkeypatch.setattr(api_module.app.state, "kanglong_service", KanglongSimulationService(repository), raising=False)
+    gateway = FakeTemplateMarketGateway()
+    runtime_manager = FakeTemplateRuntimeManager(gateway)
+    monkeypatch.setattr(api_module.app.state, "runtime_manager", runtime_manager, raising=False)
+    payload = template_payload()
+    payload["subaccounts"][0]["qty"] = "1"
+    template = KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(payload)
+    return repository, runtime_manager, template
+
+
+def create_template_backed_plan(client: TestClient, template: dict, *, run_id: str | None = None) -> dict:
+    request = {
+        "main_account_id": "tpl:tpl_eth_drop_001:main",
+        "subaccount_ids": ["tpl:tpl_eth_drop_001:sub:sub-1"],
+        "account_source": "test_template",
+        "test_template_id": template["id"],
+        "template_content_hash": template["template_content_hash"],
+        "market_data_account_id": "market-main",
+    }
+    if run_id is not None:
+        request["run_id"] = run_id
+    response = client.post("/kanglong/simulation/plan", json=request)
+    assert response.status_code == 200
+    return response.json()
+
+
+def stale_template() -> dict:
+    updated = template_payload()
+    updated["name"] = "Edited after plan creation"
+    updated["subaccounts"][0]["collateral"] = "6000"
+    return updated
+
+
+def test_kanglong_active_template_plan_preserves_frozen_synthetic_accounts(monkeypatch, tmp_path) -> None:
+    repository, runtime_manager, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template)
+        response = client.get("/kanglong/simulation/run/active")
+    finally:
+        repository.close()
+
+    assert created["status"] == "chain_ready"
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["request"]["account_source"] == "test_template"
+    account_ids = [account["account_id"] for account in payload["report"]["account_snapshot"]["accounts"]]
+    assert account_ids == ["tpl:tpl_eth_drop_001:main", "tpl:tpl_eth_drop_001:sub:sub-1"]
+    assert runtime_manager.build_calls == ["market-main"]
+
+
+def test_kanglong_template_confirm_blocks_when_template_changed(monkeypatch, tmp_path) -> None:
+    repository, _, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template)
+        KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(stale_template())
+        response = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/confirm",
+            json={"plan_version": created["plan_version"], "idempotency_key": "confirm-stale-template-0001"},
+        )
+        stored = repository.get_kanglong_run(created["run_id"])
+    finally:
+        repository.close()
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "blocked_plan_stale"
+    assert stored is not None
+    assert stored["status"] == "chain_ready"
+
+
+def test_kanglong_template_execute_blocks_when_template_changed_after_confirm(monkeypatch, tmp_path) -> None:
+    repository, _, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template)
+        confirmed = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/confirm",
+            json={"plan_version": created["plan_version"], "idempotency_key": "confirm-before-stale-0001"},
+        )
+        KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(stale_template())
+        response = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/execute",
+            json={"plan_version": created["plan_version"], "idempotency_key": "execute-stale-template-0001"},
+        )
+        stored = repository.get_kanglong_run(created["run_id"])
+    finally:
+        repository.close()
+
+    assert confirmed.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "blocked_plan_stale"
+    assert stored is not None
+    assert stored["status"] == "plan_confirmed"
+
+
+def test_kanglong_template_execute_uses_market_data_without_rebuilding_template_accounts(monkeypatch, tmp_path) -> None:
+    repository, runtime_manager, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+
+    async def fail_template_plan_collection(request):
+        raise AssertionError("execute must not rebuild account snapshots from the template")
+
+    try:
+        created = create_template_backed_plan(client, template)
+        confirmed = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/confirm",
+            json={"plan_version": created["plan_version"], "idempotency_key": "confirm-template-exec-0001"},
+        )
+        monkeypatch.setattr(api_module, "_collect_template_kanglong_plan_inputs", fail_template_plan_collection)
+        response = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/execute",
+            json={"plan_version": created["plan_version"], "idempotency_key": "execute-template-market-0001"},
+        )
+        stored = repository.get_kanglong_run(created["run_id"])
+    finally:
+        repository.close()
+
+    assert confirmed.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert runtime_manager.build_calls == ["market-main", "market-main"]
+    assert stored is not None
+    synthetic_state = stored["report"]["synthetic_account_state"]
+    assert [account["account_id"] for account in synthetic_state["accounts"]] == [
+        "tpl:tpl_eth_drop_001:main",
+        "tpl:tpl_eth_drop_001:sub:sub-1",
+    ]
 
 
 def test_kanglong_test_template_preview_uses_market_data_account_only(monkeypatch, tmp_path) -> None:

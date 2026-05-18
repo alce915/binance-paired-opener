@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from app_i18n.runtime import DEFAULT_LOCALE, DEFAULT_TIMEZONE, format_copy, frontend_bootstrap_payload, make_api_detail
 from paired_opener.account_runtime import AccountRuntimeManager
 from paired_opener.config import DEFAULT_LEVERAGE, DEFAULT_TRADING_SYMBOL, Settings, settings
-from paired_opener.domain import ExchangeStateError, SessionConflictError
+from paired_opener.domain import ExchangeStateError, PositionSide, SessionConflictError
 from paired_opener.errors import TradingError, ensure_trading_error, http_status_for_error, invalid_parameter_error
 from paired_opener.kanglong.config import load_kanglong_symbol_config
 from paired_opener.kanglong.service import KanglongSimulationService
@@ -150,6 +150,33 @@ def _raise_kanglong_template_error(exc: Exception) -> None:
         status_code = 404 if exc.code == "kanglong_test_template_not_found" else 400
         raise HTTPException(status_code=status_code, detail={"code": exc.code, **exc.detail}) from exc
     raise exc
+
+
+def _raise_blocked_plan_stale(**detail: Any) -> None:
+    raise HTTPException(status_code=409, detail={"code": "blocked_plan_stale", **detail})
+
+
+def _validate_template_run_not_stale(stored: dict[str, Any]) -> None:
+    request_payload = stored.get("request") or {}
+    if request_payload.get("account_source") != "test_template":
+        return
+    template_id = request_payload.get("test_template_id")
+    template_content_hash = request_payload.get("template_content_hash")
+    if not template_id or not template_content_hash:
+        _raise_blocked_plan_stale(run_id=stored.get("run_id"))
+    try:
+        template = _kanglong_template_store().get_template(str(template_id))
+    except Exception as exc:
+        if isinstance(exc, (TemplateStoreError, TemplateValidationError)):
+            _raise_blocked_plan_stale(run_id=stored.get("run_id"), template_id=template_id)
+        raise
+    if template.get("template_content_hash") != template_content_hash:
+        _raise_blocked_plan_stale(
+            run_id=stored.get("run_id"),
+            template_id=template_id,
+            current_template_content_hash=template.get("template_content_hash"),
+            requested_template_content_hash=template_content_hash,
+        )
 
 
 def _api_text(value: object) -> str:
@@ -785,6 +812,139 @@ async def _preview_template_from_market_data(template: dict[str, Any], market_da
     return preview_payload or {}
 
 
+def _orderbook_level_price(levels: Any) -> Decimal | None:
+    if not isinstance(levels, list) or not levels:
+        return None
+    first = levels[0]
+    if isinstance(first, dict):
+        value = first.get("price")
+    elif isinstance(first, (list, tuple)) and first:
+        value = first[0]
+    else:
+        value = first
+    try:
+        price = Decimal(str(value))
+    except Exception:
+        return None
+    return price if price > 0 else None
+
+
+def _orderbook_best_bid_ask(orderbook: Any) -> tuple[Decimal, Decimal]:
+    bids = orderbook.get("bids") if isinstance(orderbook, dict) else getattr(orderbook, "bids", None)
+    asks = orderbook.get("asks") if isinstance(orderbook, dict) else getattr(orderbook, "asks", None)
+    bid = _orderbook_level_price(bids)
+    ask = _orderbook_level_price(asks)
+    if bid is None or ask is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_test_template_market_data_account_unavailable"},
+        )
+    return bid, ask
+
+
+def _template_execution_baseline_accounts(report: dict[str, Any]) -> list[dict[str, Any]]:
+    synthetic_state = report.get("synthetic_account_state")
+    if isinstance(synthetic_state, dict) and isinstance(synthetic_state.get("accounts"), list):
+        return list(synthetic_state["accounts"])
+    account_snapshot = report.get("account_snapshot")
+    if isinstance(account_snapshot, dict) and isinstance(account_snapshot.get("accounts"), list):
+        return list(account_snapshot["accounts"])
+    return []
+
+
+def _template_execution_snapshots(stored: dict[str, Any]) -> tuple[Any | None, list[Any] | None]:
+    request_payload = stored.get("request") or {}
+    accounts = _template_execution_baseline_accounts(stored.get("report") or {})
+    if not accounts:
+        return None, None
+    accounts_by_id = {str(account.get("account_id") or ""): account for account in accounts if isinstance(account, dict)}
+    leverage_by_account_id = request_payload.get("leverage_by_account_id") or {}
+
+    def snapshot_for(account_id: str):
+        account = accounts_by_id.get(account_id)
+        if account is None:
+            return None
+        leverage = leverage_by_account_id.get(account_id)
+        if leverage is None:
+            leverage = next(
+                (
+                    position.get("leverage")
+                    for position in account.get("positions") or []
+                    if isinstance(position, dict) and position.get("leverage") is not None
+                ),
+                DEFAULT_LEVERAGE,
+            )
+        return preview_account_to_kanglong_snapshot(account, leverage=int(leverage))
+
+    main_snapshot = snapshot_for(str(request_payload.get("main_account_id") or ""))
+    subaccount_snapshots = [
+        snapshot
+        for account_id in request_payload.get("subaccount_ids") or []
+        if (snapshot := snapshot_for(str(account_id))) is not None
+    ]
+    if main_snapshot is None or len(subaccount_snapshots) != len(request_payload.get("subaccount_ids") or []):
+        return None, None
+    return main_snapshot, subaccount_snapshots
+
+
+async def _collect_template_execution_market_inputs(stored: dict[str, Any]) -> dict[str, Any]:
+    request_payload = stored.get("request") or {}
+    market_data_account_id = str(request_payload.get("market_data_account_id") or "").strip()
+    if not market_data_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_test_template_market_data_account_required"},
+        )
+    if _is_template_runtime_account_id(market_data_account_id):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_test_template_market_data_account_unavailable"},
+        )
+    symbol = str(request_payload.get("symbol") or stored.get("symbol") or DEFAULT_TRADING_SYMBOL).strip().upper()
+    runtime_manager: AccountRuntimeManager = app.state.runtime_manager
+    gateway = None
+    operation_failed = False
+    try:
+        gateway = runtime_manager.build_temporary_gateway(market_data_account_id)
+        rules = await gateway.get_symbol_rules(symbol)
+        await gateway.get_quote(symbol)
+        orderbook = await gateway.get_order_book(symbol)
+    except HTTPException:
+        operation_failed = True
+        raise
+    except Exception as exc:
+        operation_failed = True
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_test_template_market_data_account_unavailable"},
+        ) from exc
+    finally:
+        if gateway is not None:
+            try:
+                await gateway.close()
+            except Exception as exc:
+                if not operation_failed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": "kanglong_test_template_market_data_account_unavailable"},
+                    ) from exc
+    close_price, open_price = _orderbook_best_bid_ask(orderbook)
+    config = load_kanglong_symbol_config(app.state.settings, symbol)
+    main_snapshot, subaccount_snapshots = _template_execution_snapshots(stored)
+    selected_side_value = (stored.get("plan") or {}).get("selected_side")
+    return {
+        "close_price": close_price,
+        "open_price": open_price,
+        "fee_rate": Decimal(str(config.fee_rate)),
+        "recheck_main_snapshot": main_snapshot,
+        "recheck_subaccount_snapshots": subaccount_snapshots,
+        "recheck_selected_side": PositionSide(selected_side_value) if selected_side_value else None,
+        "recheck_config": config,
+        "recheck_snapshot_bundle_id": stored.get("snapshot_bundle_id"),
+        "rules": rules,
+    }
+
+
 @app.post("/kanglong/simulation/test-templates/{template_id}/preview")
 async def preview_kanglong_test_template(template_id: str, request: KanglongTemplatePreviewRequest) -> dict[str, Any]:
     market_data_account_id = request.market_data_account_id.strip()
@@ -842,7 +1002,12 @@ async def list_kanglong_simulation_accounts(symbol: str = Query(default=DEFAULT_
 
 @app.post("/kanglong/simulation/plan/{run_id}/confirm", response_model=KanglongPlanResponse)
 async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
-    payload = app.state.kanglong_service.confirm_plan(
+    service = app.state.kanglong_service
+    get_run = getattr(service, "get_run", None)
+    stored = get_run(run_id) if callable(get_run) else None
+    if stored is not None:
+        _validate_template_run_not_stale(stored)
+    payload = service.confirm_plan(
         run_id=run_id,
         plan_version=request.plan_version,
         idempotency_key=request.idempotency_key,
@@ -856,6 +1021,8 @@ async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionR
 async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
     service = app.state.kanglong_service
     stored = service.get_run(run_id)
+    if stored is not None:
+        _validate_template_run_not_stale(stored)
     execute_kwargs = {
         "run_id": run_id,
         "plan_version": request.plan_version,
@@ -871,36 +1038,56 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
     ):
         stored_request = stored.get("request") or {}
         if stored_request.get("main_account_id") and stored_request.get("subaccount_ids"):
-            selected_side = (stored.get("plan") or {}).get("selected_side")
-            plan_request = KanglongPlanRequest(
-                mode=stored_request.get("mode") or "simulation",
-                symbol=stored_request.get("symbol") or stored.get("symbol"),
-                main_account_id=stored_request["main_account_id"],
-                subaccount_ids=list(stored_request["subaccount_ids"]),
-                selected_side=selected_side,
-                account_source=stored_request.get("account_source") or "runtime",
-                test_template_id=stored_request.get("test_template_id"),
-                template_content_hash=stored_request.get("template_content_hash"),
-                market_data_account_id=stored_request.get("market_data_account_id"),
-            )
-            try:
-                inputs = await _collect_kanglong_plan_inputs(plan_request)
-            except HTTPException:
-                raise
-            except Exception as exc:
-                _raise_api_error(exc, code="kanglong_plan_failed", source="service")
-            execute_kwargs.update(
-                {
-                    "close_price": inputs["close_price"],
-                    "open_price": inputs["open_price"],
-                    "fee_rate": inputs["fee_rate"],
-                    "recheck_main_snapshot": inputs["main_snapshot"],
-                    "recheck_subaccount_snapshots": inputs["subaccount_snapshots"],
-                    "recheck_selected_side": inputs["selected_side"],
-                    "recheck_config": inputs["config"],
-                    "recheck_snapshot_bundle_id": inputs["snapshot_bundle_id"],
-                }
-            )
+            if stored_request.get("account_source") == "test_template":
+                try:
+                    inputs = await _collect_template_execution_market_inputs(stored)
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    _raise_api_error(exc, code="kanglong_plan_failed", source="service")
+                execute_kwargs.update(
+                    {
+                        "close_price": inputs["close_price"],
+                        "open_price": inputs["open_price"],
+                        "fee_rate": inputs["fee_rate"],
+                        "recheck_main_snapshot": inputs["recheck_main_snapshot"],
+                        "recheck_subaccount_snapshots": inputs["recheck_subaccount_snapshots"],
+                        "recheck_selected_side": inputs["recheck_selected_side"],
+                        "recheck_config": inputs["recheck_config"],
+                        "recheck_snapshot_bundle_id": inputs["recheck_snapshot_bundle_id"],
+                    }
+                )
+            else:
+                selected_side = (stored.get("plan") or {}).get("selected_side")
+                plan_request = KanglongPlanRequest(
+                    mode=stored_request.get("mode") or "simulation",
+                    symbol=stored_request.get("symbol") or stored.get("symbol"),
+                    main_account_id=stored_request["main_account_id"],
+                    subaccount_ids=list(stored_request["subaccount_ids"]),
+                    selected_side=selected_side,
+                    account_source=stored_request.get("account_source") or "runtime",
+                    test_template_id=stored_request.get("test_template_id"),
+                    template_content_hash=stored_request.get("template_content_hash"),
+                    market_data_account_id=stored_request.get("market_data_account_id"),
+                )
+                try:
+                    inputs = await _collect_kanglong_plan_inputs(plan_request)
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    _raise_api_error(exc, code="kanglong_plan_failed", source="service")
+                execute_kwargs.update(
+                    {
+                        "close_price": inputs["close_price"],
+                        "open_price": inputs["open_price"],
+                        "fee_rate": inputs["fee_rate"],
+                        "recheck_main_snapshot": inputs["main_snapshot"],
+                        "recheck_subaccount_snapshots": inputs["subaccount_snapshots"],
+                        "recheck_selected_side": inputs["selected_side"],
+                        "recheck_config": inputs["config"],
+                        "recheck_snapshot_bundle_id": inputs["snapshot_bundle_id"],
+                    }
+                )
     payload = service.execute_plan(**execute_kwargs)
     return KanglongPlanResponse.model_validate(payload)
 

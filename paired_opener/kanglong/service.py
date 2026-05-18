@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ from paired_opener.kanglong.precheck import run_static_precheck
 from paired_opener.kanglong.reporter import summarize_costs
 from paired_opener.kanglong.simulator import simulate_group
 from paired_opener.storage import SqliteRepository
+
+_DEFAULT_SYNTHETIC_LEVERAGE = 1
 
 
 def _now_text() -> str:
@@ -117,6 +120,124 @@ def _price_drift_bps(previous: Decimal, current: Decimal) -> Decimal:
     if previous <= Decimal("0"):
         return Decimal("0")
     return abs(current - previous) / previous * Decimal("10000")
+
+
+def _decimal_payload_value(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except Exception:
+        return Decimal("0")
+
+
+def _set_decimal_payload(target: dict[str, Any], key: str, value: Decimal) -> None:
+    if key in target:
+        target[key] = decimal_text(value)
+
+
+def _find_synthetic_account(accounts: list[dict[str, Any]], account_id: str) -> dict[str, Any] | None:
+    return next((account for account in accounts if str(account.get("account_id") or "") == account_id), None)
+
+
+def _find_synthetic_position(account: dict[str, Any], side: str) -> dict[str, Any] | None:
+    return next(
+        (
+            position
+            for position in account.get("positions") or []
+            if str(position.get("position_side") or "").strip().upper() == side
+        ),
+        None,
+    )
+
+
+def _new_synthetic_position(account: dict[str, Any], group: dict[str, Any], qty: Decimal, price: Decimal) -> dict[str, Any]:
+    leverage = int(account.get("leverage") or _DEFAULT_SYNTHETIC_LEVERAGE)
+    notional = qty * price
+    margin = notional / Decimal(max(leverage, 1))
+    return {
+        "symbol": str(group.get("symbol") or "").strip().upper(),
+        "position_side": str(group.get("side") or "").strip().upper(),
+        "qty": decimal_text(qty),
+        "entry_price": decimal_text(price),
+        "mark_price": decimal_text(price),
+        "unrealized_pnl": "0",
+        "liquidation_price": "0",
+        "notional": decimal_text(notional),
+        "leverage": leverage,
+        "margin": decimal_text(margin),
+    }
+
+
+def _refresh_synthetic_account_totals(account: dict[str, Any]) -> None:
+    positions = [position for position in account.get("positions") or [] if isinstance(position, dict)]
+    total_unrealized = sum((_decimal_payload_value(position.get("unrealized_pnl")) for position in positions), Decimal("0"))
+    total_margin = sum((_decimal_payload_value(position.get("margin")) for position in positions), Decimal("0"))
+    wallet_balance = _decimal_payload_value(account.get("wallet_balance") or account.get("collateral"))
+    equity = wallet_balance + total_unrealized
+    available_balance = max(equity - total_margin, Decimal("0"))
+    _set_decimal_payload(account, "total_unrealized_pnl", total_unrealized)
+    _set_decimal_payload(account, "margin", total_margin)
+    _set_decimal_payload(account, "equity", equity)
+    _set_decimal_payload(account, "available_balance", available_balance)
+    _set_decimal_payload(account, "margin_deficit", max(total_margin - equity, Decimal("0")))
+
+
+def _update_existing_position_qty(position: dict[str, Any], qty: Decimal, price: Decimal) -> None:
+    previous_qty = _decimal_payload_value(position.get("qty"))
+    previous_pnl = _decimal_payload_value(position.get("unrealized_pnl"))
+    next_pnl = Decimal("0") if previous_qty <= 0 else previous_pnl * qty / previous_qty
+    leverage = int(position.get("leverage") or _DEFAULT_SYNTHETIC_LEVERAGE)
+    notional = qty * _decimal_payload_value(position.get("mark_price") or price)
+    margin = notional / Decimal(max(leverage, 1))
+    position["qty"] = decimal_text(qty)
+    _set_decimal_payload(position, "unrealized_pnl", next_pnl)
+    _set_decimal_payload(position, "notional", notional)
+    _set_decimal_payload(position, "margin", margin)
+
+
+def _matched_qty_from_group(group: dict[str, Any]) -> Decimal:
+    return sum((_decimal_payload_value(qty) for qty in group.get("round_qtys") or []), Decimal("0"))
+
+
+def _synthetic_account_baseline(report: dict[str, Any]) -> list[dict[str, Any]]:
+    synthetic_state = report.get("synthetic_account_state")
+    if isinstance(synthetic_state, dict) and isinstance(synthetic_state.get("accounts"), list):
+        return copy.deepcopy(synthetic_state["accounts"])
+    account_snapshot = report.get("account_snapshot")
+    if isinstance(account_snapshot, dict) and isinstance(account_snapshot.get("accounts"), list):
+        return copy.deepcopy(account_snapshot["accounts"])
+    return []
+
+
+def _apply_group_result_to_synthetic_accounts(
+    accounts: list[dict[str, Any]],
+    group: dict[str, Any],
+    *,
+    matched_qty: Decimal,
+    close_price: Decimal,
+    open_price: Decimal,
+) -> list[dict[str, Any]]:
+    if matched_qty <= Decimal("0"):
+        return accounts
+    side = str(group.get("side") or "").strip().upper()
+    from_account = _find_synthetic_account(accounts, str(group.get("from_account_id") or ""))
+    to_account = _find_synthetic_account(accounts, str(group.get("to_account_id") or ""))
+    if from_account is not None:
+        from_position = _find_synthetic_position(from_account, side)
+        if from_position is not None:
+            next_qty = max(_decimal_payload_value(from_position.get("qty")) - matched_qty, Decimal("0"))
+            _update_existing_position_qty(from_position, next_qty, close_price)
+            _refresh_synthetic_account_totals(from_account)
+    if to_account is not None:
+        to_position = _find_synthetic_position(to_account, side)
+        if to_position is None:
+            positions = list(to_account.get("positions") or [])
+            to_position = _new_synthetic_position(to_account, group, Decimal("0"), open_price)
+            positions.append(to_position)
+            to_account["positions"] = positions
+        next_qty = _decimal_payload_value(to_position.get("qty")) + matched_qty
+        _update_existing_position_qty(to_position, next_qty, open_price)
+        _refresh_synthetic_account_totals(to_account)
+    return accounts
 
 
 class KanglongSimulationService:
@@ -501,21 +622,52 @@ class KanglongSimulationService:
             available_actions=[],
         )
         plan = stored.get("plan") or {}
-        for group in plan.get("groups") or []:
+        report = copy.deepcopy(stored.get("report") or {})
+        request_payload = stored.get("request") or {}
+        synthetic_accounts = _synthetic_account_baseline(report) if request_payload.get("account_source") == "test_template" else []
+        groups = list(plan.get("groups") or [])
+        for group_index, group in enumerate(groups, start=1):
             group_id = group.get("group_id")
-            self._repository.add_kanglong_event(
+            if synthetic_accounts:
+                synthetic_accounts = _apply_group_result_to_synthetic_accounts(
+                    synthetic_accounts,
+                    group,
+                    matched_qty=_matched_qty_from_group(group),
+                    close_price=close_price,
+                    open_price=open_price,
+                )
+                report["synthetic_account_state"] = {
+                    "account_source": "test_template",
+                    "state_version": f"{run_id}:{group_id}:group-{group_index:04d}",
+                    "accounts": synthetic_accounts,
+                    "updated_at": _now_text(),
+                }
+            progress = {
+                "current_group_id": group_id,
+                "groups_completed": group_index,
+                "group_count": len(groups),
+            }
+            self._repository.update_kanglong_run_and_events(
                 run_id,
-                "kanglong_group_simulated",
-                {
-                    "message_key": "events.kanglong.group_simulated",
-                    "message_params": {"group_id": group_id},
-                    "group_id": group_id,
-                    "plan_version": plan_version,
-                    "close_price": decimal_text(close_price),
-                    "open_price": decimal_text(open_price),
-                    "fee_rate": decimal_text(fee_rate),
-                },
-                group_id=group_id,
+                status=KanglongRunStatus.GROUP_COMPLETED.value,
+                available_actions=[],
+                progress=progress,
+                report=report,
+                events=[
+                    {
+                        "event_type": "kanglong_group_simulated",
+                        "group_id": group_id,
+                        "payload": {
+                            "message_key": "events.kanglong.group_simulated",
+                            "message_params": {"group_id": group_id},
+                            "group_id": group_id,
+                            "plan_version": plan_version,
+                            "close_price": decimal_text(close_price),
+                            "open_price": decimal_text(open_price),
+                            "fee_rate": decimal_text(fee_rate),
+                        },
+                    }
+                ],
             )
 
         available_actions = ["view_report"]
@@ -524,6 +676,7 @@ class KanglongSimulationService:
             status=KanglongRunStatus.COMPLETED.value,
             result_grade=KanglongResultGrade.SAFE_CLOSED.value,
             available_actions=available_actions,
+            report=report,
         )
         self._repository.release_kanglong_locks(run_id)
         response = _response_base(
@@ -532,7 +685,7 @@ class KanglongSimulationService:
             plan_version=plan_version,
             snapshot_bundle_id=stored.get("snapshot_bundle_id"),
             available_actions=available_actions,
-            report=stored.get("report") or {},
+            report=report,
             result_grade=KanglongResultGrade.SAFE_CLOSED.value,
             latest_event_id=self._repository.latest_kanglong_event_id(run_id),
         )

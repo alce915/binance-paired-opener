@@ -386,6 +386,91 @@ class SqliteRepository:
                 ),
             )
 
+    def update_kanglong_run_and_events(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        events: list[dict[str, Any]],
+        plan: dict[str, Any] | None = None,
+        report: dict[str, Any] | None = None,
+        result_grade: str | None = None,
+        plan_version: str | None = None,
+        snapshot_bundle_id: str | None = None,
+        confirmed_at: str | None = None,
+        available_actions: list[str] | None = None,
+        progress: dict[str, Any] | None = None,
+        report_summary: dict[str, Any] | None = None,
+    ) -> list[int]:
+        event_ids: list[int] = []
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                """
+                SELECT plan_json, report_json, result_grade, plan_version,
+                       snapshot_bundle_id, confirmed_at, available_actions_json,
+                       progress_json, report_summary_json
+                FROM kanglong_runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if current is None:
+                return event_ids
+            next_report_summary_json = current["report_summary_json"]
+            if report_summary is not None:
+                next_report_summary_json = _json_dumps(report_summary)
+            elif report is not None:
+                next_report_summary_json = _json_dumps(_kanglong_report_summary({}, report))
+            self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET status = ?,
+                    result_grade = ?,
+                    plan_json = ?,
+                    report_json = ?,
+                    plan_version = ?,
+                    snapshot_bundle_id = ?,
+                    confirmed_at = ?,
+                    available_actions_json = ?,
+                    progress_json = ?,
+                    report_summary_json = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    status,
+                    result_grade if result_grade is not None else current["result_grade"],
+                    _json_dumps(plan) if plan is not None else current["plan_json"],
+                    _json_dumps(report) if report is not None else current["report_json"],
+                    plan_version if plan_version is not None else current["plan_version"],
+                    snapshot_bundle_id if snapshot_bundle_id is not None else current["snapshot_bundle_id"],
+                    confirmed_at if confirmed_at is not None else current["confirmed_at"],
+                    _json_dumps(available_actions) if available_actions is not None else current["available_actions_json"],
+                    _json_dumps(progress) if progress is not None else current["progress_json"],
+                    next_report_summary_json,
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                ),
+            )
+            created_at = datetime.now(UTC).isoformat()
+            for event in events:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO kanglong_events (run_id, group_id, round_id, event_type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        event.get("group_id"),
+                        event.get("round_id"),
+                        event["event_type"],
+                        _json_dumps(event.get("payload") or {}),
+                        created_at,
+                    ),
+                )
+                event_ids.append(int(cursor.lastrowid))
+        return event_ids
+
     def add_kanglong_event(
         self,
         run_id: str,

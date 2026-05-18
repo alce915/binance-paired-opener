@@ -98,6 +98,100 @@ def _create_ready_plan(
     )
 
 
+def _template_account_snapshot_payload() -> dict:
+    return {
+        "account_source": "test_template",
+        "template_id": "tpl_eth_drop_001",
+        "template_content_hash": "sha256:template-v1",
+        "accounts": [
+            {
+                "account_id": "tpl:tpl_eth_drop_001:main",
+                "template_account_id": "test-main",
+                "name": "Test Main",
+                "role": "main",
+                "collateral": "10000",
+                "wallet_balance": "10000",
+                "total_unrealized_pnl": "0",
+                "equity": "10000",
+                "available_balance": "10000",
+                "margin": "0",
+                "margin_deficit": "0",
+                "positions": [],
+            },
+            {
+                "account_id": "tpl:tpl_eth_drop_001:sub:sub-1",
+                "template_account_id": "test-sub-1",
+                "row_id": "sub-1",
+                "name": "Test Sub 1",
+                "role": "subaccount",
+                "collateral": "5000",
+                "wallet_balance": "5000",
+                "total_unrealized_pnl": "100",
+                "equity": "5100",
+                "available_balance": "4975",
+                "margin": "125",
+                "margin_deficit": "0",
+                "positions": [
+                    {
+                        "symbol": "ETHUSDC",
+                        "position_side": "LONG",
+                        "qty": "1",
+                        "entry_price": "3000",
+                        "mark_price": "3100",
+                        "unrealized_pnl": "100",
+                        "liquidation_price": "0",
+                        "notional": "3100",
+                        "leverage": 75,
+                        "margin": "41.33333333333333333333333333",
+                    },
+                    {
+                        "symbol": "ETHUSDC",
+                        "position_side": "SHORT",
+                        "qty": "1",
+                        "entry_price": "3100",
+                        "mark_price": "3100",
+                        "unrealized_pnl": "0",
+                        "liquidation_price": "0",
+                        "notional": "3100",
+                        "leverage": 75,
+                        "margin": "41.33333333333333333333333333",
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _create_ready_template_plan(
+    service: KanglongSimulationService,
+    *,
+    run_id: str,
+    snapshot_bundle_id: str = "snap-template",
+) -> dict:
+    return service.create_plan(
+        run_id=run_id,
+        symbol="ETHUSDC",
+        main_snapshot=snapshot("tpl:tpl_eth_drop_001:main", "0", "0", "0", "0"),
+        subaccount_snapshots=[snapshot("tpl:tpl_eth_drop_001:sub:sub-1", "1", "1", "100", "0")],
+        main_account_id="tpl:tpl_eth_drop_001:main",
+        subaccount_ids=["tpl:tpl_eth_drop_001:sub:sub-1"],
+        selected_side=PositionSide.LONG,
+        snapshot_bundle_id=snapshot_bundle_id,
+        config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25")),
+        rules=_rules(),
+        close_price=Decimal("3100.00"),
+        open_price=Decimal("3100.50"),
+        fee_rate=Decimal("0.0005"),
+        request_metadata={
+            "account_source": "test_template",
+            "test_template_id": "tpl_eth_drop_001",
+            "template_content_hash": "sha256:template-v1",
+            "market_data_account_id": "market-main",
+        },
+        account_snapshot_payload=_template_account_snapshot_payload(),
+    )
+
+
 def _create_blocked_plan(
     service: KanglongSimulationService,
     *,
@@ -162,6 +256,45 @@ def test_service_plan_confirm_execute_records_state_and_events(tmp_path) -> None
     assert "execute" in confirmed["available_actions"]
     assert executed["status"] == "completed"
     assert events["latest_event_id"] > 0
+
+
+def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_template_plan(service, run_id="run-template-execute")
+        confirmed = service.confirm_plan(
+            run_id="run-template-execute",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-template-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        executed = service.execute_plan(
+            run_id="run-template-execute",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-template-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+        )
+        stored = repository.get_kanglong_run("run-template-execute")
+    finally:
+        repository.close()
+
+    assert confirmed["status"] == "plan_confirmed"
+    assert executed["status"] == "completed"
+    assert stored is not None
+    synthetic_state = stored["report"]["synthetic_account_state"]
+    assert synthetic_state["account_source"] == "test_template"
+    assert synthetic_state["state_version"].startswith("run-template-execute:")
+    account_ids = [account["account_id"] for account in synthetic_state["accounts"]]
+    assert account_ids == ["tpl:tpl_eth_drop_001:main", "tpl:tpl_eth_drop_001:sub:sub-1"]
+    sub = synthetic_state["accounts"][1]
+    main = synthetic_state["accounts"][0]
+    assert sub["positions"][0]["qty"] == "1.00"
+    assert main["positions"][0]["position_side"] == "LONG"
+    assert main["positions"][0]["qty"] == "0.00"
 
 
 def test_service_active_run_returns_latest_restorable_run_with_actions(tmp_path) -> None:
@@ -444,20 +577,20 @@ def test_service_plan_persists_template_metadata_and_account_snapshot_report(tmp
 
 
 @pytest.mark.asyncio
-async def test_execute_recheck_restores_template_account_source_from_stored_request(monkeypatch) -> None:
-    captured_requests: list[KanglongPlanRequest] = []
+async def test_execute_recheck_uses_template_market_data_path_from_stored_request(monkeypatch) -> None:
+    captured_stored: list[dict] = []
 
-    async def fake_collector(request: KanglongPlanRequest) -> dict:
-        captured_requests.append(request)
+    async def fake_market_inputs(stored: dict) -> dict:
+        captured_stored.append(stored)
         return {
             "close_price": Decimal("3100.00"),
             "open_price": Decimal("3100.50"),
             "fee_rate": Decimal("0.0005"),
-            "main_snapshot": snapshot(request.main_account_id, "0", "0", "0", "0"),
-            "subaccount_snapshots": [snapshot(account_id, "1", "1", "100", "0") for account_id in request.subaccount_ids],
-            "selected_side": request.selected_side,
-            "config": KanglongSymbolConfig(),
-            "snapshot_bundle_id": "snap-template-recheck",
+            "recheck_main_snapshot": snapshot("tpl:tpl_eth_drop_001:main", "0", "0", "0", "0"),
+            "recheck_subaccount_snapshots": [snapshot("tpl:tpl_eth_drop_001:sub:sub-1", "1", "1", "100", "0")],
+            "recheck_selected_side": PositionSide.LONG,
+            "recheck_config": KanglongSymbolConfig(),
+            "recheck_snapshot_bundle_id": "snap-template-recheck",
         }
 
     class TemplateExecuteService:
@@ -488,11 +621,15 @@ async def test_execute_recheck_restores_template_account_source_from_stored_requ
                 "snapshot_bundle_id": kwargs["recheck_snapshot_bundle_id"],
                 "available_actions": ["view_report"],
                 "report": {},
-            }
+                }
 
     original_collector = api_module._collect_kanglong_plan_inputs
+    original_market_inputs = api_module._collect_template_execution_market_inputs
+    original_validator = api_module._validate_template_run_not_stale
     original_service = getattr(api_module.app.state, "kanglong_service", None)
-    monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", fake_collector)
+    monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", lambda request: (_ for _ in ()).throw(AssertionError("full collector not used")))
+    monkeypatch.setattr(api_module, "_collect_template_execution_market_inputs", fake_market_inputs)
+    monkeypatch.setattr(api_module, "_validate_template_run_not_stale", lambda stored: None)
     monkeypatch.setattr(api_module.app.state, "kanglong_service", TemplateExecuteService(), raising=False)
     try:
         await api_module.execute_kanglong_simulation_plan(
@@ -501,22 +638,24 @@ async def test_execute_recheck_restores_template_account_source_from_stored_requ
         )
     finally:
         monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", original_collector)
+        monkeypatch.setattr(api_module, "_collect_template_execution_market_inputs", original_market_inputs)
+        monkeypatch.setattr(api_module, "_validate_template_run_not_stale", original_validator)
         if original_service is not None:
             monkeypatch.setattr(api_module.app.state, "kanglong_service", original_service, raising=False)
 
-    assert len(captured_requests) == 1
-    assert captured_requests[0].account_source == "test_template"
-    assert captured_requests[0].test_template_id == "tpl_eth_drop_001"
-    assert captured_requests[0].template_content_hash == "sha256:abc"
-    assert captured_requests[0].market_data_account_id == "market-main"
+    assert len(captured_stored) == 1
+    assert captured_stored[0]["request"]["account_source"] == "test_template"
+    assert captured_stored[0]["request"]["test_template_id"] == "tpl_eth_drop_001"
+    assert captured_stored[0]["request"]["template_content_hash"] == "sha256:abc"
+    assert captured_stored[0]["request"]["market_data_account_id"] == "market-main"
 
 
 @pytest.mark.asyncio
-async def test_execute_recheck_propagates_template_collector_http_exception(monkeypatch) -> None:
-    async def stale_template_collector(request: KanglongPlanRequest) -> dict:
+async def test_execute_recheck_propagates_template_stale_validation_http_exception(monkeypatch) -> None:
+    def stale_template_validator(stored: dict) -> None:
         raise HTTPException(
             status_code=409,
-            detail={"code": "blocked_plan_stale", "template_id": request.test_template_id},
+            detail={"code": "blocked_plan_stale", "template_id": stored["request"]["test_template_id"]},
         )
 
     class TemplateExecuteService:
@@ -542,9 +681,9 @@ async def test_execute_recheck_propagates_template_collector_http_exception(monk
         def execute_plan(self, **kwargs) -> dict:
             raise AssertionError("execute_plan should not run when recheck collection raises HTTPException")
 
-    original_collector = api_module._collect_kanglong_plan_inputs
+    original_validator = api_module._validate_template_run_not_stale
     original_service = getattr(api_module.app.state, "kanglong_service", None)
-    monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", stale_template_collector)
+    monkeypatch.setattr(api_module, "_validate_template_run_not_stale", stale_template_validator)
     monkeypatch.setattr(api_module.app.state, "kanglong_service", TemplateExecuteService(), raising=False)
     try:
         with pytest.raises(HTTPException) as exc:
@@ -553,7 +692,7 @@ async def test_execute_recheck_propagates_template_collector_http_exception(monk
                 KanglongActionRequest(plan_version="plan-1", idempotency_key="execute-template-0002"),
             )
     finally:
-        monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", original_collector)
+        monkeypatch.setattr(api_module, "_validate_template_run_not_stale", original_validator)
         if original_service is not None:
             monkeypatch.setattr(api_module.app.state, "kanglong_service", original_service, raising=False)
 
