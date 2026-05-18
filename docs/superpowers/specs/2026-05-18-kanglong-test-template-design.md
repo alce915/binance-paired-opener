@@ -91,6 +91,7 @@ data/kanglong_test_templates.json
 - `main_account.positions` 第一版默认为空；如果未来允许主账号模板仓位，仍必须经过亢龙主账号初始空仓预检。
 - `subaccounts[].qty` 表示自动生成 LONG/SHORT 双向配平仓位的数量。
 - `long_entry_price` 和 `short_entry_price` 分别用于计算 LONG/SHORT 未实现盈亏。
+- 模板保存和 preview 都必须校验数值边界：`collateral >= 0`、`leverage > 0`、`qty > 0`、`long_entry_price > 0`、`short_entry_price > 0`。非法 Decimal、0 杠杆、负数保证金、非正数量或非正价格都不能进入计划链路。
 - 每次模板保存后生成稳定的 `template_content_hash`。hash 基于规范化 JSON 内容计算，忽略字段顺序，但只包含会影响快照、计划和风险判断的字段。
 - 写入 JSON 文件必须使用原子写：先写入同目录 `.tmp` 文件，校验可读后替换正式文件；替换前保留 `.bak`。Windows 下同一时间只允许一个模板写操作，避免并发保存导致文件损坏。
 - 模板账号保存时可以使用用户可读的 `account_id`，但应用到运行时快照前必须改写为 `tpl:{template_id}:main` 和 `tpl:{template_id}:sub:{row_id}`。后端必须校验这些运行时 ID 与真实账号 ID 归一化后不冲突。
@@ -215,6 +216,9 @@ run state 字段落点：
 - `request_json.snapshot_bundle_id` 必须和 `kanglong_runs.snapshot_bundle_id` 一致。
 - `request_json.template_runtime_account_map` 保存模板账号 ID 到运行时账号 ID 的映射，用于日志、恢复和 UI 展示。
 - `report.account_snapshot.accounts` 或同等 run state 字段必须保存最近一次用于 plan 的模板账号快照，至少包含 `preview.accounts` 中的账号、持仓、资金、`template_content_hash` 和 `snapshot_bundle_id`。
+- `report.account_snapshot.accounts` 表示计划生成时的冻结初始快照，不得在执行中被当前行情 preview 覆盖。
+- `report.synthetic_account_state` 或同等 run state 字段必须保存测试模板执行过程中的最新 synthetic 账号状态。每个成功 group/round 后立即落库，至少包含账号资金、LONG/SHORT 仓位、已执行 group/round、成本累计、rounding/residual ledger、`snapshot_bundle_id` 和更新时间。
+- 未闭合暂停、执行失败、页面刷新或 recover 时，后端和前端必须优先使用最新 `synthetic_account_state` 恢复执行态；只有尚未开始执行且没有 synthetic 变更时，才允许回退到冻结的 `account_snapshot.accounts`。
 - 后续如果需要按模板查询历史运行，再考虑把 `account_source`、`test_template_id` 单独升为列。
 
 execute / recover 复检规则：
@@ -227,7 +231,8 @@ execute / recover 复检规则：
 active run 恢复规则：
 
 - `/kanglong/simulation/run/active` 返回 active run 时必须包含 `request.account_source` 和当前 run 使用的账号来源。
-- 当 `account_source = test_template` 时，响应必须直接携带 `account_snapshot.accounts`，或携带足够信息让前端自动重新调用 preview 并校验同一个 `template_content_hash`。
+- 当 `account_source = test_template` 且 run 已经进入 plan 创建或之后状态时，响应必须直接携带 run state 中冻结的 `account_snapshot.accounts`；如果 run 已经开始执行，还必须携带最新 `synthetic_account_state`。前端不得为了恢复 active run 自动重新调用 preview 来重算账号池。
+- 重新调用 preview 只允许用于未生成 plan 的模板编辑、模板预览或重新应用模板阶段；它不能替代已创建 run 的冻结快照。
 - 前端恢复 active run 时，如果发现 `account_source = test_template`，必须先用模板账号快照替换 `availableAccounts`，再恢复主账号、子账号选择和执行日志；不得用真实账号池渲染 `tpl:...` 账号。
 - 如果模板已删除或 hash 漂移导致无法恢复账号池，active run 响应进入 `blocked_plan_stale` 或 `needs_abort_recover`，并只允许刷新计划或人工恢复动作。
 
@@ -270,7 +275,7 @@ margin_deficit = max(margin - equity, 0)
 
 - 所有计算使用 Decimal。
 - 生成仓位数量按交易对 step size 向下取整。
-- 生成价格按交易对 tick size 归一化。
+- 用户输入的历史开仓价第一版必须符合交易对 tick size；不符合时返回结构化错误，不静默改写用户输入价格。批量生成器内部生成的价格如果需要归一化，必须按 tick size 处理并在预览中展示归一化结果。
 - 取整产生的差额在预览报告中展示为 `rounding_residuals`，但不写入真实执行账本。
 - 杠杆必须在 preview 阶段按 `symbol_rules.max_leverage` 校验。超过上限时不生成可执行计划，只返回阻断原因。
 
@@ -387,6 +392,28 @@ test_template 使用当前测试模板账号池
 - plan 创建后模板内容变化、删除或 hash 不一致：confirm/execute/recover 阶段返回 `blocked_plan_stale`。
 - 存在引用模板的 active run 时删除或影响 hash 的编辑：返回 `kanglong_test_template_active_run_exists`。
 
+错误码第一版固定为以下集合，接口不得只返回模糊文案：
+
+| 场景 | code |
+| --- | --- |
+| 模板不存在 | `kanglong_test_template_not_found` |
+| 模板交易对和请求交易对不一致 | `kanglong_test_template_symbol_mismatch` |
+| 模板账号数量不足 | `kanglong_test_template_accounts_required` |
+| 请求账号不属于模板账号集合 | `kanglong_test_template_account_mismatch` |
+| 模板 ID、账号 ID 或 row ID 字符集非法 | `kanglong_test_template_invalid_id` |
+| 数值字段无法转为 Decimal | `kanglong_test_template_invalid_decimal` |
+| `collateral < 0` | `kanglong_test_template_negative_collateral` |
+| `leverage <= 0` | `kanglong_test_template_invalid_leverage` |
+| `qty <= 0` | `kanglong_test_template_non_positive_qty` |
+| 开仓价 `<= 0` 或不符合 tick size | `kanglong_test_template_invalid_price` |
+| 杠杆超过交易对最大杠杆 | `kanglong_test_template_leverage_exceeded` |
+| quote 不可用 | `kanglong_test_template_quote_unavailable` |
+| orderbook 不可用、过期或深度不足 | `kanglong_test_template_orderbook_unavailable` |
+| 模板存储 JSON 损坏 | `kanglong_test_template_store_corrupted` |
+| 模板存储写锁冲突 | `kanglong_test_template_store_write_conflict` |
+| 引用模板的 active run 阻止删除或 hash 字段编辑 | `kanglong_test_template_active_run_exists` |
+| plan 后模板删除、hash 漂移或运行时映射不一致 | `blocked_plan_stale` |
+
 ## 测试计划
 
 - 模板 JSON 文件不存在时，列表接口返回空列表。
@@ -403,13 +430,16 @@ test_template 使用当前测试模板账号池
 - preview 在 quote 或 orderbook 不可用时分别返回 `kanglong_test_template_quote_unavailable` 或 `kanglong_test_template_orderbook_unavailable`。
 - execution 使用订单簿 bid/ask 或深度生成成交价，不把 `mark_price`、quote mid 或单独 quote 当作成交价。
 - execution 在事件日志和成本报告中记录 `execution_price_source`，至少区分 `orderbook_depth` 和 `orderbook_top`。
-- preview 按交易对 step size / tick size 归一化数量和价格。
+- preview 按交易对 step size 归一化数量；批量生成器生成的价格按 tick size 归一化，手动输入价格不符合 tick size 时阻断。
+- preview 拒绝非法 Decimal、负数保证金、非正杠杆、非正数量、非正价格和不符合 tick size 的开仓价，并返回对应结构化错误码。
 - 加载测试模板后，前端账号池完全替换为模板账号，真实账号不再出现。
 - 退出测试模板模式后，真实账号池恢复。
 - `account_source = test_template` 时，plan 接口拒绝模板外账号。
 - `account_source = runtime` 时，plan 接口拒绝 `test_template_id`。
 - `account_source = test_template` 时，plan 和 execute recheck 不会调用真实账号 gateway 的账号级方法。
 - `/kanglong/simulation/run/active` 能恢复测试模板账号池；前端不会用真实账号池渲染 `tpl:...` 账号。
+- plan 创建后的 active run 必须使用 run state 中冻结的 `account_snapshot.accounts` 恢复账号池，不允许通过重新 preview 以当前行情重算替代。
+- 执行中断后，active run 和 recover 使用最新 `synthetic_account_state` 恢复已执行 group/round 后的测试账号资金和仓位。
 - plan 写入模板 hash 后，模板被编辑或删除时 confirm/execute 阻断为 `blocked_plan_stale`。
 - active run 引用模板时，删除模板或修改影响 hash 的字段会被阻断。
 - `.bak` 可读时，模板存储恢复接口能恢复备份且不会静默覆盖当前损坏文件。
@@ -423,6 +453,7 @@ test_template 使用当前测试模板账号池
 - 模板存储模块应独立于 `api.py`，避免继续膨胀 API 文件。
 - 模板快照转换应复用 `build_snapshot_bundle` 和现有 Decimal 规则。
 - 模板来源、模板 hash 和模板输入摘要应进入 run state，与 `snapshot_bundle_id`、`plan_version` 一起用于复检和审计。
+- synthetic 账号状态应作为执行账本的一部分保存，不能只依赖前端内存或重新 preview；否则长链路中断后无法可靠恢复。
 - 实现时优先新增 `paired_opener/kanglong/test_templates.py` 或同级存储/快照模块，不要把模板 JSON 读写、hash、预览转换逻辑堆进 `api.py`。
 - 若第一版执行适配器暂时不能按 orderbook depth 穿透成交，必须在文档化字段和 UI 中明确展示 `orderbook_top`，避免把顶档模拟误认为深度撮合。
 - 前端弹窗状态应与亢龙账号池状态分离，关闭弹窗不应丢失已应用模板。
