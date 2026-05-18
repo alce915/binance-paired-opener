@@ -95,6 +95,7 @@ function appSlice(start, end) {
 }
 
 function makeTemplateHarness() {
+  const apiHelpers = appSlice("function fetchKanglongTestTemplates()", "function formatNumber");
   const helpers = appSlice("function renderKanglongWorkspace()", "function renderKanglongSelectedSubaccounts");
   const modalHelpers = appSlice("function selectedKanglongTemplate()", "function buildSimulationRunPayload");
   const requestCalls = [];
@@ -144,6 +145,8 @@ function makeTemplateHarness() {
     const kanglongExecutePlanBtn = { disabled: false };
     const kanglongPlanSummary = { replaceChildren() { this.cleared = true; } };
     const kanglongExecutionLog = { replaceChildren() { this.cleared = true; } };
+    const kanglongSymbol = { value: "ETHUSDC" };
+    const kanglongSide = { value: "" };
     function makeContainer() {
       return {
         children: [],
@@ -198,8 +201,18 @@ function makeTemplateHarness() {
     function appendLog() {}
     async function request(path, options = {}) {
       requestCalls.push({ path, options });
+      if (String(path).includes("/kanglong/simulation/test-templates/") && options.method === "PUT") {
+        return {
+          template: {
+            id: "tpl_a",
+            name: "Template A Edited",
+            template_content_hash: "sha256:saved-template",
+          },
+        };
+      }
       return { run_id: "captured-plan", available_actions: [] };
     }
+    ${apiHelpers}
     function kanglongAccountId(account) {
       if (typeof account === "string") return account.trim().toLowerCase();
       return String(account?.account_id || account?.id || "").trim().toLowerCase();
@@ -220,8 +233,12 @@ function makeTemplateHarness() {
       createKanglongPlan,
       exitKanglongTemplateMode,
       renderKanglongTemplateLibrary,
+      saveCurrentKanglongTemplate,
       state: kanglongState,
       get availableAccounts() { return availableAccounts; },
+      setEditorPayload(payload) {
+        elementById.set("kanglongTemplateEditorText", { value: JSON.stringify(payload) });
+      },
       library: kanglongTemplateLibrary,
       renderCalls,
       requestCalls,
@@ -292,4 +309,44 @@ function makeTemplateHarness() {
   assert.equal(api.availableAccounts[0].account_id, "runtime-main", "selecting another library template should restore the real account pool");
   assert.equal(api.requestCalls.length, 0, "plan request should not be sent with old tpl accounts and new template metadata");
   assert.ok(createError, "plan creation should require a fresh runtime/template selection after switching templates");
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplates = [
+    { id: "tpl_a", name: "Template A", template_content_hash: "sha256:a" },
+  ];
+  api.applyKanglongTemplatePreview({
+    template_id: "tpl_a",
+    template_content_hash: "sha256:a",
+    market_data_account_id: "market-main",
+    accounts: [
+      { account_id: "tpl:tpl_a:main", name: "Template A Main", role: "main" },
+      { account_id: "tpl:tpl_a:sub:sub-1", name: "Template A Sub", role: "subaccount" },
+    ],
+  });
+  api.state.selectedSubaccountIds.add("tpl:tpl_a:sub:sub-1");
+  api.setEditorPayload({
+    id: "tpl_a",
+    name: "Template A Edited",
+    symbol: "ETHUSDC",
+    main_account: { collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [],
+  });
+
+  await api.saveCurrentKanglongTemplate();
+
+  let createError = null;
+  try {
+    await api.createKanglongPlan();
+  } catch (error) {
+    createError = error;
+  }
+  const planRequests = api.requestCalls.filter((call) => call.path === "/kanglong/simulation/plan");
+
+  assert.equal(api.state.activeTemplateContentHash, "sha256:saved-template", "plain save should record the latest saved template hash");
+  assert.equal(api.state.templatePreview.template_content_hash, "sha256:a", "plain save should not silently refresh the applied snapshot");
+  assert.equal(api.availableAccounts[0].account_id, "tpl:tpl_a:main", "plain save should leave the old preview visible until the user applies it");
+  assert.ok(createError, "stale applied template snapshots should block plan creation");
+  assert.equal(planRequests.length, 0, "plan request should not be sent with a stale applied snapshot");
 }

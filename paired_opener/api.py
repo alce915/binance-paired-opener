@@ -1027,6 +1027,17 @@ async def list_kanglong_simulation_accounts(symbol: str = Query(default=DEFAULT_
 @app.post("/kanglong/simulation/plan/{run_id}/confirm", response_model=KanglongPlanResponse)
 async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
     service = app.state.kanglong_service
+    idempotency_lookup = getattr(service, "confirm_plan_idempotency_response", None)
+    if callable(idempotency_lookup):
+        _, idempotency_response = idempotency_lookup(
+            run_id=run_id,
+            plan_version=request.plan_version,
+            idempotency_key=request.idempotency_key,
+            operator=request.operator,
+            confirmed_warning_codes=request.confirmed_warning_codes,
+        )
+        if idempotency_response is not None:
+            return KanglongPlanResponse.model_validate(idempotency_response)
     get_run = getattr(service, "get_run", None)
     stored = get_run(run_id) if callable(get_run) else None
     if stored is not None:
@@ -1044,6 +1055,15 @@ async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionR
 @app.post("/kanglong/simulation/plan/{run_id}/execute", response_model=KanglongPlanResponse)
 async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
     service = app.state.kanglong_service
+    idempotency_lookup = getattr(service, "execute_plan_idempotency_response", None)
+    if callable(idempotency_lookup):
+        _, idempotency_response = idempotency_lookup(
+            run_id=run_id,
+            plan_version=request.plan_version,
+            idempotency_key=request.idempotency_key,
+        )
+        if idempotency_response is not None:
+            return KanglongPlanResponse.model_validate(idempotency_response)
     stored = service.get_run(run_id)
     if stored is not None:
         _validate_template_run_not_stale(stored)
@@ -1131,6 +1151,16 @@ async def get_kanglong_simulation_events(
 @app.post("/kanglong/simulation/run/{run_id}/recover", response_model=KanglongPlanResponse)
 async def recover_kanglong_simulation_run(run_id: str, request: KanglongRecoverRequest) -> KanglongPlanResponse:
     service = app.state.kanglong_service
+    idempotency_lookup = getattr(service, "recover_run_idempotency_response", None)
+    if callable(idempotency_lookup):
+        _, idempotency_response = idempotency_lookup(
+            run_id=run_id,
+            idempotency_key=request.idempotency_key,
+            operator=request.operator,
+            release_reason=request.release_reason,
+        )
+        if idempotency_response is not None:
+            return KanglongPlanResponse.model_validate(idempotency_response)
     stored = service.get_run(run_id)
     if stored is not None:
         _validate_template_run_not_stale(stored)

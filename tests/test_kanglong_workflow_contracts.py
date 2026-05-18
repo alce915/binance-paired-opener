@@ -436,6 +436,48 @@ def test_apply_group_result_caps_receiver_open_by_donor_available_qty() -> None:
     assert receiver["positions"][0]["qty"] == "0.25"
 
 
+def test_apply_group_result_does_not_close_donor_when_receiver_missing() -> None:
+    accounts = [
+        {
+            "account_id": "donor",
+            "wallet_balance": "1000",
+            "total_unrealized_pnl": "0",
+            "equity": "1000",
+            "available_balance": "1000",
+            "margin": "10",
+            "margin_deficit": "0",
+            "positions": [
+                {
+                    "symbol": "ETHUSDC",
+                    "position_side": "LONG",
+                    "qty": "1",
+                    "mark_price": "3100",
+                    "unrealized_pnl": "0",
+                    "notional": "3100",
+                    "margin": "10",
+                    "leverage": 75,
+                }
+            ],
+        }
+    ]
+
+    updated = _apply_group_result_to_synthetic_accounts(
+        accounts,
+        {
+            "from_account_id": "donor",
+            "to_account_id": "missing-receiver",
+            "side": "LONG",
+            "symbol": "ETHUSDC",
+        },
+        matched_qty=Decimal("1"),
+        close_price=Decimal("3100"),
+        open_price=Decimal("3101"),
+    )
+
+    donor = next(account for account in updated if account["account_id"] == "donor")
+    assert donor["positions"][0]["qty"] == "1"
+
+
 def test_service_active_run_returns_latest_restorable_run_with_actions(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)

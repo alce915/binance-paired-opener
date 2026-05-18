@@ -221,7 +221,7 @@ def _apply_group_result_to_synthetic_accounts(
     side = str(group.get("side") or "").strip().upper()
     from_account = _find_synthetic_account(accounts, str(group.get("from_account_id") or ""))
     to_account = _find_synthetic_account(accounts, str(group.get("to_account_id") or ""))
-    if from_account is None:
+    if from_account is None or to_account is None:
         return accounts
     from_position = _find_synthetic_position(from_account, side)
     if from_position is None:
@@ -232,16 +232,15 @@ def _apply_group_result_to_synthetic_accounts(
     next_qty = max(_decimal_payload_value(from_position.get("qty")) - effective_matched_qty, Decimal("0"))
     _update_existing_position_qty(from_position, next_qty, close_price)
     _refresh_synthetic_account_totals(from_account)
-    if to_account is not None:
-        to_position = _find_synthetic_position(to_account, side)
-        if to_position is None:
-            positions = list(to_account.get("positions") or [])
-            to_position = _new_synthetic_position(to_account, group, Decimal("0"), open_price)
-            positions.append(to_position)
-            to_account["positions"] = positions
-        next_qty = _decimal_payload_value(to_position.get("qty")) + effective_matched_qty
-        _update_existing_position_qty(to_position, next_qty, open_price)
-        _refresh_synthetic_account_totals(to_account)
+    to_position = _find_synthetic_position(to_account, side)
+    if to_position is None:
+        positions = list(to_account.get("positions") or [])
+        to_position = _new_synthetic_position(to_account, group, Decimal("0"), open_price)
+        positions.append(to_position)
+        to_account["positions"] = positions
+    next_qty = _decimal_payload_value(to_position.get("qty")) + effective_matched_qty
+    _update_existing_position_qty(to_position, next_qty, open_price)
+    _refresh_synthetic_account_totals(to_account)
     return accounts
 
 
@@ -511,7 +510,21 @@ class KanglongSimulationService:
         )
         return payload
 
-    def confirm_plan(
+    def _idempotency_response(
+        self,
+        *,
+        idempotency_key: str,
+        request_hash: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        existing = self._repository.get_kanglong_idempotency(idempotency_key, request_hash)
+        if existing is None:
+            return None
+        if existing["conflict"]:
+            return self._idempotency_conflict(run_id)
+        return existing["response"]
+
+    def confirm_plan_idempotency_response(
         self,
         *,
         run_id: str,
@@ -519,7 +532,7 @@ class KanglongSimulationService:
         idempotency_key: str,
         operator: str,
         confirmed_warning_codes: list[str],
-    ) -> dict[str, Any]:
+    ) -> tuple[str, dict[str, Any] | None]:
         request_hash = _request_hash(
             {
                 "action": "confirm",
@@ -529,11 +542,30 @@ class KanglongSimulationService:
                 "confirmed_warning_codes": confirmed_warning_codes,
             }
         )
-        existing = self._repository.get_kanglong_idempotency(idempotency_key, request_hash)
-        if existing is not None:
-            if existing["conflict"]:
-                return self._idempotency_conflict(run_id)
-            return existing["response"]
+        return request_hash, self._idempotency_response(
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            run_id=run_id,
+        )
+
+    def confirm_plan(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        idempotency_key: str,
+        operator: str,
+        confirmed_warning_codes: list[str],
+    ) -> dict[str, Any]:
+        request_hash, existing_response = self.confirm_plan_idempotency_response(
+            run_id=run_id,
+            plan_version=plan_version,
+            idempotency_key=idempotency_key,
+            operator=operator,
+            confirmed_warning_codes=confirmed_warning_codes,
+        )
+        if existing_response is not None:
+            return existing_response
 
         stored = self._repository.get_kanglong_run(run_id)
         if stored is None:
@@ -562,6 +594,26 @@ class KanglongSimulationService:
         )
         return self._remember_idempotency(idempotency_key, request_hash, response)
 
+    def execute_plan_idempotency_response(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        idempotency_key: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        request_hash = _request_hash(
+            {
+                "action": "execute",
+                "run_id": run_id,
+                "plan_version": plan_version,
+            }
+        )
+        return request_hash, self._idempotency_response(
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            run_id=run_id,
+        )
+
     def execute_plan(
         self,
         *,
@@ -577,18 +629,13 @@ class KanglongSimulationService:
         recheck_config: KanglongSymbolConfig | None = None,
         recheck_snapshot_bundle_id: str | None = None,
     ) -> dict[str, Any]:
-        request_hash = _request_hash(
-            {
-                "action": "execute",
-                "run_id": run_id,
-                "plan_version": plan_version,
-            }
+        request_hash, existing_response = self.execute_plan_idempotency_response(
+            run_id=run_id,
+            plan_version=plan_version,
+            idempotency_key=idempotency_key,
         )
-        existing = self._repository.get_kanglong_idempotency(idempotency_key, request_hash)
-        if existing is not None:
-            if existing["conflict"]:
-                return self._idempotency_conflict(run_id)
-            return existing["response"]
+        if existing_response is not None:
+            return existing_response
 
         stored = self._repository.get_kanglong_run(run_id)
         if stored is None:
@@ -693,14 +740,14 @@ class KanglongSimulationService:
         )
         return self._remember_idempotency(idempotency_key, request_hash, response)
 
-    def recover_run(
+    def recover_run_idempotency_response(
         self,
         *,
         run_id: str,
         idempotency_key: str,
         operator: str,
         release_reason: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[str, dict[str, Any] | None]:
         request_hash = _request_hash(
             {
                 "action": "recover",
@@ -709,11 +756,28 @@ class KanglongSimulationService:
                 "release_reason": release_reason,
             }
         )
-        existing = self._repository.get_kanglong_idempotency(idempotency_key, request_hash)
-        if existing is not None:
-            if existing["conflict"]:
-                return self._idempotency_conflict(run_id)
-            return existing["response"]
+        return request_hash, self._idempotency_response(
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            run_id=run_id,
+        )
+
+    def recover_run(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        operator: str,
+        release_reason: str,
+    ) -> dict[str, Any]:
+        request_hash, existing_response = self.recover_run_idempotency_response(
+            run_id=run_id,
+            idempotency_key=idempotency_key,
+            operator=operator,
+            release_reason=release_reason,
+        )
+        if existing_response is not None:
+            return existing_response
 
         stored = self._repository.get_kanglong_run(run_id)
         if stored is None:

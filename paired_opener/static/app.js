@@ -1570,6 +1570,15 @@ function newKanglongIdempotencyKey(prefix) {
   return `${prefix}-${Date.now()}-${random}`;
 }
 
+function isKanglongTemplateSnapshotStale() {
+  if (kanglongState.accountSource !== KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    return false;
+  }
+  const activeHash = String(kanglongState.activeTemplateContentHash || "").trim();
+  const previewHash = String(kanglongState.templatePreview?.template_content_hash || kanglongState.templatePreview?.templateContentHash || "").trim();
+  return !activeHash || !previewHash || activeHash !== previewHash;
+}
+
 function kanglongAvailableActions(payload = kanglongState.plan) {
   const actions = payload?.available_actions || payload?.plan?.available_actions || payload?.report?.available_actions || [];
   return Array.isArray(actions) ? actions.map((action) => String(action)) : [];
@@ -1745,6 +1754,9 @@ async function createKanglongPlan() {
     account_source: accountSource,
   };
   if (accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
+    if (isKanglongTemplateSnapshotStale()) {
+      throw new Error(copyOrDefault("console.kanglong.test_template.snapshot_stale", "console.kanglong.test_template.snapshot_stale"));
+    }
     requestBody.test_template_id = kanglongState.activeTestTemplateId;
     requestBody.template_content_hash = kanglongState.activeTemplateContentHash;
     requestBody.market_data_account_id = kanglongState.marketDataAccountId;
@@ -3853,9 +3865,7 @@ function renderKanglongTemplatePreviewPanel() {
   kanglongTemplatePreview.replaceChildren();
   const preview = kanglongState.templatePreview;
   if (preview) {
-    const hashChanged = kanglongState.activeTemplateContentHash
-      && preview.template_content_hash
-      && preview.template_content_hash !== kanglongState.activeTemplateContentHash;
+    const hashChanged = isKanglongTemplateSnapshotStale();
     const status = document.createElement("div");
     status.textContent = hashChanged
       ? copyOrDefault("console.kanglong.test_template.snapshot_stale", "console.kanglong.test_template.snapshot_stale")

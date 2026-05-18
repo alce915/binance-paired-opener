@@ -259,6 +259,28 @@ def test_kanglong_template_confirm_blocks_when_template_changed(monkeypatch, tmp
     assert stored["status"] == "chain_ready"
 
 
+def test_kanglong_template_confirm_idempotency_survives_template_edit(monkeypatch, tmp_path) -> None:
+    repository, _, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template)
+        first = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/confirm",
+            json={"plan_version": created["plan_version"], "idempotency_key": "confirm-template-once-0001"},
+        )
+        KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(stale_template())
+        repeated = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/confirm",
+            json={"plan_version": created["plan_version"], "idempotency_key": "confirm-template-once-0001"},
+        )
+    finally:
+        repository.close()
+
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json() == first.json()
+
+
 def test_kanglong_template_execute_blocks_when_template_changed_after_confirm(monkeypatch, tmp_path) -> None:
     repository, _, template = install_template_api_runtime(monkeypatch, tmp_path)
     client = TestClient(api_module.app)
@@ -282,6 +304,33 @@ def test_kanglong_template_execute_blocks_when_template_changed_after_confirm(mo
     assert response.json()["detail"]["code"] == "blocked_plan_stale"
     assert stored is not None
     assert stored["status"] == "plan_confirmed"
+
+
+def test_kanglong_template_execute_idempotency_survives_template_edit(monkeypatch, tmp_path) -> None:
+    repository, _, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template)
+        confirmed = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/confirm",
+            json={"plan_version": created["plan_version"], "idempotency_key": "confirm-template-exec-once-0001"},
+        )
+        first = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/execute",
+            json={"plan_version": created["plan_version"], "idempotency_key": "execute-template-once-0001"},
+        )
+        KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(stale_template())
+        repeated = client.post(
+            f"/kanglong/simulation/plan/{created['run_id']}/execute",
+            json={"plan_version": created["plan_version"], "idempotency_key": "execute-template-once-0001"},
+        )
+    finally:
+        repository.close()
+
+    assert confirmed.status_code == 200
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json() == first.json()
 
 
 def test_kanglong_template_recover_blocks_when_template_changed_without_mutating_or_releasing_locks(
@@ -321,6 +370,33 @@ def test_kanglong_template_recover_blocks_when_template_changed_without_mutating
     assert lock_conflict is not None
     assert lock_conflict["run_id"] == created["run_id"]
     assert events["events"] == []
+
+
+def test_kanglong_template_recover_idempotency_survives_template_edit(monkeypatch, tmp_path) -> None:
+    repository, _, template = install_template_api_runtime(monkeypatch, tmp_path)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template)
+        repository.update_kanglong_run(
+            created["run_id"],
+            status="needs_abort_recover",
+            available_actions=["recover"],
+        )
+        first = client.post(
+            f"/kanglong/simulation/run/{created['run_id']}/recover",
+            json={"idempotency_key": "recover-template-once-0001", "release_reason": "operator review"},
+        )
+        KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(stale_template())
+        repeated = client.post(
+            f"/kanglong/simulation/run/{created['run_id']}/recover",
+            json={"idempotency_key": "recover-template-once-0001", "release_reason": "operator review"},
+        )
+    finally:
+        repository.close()
+
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json() == first.json()
 
 
 def test_kanglong_template_execute_uses_market_data_without_rebuilding_template_accounts(monkeypatch, tmp_path) -> None:
