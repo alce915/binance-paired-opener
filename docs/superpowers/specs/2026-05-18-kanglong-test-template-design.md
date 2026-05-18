@@ -15,7 +15,7 @@
 - 模板编辑入口使用弹窗，不挤占亢龙主页面空间。
 - 模板保存输入参数；标记价格、未实现盈亏、名义价值、保证金占用和可用余额在加载或检测时按真实行情重算。
 - 后续移仓模拟继续复用现有开平仓、订单簿、链路规划、事件日志和消耗统计机制。
-- 用户录入的“保证金”统一落库为 `collateral`，表示该测试账号用于本场景的权益/资金上限；`margin_used` 和 `available_balance` 由系统按当前行情重算。
+- 用户录入的“保证金”统一落库为 `collateral`，第一版口径为测试账号的场景钱包余额；`equity`、`margin_used`、`available_balance` 和 `margin_deficit` 由系统按当前行情和未实现盈亏重算。
 - 每次生成 plan 时必须锁定 `template_content_hash`，后续 confirm、execute 和 recover 以 run state 中的模板来源和 hash 做后端校验，不依赖前端重复传参。
 - 测试模板账号只能进入 synthetic/simulation gateway；真实 gateway 只能用于读取交易对规则、quote 和订单簿，不能按模板账号查仓、撤单或下单。
 - 测试模板运行时账号 ID 必须使用独立命名空间，避免和真实账号 ID 归一化后碰撞。
@@ -87,7 +87,7 @@ data/kanglong_test_templates.json
 存储规则：
 
 - 所有数量、价格、保证金、权益和可用余额以字符串保存，后端读取后转为 Decimal。
-- 用户输入的保证金字段统一命名为 `collateral`。预览和检测时派生 `equity = collateral`、`margin_used` 和 `available_balance`，避免 UI 字段和后端资金口径不一致。
+- 用户输入的保证金字段统一命名为 `collateral`。预览和检测时把它解释为场景钱包余额，派生 `wallet_balance = collateral`、`equity = collateral + total_unrealized_pnl`、`margin_used`、`available_balance` 和 `margin_deficit`，避免 UI 字段和后端资金口径不一致。
 - `main_account.positions` 第一版默认为空；如果未来允许主账号模板仓位，仍必须经过亢龙主账号初始空仓预检。
 - `subaccounts[].qty` 表示自动生成 LONG/SHORT 双向配平仓位的数量。
 - `long_entry_price` 和 `short_entry_price` 分别用于计算 LONG/SHORT 未实现盈亏。
@@ -95,6 +95,7 @@ data/kanglong_test_templates.json
 - 写入 JSON 文件必须使用原子写：先写入同目录 `.tmp` 文件，校验可读后替换正式文件；替换前保留 `.bak`。Windows 下同一时间只允许一个模板写操作，避免并发保存导致文件损坏。
 - 模板账号保存时可以使用用户可读的 `account_id`，但应用到运行时快照前必须改写为 `tpl:{template_id}:main` 和 `tpl:{template_id}:sub:{row_id}`。后端必须校验这些运行时 ID 与真实账号 ID 归一化后不冲突。
 - `template_content_hash` 只覆盖会影响模板快照和计划的字段：交易对、账号标识、保证金、杠杆、开仓价、数量。账号展示名称不进入 hash；仅修改名称、列表排序、UI 折叠状态等不影响计划的字段不得改变 hash。
+- `template_id`、模板账号 `account_id` 和子账号 `row_id` 只能包含 `[a-zA-Z0-9_-]`。展示名称可以使用中文，但不得参与运行时账号 ID。保存子账号时生成稳定 `row_id`，后续改名或排序不能改变该子账号的运行时 ID。
 
 ## 后端接口
 
@@ -120,18 +121,27 @@ POST   /kanglong/simulation/test-templates/{template_id}/preview
   "symbol": "ETHUSDC",
   "account_source": "test_template",
   "snapshot_bundle_id": "snap-...",
-  "price_snapshot": {
+  "mark_price_snapshot": {
     "mark_price": "2443.21",
     "mark_price_source": "quote_mid",
-    "bid_price": "2443.20",
-    "ask_price": "2443.22",
-    "captured_at": "2026-05-18T00:00:00+08:00"
+    "quote_bid_price": "2443.20",
+    "quote_ask_price": "2443.22",
+    "captured_at": "2026-05-18T00:00:00+08:00",
+    "ttl_ms": 5000
+  },
+  "execution_orderbook_snapshot": {
+    "source": "orderbook_top",
+    "best_bid_price": "2443.19",
+    "best_ask_price": "2443.23",
+    "captured_at": "2026-05-18T00:00:00+08:00",
+    "ttl_ms": 5000
   },
   "symbol_rules": {
     "step_size": "0.001",
     "tick_size": "0.01",
     "min_qty": "0.001",
-    "min_notional": "5"
+    "min_notional": "5",
+    "max_leverage": 125
   },
   "accounts": [
     {
@@ -140,6 +150,8 @@ POST   /kanglong/simulation/test-templates/{template_id}/preview
       "name": "测试主账号",
       "role": "main",
       "collateral": "10000",
+      "wallet_balance": "10000",
+      "total_unrealized_pnl": "0",
       "equity": "10000",
       "margin": "0",
       "available_balance": "10000",
@@ -159,6 +171,8 @@ POST   /kanglong/simulation/test-templates/{template_id}/preview
 - `snapshot_bundle_id` 覆盖模板输入、运行时账号 ID、交易对规则版本、价格快照和生成出的账号快照。
 - `warnings` 和 `blocks` 只携带结构化 code 和 params；展示文本由语言包或 registry 渲染。
 - `mark_price_source` 第一版默认使用 `quote_mid`。只有后端已经实现交易所 mark price 市场数据接口并通过测试后，才允许返回 `exchange_mark_price`；否则不得在响应中伪造交易所标记价来源。
+- `mark_price_snapshot` 只服务持仓展示、PnL 和风险预估；`execution_orderbook_snapshot` 只服务执行价格预估和移仓损耗统计。两者不得共用字段或互相兜底。
+- `symbol_rules.max_leverage` 必须来自交易对规则或交易所规则；模板输入杠杆超过该值时，`blocks` 返回 `kanglong_test_template_leverage_exceeded`，不能等到 plan 阶段才失败。
 
 亢龙计划接口扩展请求字段：
 
@@ -200,6 +214,7 @@ run state 字段落点：
 - `request_json.test_template_id`、`request_json.template_content_hash`、`request_json.template_input_digest` 只在测试模板模式下存在。
 - `request_json.snapshot_bundle_id` 必须和 `kanglong_runs.snapshot_bundle_id` 一致。
 - `request_json.template_runtime_account_map` 保存模板账号 ID 到运行时账号 ID 的映射，用于日志、恢复和 UI 展示。
+- `report.account_snapshot.accounts` 或同等 run state 字段必须保存最近一次用于 plan 的模板账号快照，至少包含 `preview.accounts` 中的账号、持仓、资金、`template_content_hash` 和 `snapshot_bundle_id`。
 - 后续如果需要按模板查询历史运行，再考虑把 `account_source`、`test_template_id` 单独升为列。
 
 execute / recover 复检规则：
@@ -208,6 +223,13 @@ execute / recover 复检规则：
 - `runtime` 模式下执行现有真实账号快照复检。
 - `test_template` 模式下读取 run state 中的 `test_template_id`、`template_content_hash` 和 `template_runtime_account_map`，重新生成模板快照并校验 hash；模板缺失、hash 漂移或运行时账号映射不一致时返回 `blocked_plan_stale`。
 - recover 阶段同样从 run state 读取模板来源；人工恢复审计需要记录模板 ID、模板 hash、复检前后 `snapshot_bundle_id` 和操作者。
+
+active run 恢复规则：
+
+- `/kanglong/simulation/run/active` 返回 active run 时必须包含 `request.account_source` 和当前 run 使用的账号来源。
+- 当 `account_source = test_template` 时，响应必须直接携带 `account_snapshot.accounts`，或携带足够信息让前端自动重新调用 preview 并校验同一个 `template_content_hash`。
+- 前端恢复 active run 时，如果发现 `account_source = test_template`，必须先用模板账号快照替换 `availableAccounts`，再恢复主账号、子账号选择和执行日志；不得用真实账号池渲染 `tpl:...` 账号。
+- 如果模板已删除或 hash 漂移导致无法恢复账号池，active run 响应进入 `blocked_plan_stale` 或 `needs_abort_recover`，并只允许刷新计划或人工恢复动作。
 
 ## 行情与计算
 
@@ -227,9 +249,11 @@ short_unrealized_pnl = (short_entry_price - mark_price) * qty
 notional = mark_price * qty
 position_margin = notional / leverage
 margin = sum(position_margin)
-equity = collateral
-available_balance = max(collateral - margin, 0)
-margin_deficit = max(margin - collateral, 0)
+wallet_balance = collateral
+total_unrealized_pnl = sum(long_unrealized_pnl + short_unrealized_pnl)
+equity = wallet_balance + total_unrealized_pnl
+available_balance = max(equity - margin, 0)
+margin_deficit = max(margin - equity, 0)
 ```
 
 `mark_price` 只用于持仓展示、未实现盈亏和风险估算。移仓执行中的 close/open 成交价必须由模拟执行适配器基于订单簿计算，并进入手续费、价差损耗和执行日志。
@@ -248,6 +272,7 @@ margin_deficit = max(margin - collateral, 0)
 - 生成仓位数量按交易对 step size 向下取整。
 - 生成价格按交易对 tick size 归一化。
 - 取整产生的差额在预览报告中展示为 `rounding_residuals`，但不写入真实执行账本。
+- 杠杆必须在 preview 阶段按 `symbol_rules.max_leverage` 校验。超过上限时不生成可执行计划，只返回阻断原因。
 
 ## 测试模板模式
 
@@ -354,8 +379,10 @@ test_template 使用当前测试模板账号池
 - JSON 写入中断：保留 `.bak` 和损坏文件，返回恢复提示，不自动丢弃用户数据。
 - 如果 `.bak` 可读，列表接口返回 `recoverable_backup = true` 和备份时间；第一版至少提供后端恢复动作 `POST /kanglong/simulation/test-templates/store/recover-backup`，恢复前需要用户确认。
 - 模板交易对与当前页面交易对不同：加载时切换页面交易对；检测时以模板交易对为准。
-- 订单簿不可用：预览和检测阻断，错误码 `kanglong_test_template_quote_unavailable`。
+- quote 不可用：预览和检测阻断，错误码 `kanglong_test_template_quote_unavailable`。
+- orderbook 不可用：预览、检测和执行复检阻断，错误码 `kanglong_test_template_orderbook_unavailable`。
 - 模板账号数量不足：阻断，错误码 `kanglong_test_template_accounts_required`。
+- 模板杠杆超过交易对最大杠杆：预览和检测阻断，错误码 `kanglong_test_template_leverage_exceeded`。
 - 资金重算后可用余额不足：预览显示警告；如果触发亢龙现有风险上限，则检测阶段阻断。
 - plan 创建后模板内容变化、删除或 hash 不一致：confirm/execute/recover 阶段返回 `blocked_plan_stale`。
 - 存在引用模板的 active run 时删除或影响 hash 的编辑：返回 `kanglong_test_template_active_run_exists`。
@@ -366,11 +393,14 @@ test_template 使用当前测试模板账号池
 - 创建模板后，JSON 文件包含完整场景并保留 Decimal 字符串。
 - 保存模板时通过 `.tmp` 原子替换，并生成 `.bak`；并发保存不会破坏正式 JSON。
 - 更新、复制、删除模板只影响目标模板。
-- preview 使用当前 quote 重算 `mark_price`、LONG/SHORT 未实现盈亏、notional、margin 和 available balance。
-- preview 使用 `collateral` 派生 equity 和 available balance，不接受前端传入的 available balance 作为最终值。
+- preview 使用当前 quote 重算 `mark_price`、LONG/SHORT 未实现盈亏、notional、margin、equity 和 available balance。
+- preview 使用 `collateral` 作为 wallet balance，并派生 equity 和 available balance，不接受前端传入的 available balance 作为最终值。
 - preview 在保证金不足时返回 `margin_deficit`，不能只把 available balance 压成 0。
-- preview 返回 `template_content_hash`、`snapshot_bundle_id`、运行时账号 ID、模板账号 ID 映射、价格快照、交易对规则、warnings 和 blocks。
+- preview 返回 `template_content_hash`、`snapshot_bundle_id`、运行时账号 ID、模板账号 ID 映射、`mark_price_snapshot`、`execution_orderbook_snapshot`、交易对规则、warnings 和 blocks。
 - preview 账号池必须使用 `tpl:{template_id}:...` 运行时 ID，且不会和真实账号 ID 冲突。
+- preview 校验模板 ID、账号 ID 和 row ID 字符集，只允许 `[a-zA-Z0-9_-]` 进入运行时账号 ID。
+- preview 在杠杆超过 `symbol_rules.max_leverage` 时阻断为 `kanglong_test_template_leverage_exceeded`。
+- preview 在 quote 或 orderbook 不可用时分别返回 `kanglong_test_template_quote_unavailable` 或 `kanglong_test_template_orderbook_unavailable`。
 - execution 使用订单簿 bid/ask 或深度生成成交价，不把 `mark_price`、quote mid 或单独 quote 当作成交价。
 - execution 在事件日志和成本报告中记录 `execution_price_source`，至少区分 `orderbook_depth` 和 `orderbook_top`。
 - preview 按交易对 step size / tick size 归一化数量和价格。
@@ -379,12 +409,14 @@ test_template 使用当前测试模板账号池
 - `account_source = test_template` 时，plan 接口拒绝模板外账号。
 - `account_source = runtime` 时，plan 接口拒绝 `test_template_id`。
 - `account_source = test_template` 时，plan 和 execute recheck 不会调用真实账号 gateway 的账号级方法。
+- `/kanglong/simulation/run/active` 能恢复测试模板账号池；前端不会用真实账号池渲染 `tpl:...` 账号。
 - plan 写入模板 hash 后，模板被编辑或删除时 confirm/execute 阻断为 `blocked_plan_stale`。
 - active run 引用模板时，删除模板或修改影响 hash 的字段会被阻断。
 - `.bak` 可读时，模板存储恢复接口能恢复备份且不会静默覆盖当前损坏文件。
 - 模板账号路径不会调用真实账号 gateway 的查仓、撤单或下单方法。
 - 模板模式下检测、确认、执行仍产出现有亢龙事件日志结构。
-- 所有新增中文展示文本、预览警告、错误码和阻断原因来自语言包或 registry，不在 JS 中硬编码。
+- 所有新增中文展示文本、预览警告、错误码、阻断原因、`mark_price_source` 和 `execution_price_source` 展示文案来自语言包或 registry，不在 JS 中硬编码。
+- 所有 `kanglong_test_template_*` 错误码、`blocked_plan_stale` 扩展原因、`kanglong_test_template_leverage_exceeded`、`kanglong_test_template_orderbook_unavailable`、`kanglong_test_template_active_run_exists` 都在 i18n messages 或 registry 中有覆盖测试。
 
 ## 实施注意
 
