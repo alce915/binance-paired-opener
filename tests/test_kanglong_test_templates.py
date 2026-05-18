@@ -237,6 +237,66 @@ def test_build_template_preview_payload_returns_quantity_notional_and_leverage_b
     assert "kanglong_test_template_leverage_exceeded" in codes
 
 
+def test_build_template_preview_payload_min_notional_uses_executable_orderbook_price() -> None:
+    template = template_payload()
+    template["subaccounts"][0]["qty"] = "0.05"
+
+    payload = build_template_preview_payload(
+        template,
+        preview_quote(bid="99", ask="101"),
+        preview_orderbook(bid="99", ask="101"),
+        preview_rules(step_size="0.01", min_qty="0.01", min_notional="5"),
+        KanglongSymbolConfig(),
+    )
+
+    assert "kanglong_test_template_min_notional_not_met" in [block["code"] for block in payload["blocks"]]
+
+
+def test_build_template_preview_payload_snapshot_bundle_id_changes_with_fee_rate() -> None:
+    first = build_template_preview_payload(
+        template_payload(),
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(),
+        KanglongSymbolConfig(fee_rate=Decimal("0.0005")),
+    )
+    second = build_template_preview_payload(
+        template_payload(),
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(),
+        KanglongSymbolConfig(fee_rate=Decimal("0.001")),
+    )
+
+    assert first["snapshot_bundle_id"] != second["snapshot_bundle_id"]
+
+
+def test_build_template_preview_payload_snapshot_bundle_id_ignores_display_names() -> None:
+    base = template_payload()
+    renamed = template_payload()
+    renamed["name"] = "Renamed template"
+    renamed["main_account"]["name"] = "Renamed main"
+    renamed["subaccounts"][0]["name"] = "Renamed sub"
+
+    first = build_template_preview_payload(
+        base,
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(),
+        KanglongSymbolConfig(),
+    )
+    second = build_template_preview_payload(
+        renamed,
+        preview_quote(),
+        preview_orderbook(),
+        preview_rules(),
+        KanglongSymbolConfig(),
+    )
+
+    assert first["template_content_hash"] == second["template_content_hash"]
+    assert first["snapshot_bundle_id"] == second["snapshot_bundle_id"]
+
+
 @pytest.mark.parametrize(
     ("quote", "orderbook", "code"),
     [

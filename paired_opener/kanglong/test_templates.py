@@ -150,7 +150,7 @@ def build_template_preview_payload(
             blocks.append({"code": "kanglong_test_template_non_positive_qty", "account_id": account_id})
         if rounded_qty < rules.min_qty:
             blocks.append({"code": "kanglong_test_template_min_qty_not_met", "account_id": account_id})
-        if mark_price * rounded_qty < rules.min_notional:
+        if min(best_bid, best_ask) * rounded_qty < rules.min_notional:
             blocks.append({"code": "kanglong_test_template_min_notional_not_met", "account_id": account_id})
         if leverage > rules.max_leverage:
             blocks.append({"code": "kanglong_test_template_leverage_exceeded", "account_id": account_id})
@@ -346,13 +346,19 @@ def _position_snapshot(
 def _snapshot_bundle_id(payload: dict[str, Any]) -> str:
     bundle_payload = {
         "template_content_hash": payload["template_content_hash"],
+        "fee_rate_source": payload["fee_rate_source"],
+        "fee_rate": payload["fee_rate"],
         "mark_price_snapshot": payload["mark_price_snapshot"],
         "execution_orderbook_snapshot": payload["execution_orderbook_snapshot"],
         "symbol_rules": payload["symbol_rules"],
-        "accounts": payload["accounts"],
+        "accounts": [_fingerprint_account(account) for account in payload["accounts"]],
     }
     raw = json.dumps(bundle_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _fingerprint_account(account: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in account.items() if key != "name"}
 
 
 def _decimal_payload(value: Decimal) -> str:
