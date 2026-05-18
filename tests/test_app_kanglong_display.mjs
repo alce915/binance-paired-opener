@@ -60,13 +60,17 @@ for (const fragment of [
 
 for (const key of [
   "console.kanglong.nav",
-  "console.kanglong.stage.account_selection",
   "console.kanglong.account_pool.title",
   "console.kanglong.plan.summary_title",
   "console.kanglong.execution.log_title",
 ]) {
   assert.ok(indexSource.includes(key) || appSource.includes(key), `${key} should be wired in the Task 7 shell`);
 }
+assert.equal(
+  indexSource.includes('data-i18n="console.kanglong.stage.account_selection"'),
+  false,
+  "account selection stage badge should not render in the Kanglong workspace shell",
+);
 
 const zhMessages = JSON.parse(zhSource);
 const kanglongStatusLabels = {

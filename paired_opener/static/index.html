@@ -115,6 +115,10 @@
         gap: 16px;
         grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
       }
+      .kanglong-layout > .card > .card-title,
+      .kanglong-workspace > .card > .card-title {
+        padding: 16px 20px 8px;
+      }
       .kanglong-compact-list {
         display: grid;
         gap: 8px;
@@ -216,7 +220,7 @@
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
-        margin-bottom: 8px;
+        padding: 0 20px 10px;
       }
       .kanglong-log-filter {
         width: auto;
@@ -761,9 +765,6 @@
       </nav>
 
       <section id="kanglongWorkspace" class="kanglong-workspace" data-kanglong-only>
-        <div>
-          <span class="badge warn" data-i18n="console.kanglong.stage.account_selection"></span>
-        </div>
         <div class="kanglong-toolbar">
           <div class="field">
             <label for="kanglongSymbol" data-i18n="runtime.symbol"></label>
