@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -28,6 +29,8 @@ from paired_opener.kanglong.test_templates import (
     TemplateStoreError,
     TemplateValidationError,
     build_template_preview_payload,
+    preview_account_to_kanglong_snapshot,
+    symbol_rules_from_preview_payload,
 )
 from paired_opener.market_stream import format_sse
 from paired_opener.schemas import (
@@ -210,6 +213,21 @@ def _kanglong_account_totals_payload(snapshot: dict) -> dict:
 
 async def _collect_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
     _validate_kanglong_account_ids(request)
+    if request.account_source == "test_template":
+        return await _collect_template_kanglong_plan_inputs(request)
+    return await _collect_runtime_kanglong_plan_inputs(request)
+
+
+def _reject_runtime_template_fields(request: KanglongPlanRequest) -> None:
+    if request.test_template_id or request.template_content_hash or request.market_data_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_test_template_account_mismatch"},
+        )
+
+
+async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
+    _reject_runtime_template_fields(request)
     runtime_manager: AccountRuntimeManager = app.state.runtime_manager
     account_ids = [request.main_account_id, *request.subaccount_ids]
     gateways = []
@@ -259,6 +277,156 @@ async def _collect_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
         "close_price": Decimal(str(quote.bid_price)),
         "open_price": Decimal(str(quote.ask_price)),
         "fee_rate": Decimal("0.0005"),
+        "request_metadata": {"account_source": "runtime"},
+    }
+
+
+def _raise_blocked_plan_stale(**detail: Any) -> None:
+    raise HTTPException(status_code=409, detail={"code": "blocked_plan_stale", **detail})
+
+
+def _require_template_plan_field(value: str | None, *, code: str, status_code: int = 400) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=status_code, detail={"code": code})
+    return text
+
+
+def _template_input_digest(preview_payload: dict[str, Any]) -> str:
+    digest_payload = {
+        "template_content_hash": preview_payload.get("template_content_hash"),
+        "fee_rate": preview_payload.get("fee_rate"),
+        "mark_price_snapshot": preview_payload.get("mark_price_snapshot"),
+        "execution_orderbook_snapshot": preview_payload.get("execution_orderbook_snapshot"),
+        "symbol_rules": preview_payload.get("symbol_rules"),
+    }
+    raw = json.dumps(digest_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _preview_account_leverage_map(template: dict[str, Any], preview_payload: dict[str, Any]) -> dict[str, int]:
+    row_leverage = {str(item.get("row_id")): int(item.get("leverage")) for item in template.get("subaccounts") or []}
+    leverage_by_account_id: dict[str, int] = {}
+    for account in preview_payload.get("accounts") or []:
+        account_id = str(account.get("account_id") or "")
+        if account.get("role") == "main":
+            leverage_by_account_id[account_id] = int((template.get("main_account") or {}).get("leverage") or DEFAULT_LEVERAGE)
+        else:
+            leverage_by_account_id[account_id] = row_leverage.get(str(account.get("row_id")), DEFAULT_LEVERAGE)
+    return leverage_by_account_id
+
+
+def _template_runtime_account_map(preview_payload: dict[str, Any]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for account in preview_payload.get("accounts") or []:
+        template_account_id = str(account.get("template_account_id") or "")
+        account_id = str(account.get("account_id") or "")
+        if template_account_id and account_id:
+            mapping[template_account_id] = account_id
+    return mapping
+
+
+def _template_account_snapshot_payload(
+    *,
+    template: dict[str, Any],
+    preview_payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "account_source": "test_template",
+        "template_id": template["id"],
+        "template_content_hash": template["template_content_hash"],
+        "snapshot_bundle_id": preview_payload["snapshot_bundle_id"],
+        "accounts": preview_payload.get("accounts") or [],
+    }
+
+
+async def _collect_template_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
+    template_id = _require_template_plan_field(
+        request.test_template_id,
+        code="kanglong_test_template_not_found",
+        status_code=404,
+    )
+    template_content_hash = _require_template_plan_field(
+        request.template_content_hash,
+        code="blocked_plan_stale",
+        status_code=409,
+    )
+    market_data_account_id = _require_template_plan_field(
+        request.market_data_account_id,
+        code="kanglong_test_template_market_data_account_required",
+    )
+    try:
+        template = _kanglong_template_store().get_template(template_id)
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    if request.symbol.strip().upper() != template["symbol"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "kanglong_test_template_symbol_mismatch",
+                "template_symbol": template["symbol"],
+                "request_symbol": request.symbol,
+            },
+        )
+    if template_content_hash != template["template_content_hash"]:
+        _raise_blocked_plan_stale(
+            template_id=template["id"],
+            current_template_content_hash=template["template_content_hash"],
+            requested_template_content_hash=template_content_hash,
+        )
+
+    preview_payload = await _preview_template_from_market_data(template, market_data_account_id)
+    accounts = preview_payload.get("accounts") or []
+    accounts_by_id = {str(account.get("account_id") or ""): account for account in accounts}
+    requested_account_ids = [request.main_account_id, *request.subaccount_ids]
+    outside_account_ids = [account_id for account_id in requested_account_ids if account_id not in accounts_by_id]
+    if outside_account_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "kanglong_test_template_account_mismatch",
+                "account_ids": outside_account_ids,
+            },
+        )
+
+    leverage_by_account_id = _preview_account_leverage_map(template, preview_payload)
+    snapshots_by_id = {
+        account_id: preview_account_to_kanglong_snapshot(
+            accounts_by_id[account_id],
+            leverage=leverage_by_account_id.get(account_id, DEFAULT_LEVERAGE),
+        )
+        for account_id in requested_account_ids
+    }
+    best_bid = Decimal(str(preview_payload["execution_orderbook_snapshot"]["best_bid_price"]))
+    best_ask = Decimal(str(preview_payload["execution_orderbook_snapshot"]["best_ask_price"]))
+    fee_rate = Decimal(str(preview_payload["fee_rate"]))
+    snapshot_payload = _template_account_snapshot_payload(template=template, preview_payload=preview_payload)
+    request_metadata = {
+        "account_source": "test_template",
+        "test_template_id": template["id"],
+        "template_content_hash": template["template_content_hash"],
+        "template_input_digest": _template_input_digest(preview_payload),
+        "market_data_account_id": market_data_account_id,
+        "fee_rate_source": preview_payload.get("fee_rate_source"),
+        "fee_rate": preview_payload.get("fee_rate"),
+        "snapshot_bundle_id": preview_payload["snapshot_bundle_id"],
+        "template_runtime_account_map": _template_runtime_account_map(preview_payload),
+    }
+    return {
+        "symbol": request.symbol,
+        "main_account_id": request.main_account_id,
+        "subaccount_ids": request.subaccount_ids,
+        "selected_side": request.selected_side,
+        "snapshot_bundle_id": preview_payload["snapshot_bundle_id"],
+        "main_snapshot": snapshots_by_id[request.main_account_id],
+        "subaccount_snapshots": [snapshots_by_id[account_id] for account_id in request.subaccount_ids],
+        "config": load_kanglong_symbol_config(app.state.settings, request.symbol),
+        "rules": symbol_rules_from_preview_payload(preview_payload["symbol_rules"], symbol=request.symbol),
+        "close_price": best_bid,
+        "open_price": best_ask,
+        "fee_rate": fee_rate,
+        "request_metadata": request_metadata,
+        "account_snapshot_payload": snapshot_payload,
     }
 
 
@@ -539,19 +707,13 @@ async def recover_kanglong_test_template_backup() -> KanglongTemplateListRespons
     return KanglongTemplateListResponse.model_validate(payload)
 
 
-@app.post("/kanglong/simulation/test-templates/{template_id}/preview")
-async def preview_kanglong_test_template(template_id: str, request: KanglongTemplatePreviewRequest) -> dict[str, Any]:
-    market_data_account_id = request.market_data_account_id.strip()
+async def _preview_template_from_market_data(template: dict[str, Any], market_data_account_id: str) -> dict[str, Any]:
+    market_data_account_id = str(market_data_account_id or "").strip()
     if not market_data_account_id:
         raise HTTPException(
             status_code=400,
             detail={"code": "kanglong_test_template_market_data_account_required"},
         )
-    try:
-        template = _kanglong_template_store().get_template(template_id)
-    except (TemplateValidationError, TemplateStoreError) as exc:
-        _raise_kanglong_template_error(exc)
-
     runtime_manager: AccountRuntimeManager = app.state.runtime_manager
     gateway = None
     template_error: TemplateValidationError | TemplateStoreError | None = None
@@ -586,6 +748,21 @@ async def preview_kanglong_test_template(template_id: str, request: KanglongTemp
             },
         ) from market_error
     return preview_payload or {}
+
+
+@app.post("/kanglong/simulation/test-templates/{template_id}/preview")
+async def preview_kanglong_test_template(template_id: str, request: KanglongTemplatePreviewRequest) -> dict[str, Any]:
+    market_data_account_id = request.market_data_account_id.strip()
+    if not market_data_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_test_template_market_data_account_required"},
+        )
+    try:
+        template = _kanglong_template_store().get_template(template_id)
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    return await _preview_template_from_market_data(template, market_data_account_id)
 
 
 @app.get("/kanglong/simulation/accounts", response_model=AccountListResponse)
@@ -666,6 +843,10 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
                 main_account_id=stored_request["main_account_id"],
                 subaccount_ids=list(stored_request["subaccount_ids"]),
                 selected_side=selected_side,
+                account_source=stored_request.get("account_source") or "runtime",
+                test_template_id=stored_request.get("test_template_id"),
+                template_content_hash=stored_request.get("template_content_hash"),
+                market_data_account_id=stored_request.get("market_data_account_id"),
             )
             try:
                 inputs = await _collect_kanglong_plan_inputs(plan_request)

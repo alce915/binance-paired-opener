@@ -90,6 +90,12 @@ def _blocked_payload(run_id: str, precheck: KanglongPrecheckResult) -> dict[str,
     }
 
 
+def _attach_account_snapshot(report: dict[str, Any], account_snapshot_payload: dict[str, Any] | None) -> dict[str, Any]:
+    if account_snapshot_payload is not None:
+        report["account_snapshot"] = _payloadify(account_snapshot_payload)
+    return report
+
+
 def _lock_scopes(symbol: str, main_account_id: str, subaccount_ids: list[str]) -> list[str]:
     normalized_symbol = symbol.strip().upper()
     account_ids = [main_account_id, *subaccount_ids]
@@ -124,6 +130,7 @@ class KanglongSimulationService:
         symbol: str,
         main_account_id: str,
         subaccount_ids: list[str],
+        request_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "run_id": run_id,
@@ -134,6 +141,8 @@ class KanglongSimulationService:
             "created_at": _now_text(),
             "updated_at": _now_text(),
         }
+        if request_payload is not None:
+            payload["request"] = request_payload
         self._repository.create_kanglong_run(payload)
         return payload
 
@@ -163,12 +172,25 @@ class KanglongSimulationService:
         close_price: Decimal,
         open_price: Decimal,
         fee_rate: Decimal,
+        request_metadata: dict[str, Any] | None = None,
+        account_snapshot_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        request_payload = {
+            "mode": "simulation",
+            "symbol": symbol,
+            "main_account_id": main_account_id,
+            "subaccount_ids": subaccount_ids,
+            "selected_side": selected_side.value if selected_side is not None else None,
+            "account_source": "runtime",
+        }
+        if request_metadata:
+            request_payload.update(_payloadify(request_metadata))
         self.create_draft_run(
             run_id=run_id,
             symbol=symbol,
             main_account_id=main_account_id,
             subaccount_ids=subaccount_ids,
+            request_payload=request_payload,
         )
         precheck = run_static_precheck(
             main=main_snapshot,
@@ -193,6 +215,7 @@ class KanglongSimulationService:
                 "warnings": [],
                 "blocks": [precheck.reason_code] if precheck.reason_code else [],
             }
+            _attach_account_snapshot(report, account_snapshot_payload)
             payload = {
                 "run_id": run_id,
                 "status": status,
@@ -244,6 +267,7 @@ class KanglongSimulationService:
                     "max_rounds_per_group": exc.max_rounds,
                 },
             }
+            _attach_account_snapshot(report, account_snapshot_payload)
             payload = {
                 "run_id": run_id,
                 "status": status.value,
@@ -277,6 +301,7 @@ class KanglongSimulationService:
                 "blocks": [KanglongRunStatus.BLOCKED_RUN_LOCK_EXISTS.value],
                 "lock_conflict": _payloadify(lock_conflict),
             }
+            _attach_account_snapshot(report, account_snapshot_payload)
             payload = {
                 "run_id": run_id,
                 "status": KanglongRunStatus.BLOCKED_RUN_LOCK_EXISTS.value,
@@ -338,6 +363,7 @@ class KanglongSimulationService:
             "warnings": [],
             "blocks": [],
         }
+        _attach_account_snapshot(report, account_snapshot_payload)
         available_actions = ["confirm", "refresh_plan"]
         payload = {
             "run_id": run_id,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from paired_opener import api as api_module
@@ -266,3 +267,109 @@ def test_kanglong_plan_request_keeps_runtime_defaults_and_accepts_template_field
     assert template_request.test_template_id == "tpl_eth_drop_001"
     assert template_request.template_content_hash == "sha256:abc"
     assert template_request.market_data_account_id == "market-main"
+
+
+@pytest.mark.asyncio
+async def test_collect_template_plan_inputs_uses_preview_accounts_and_market_gateway_only(monkeypatch, tmp_path) -> None:
+    install_template_settings(monkeypatch, tmp_path)
+    template = KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(template_payload())
+    gateway = FakeTemplateMarketGateway()
+    runtime_manager = FakeTemplateRuntimeManager(gateway)
+    monkeypatch.setattr(api_module.app.state, "runtime_manager", runtime_manager, raising=False)
+
+    payload = await api_module._collect_kanglong_plan_inputs(
+        KanglongPlanRequest(
+            main_account_id="tpl:tpl_eth_drop_001:main",
+            subaccount_ids=["tpl:tpl_eth_drop_001:sub:sub-1"],
+            account_source="test_template",
+            test_template_id=template["id"],
+            template_content_hash=template["template_content_hash"],
+            market_data_account_id="market-main",
+        )
+    )
+
+    assert runtime_manager.build_calls == ["market-main"]
+    assert [snapshot.account_id for snapshot in [payload["main_snapshot"], *payload["subaccount_snapshots"]]] == [
+        "tpl:tpl_eth_drop_001:main",
+        "tpl:tpl_eth_drop_001:sub:sub-1",
+    ]
+    assert payload["rules"] == SymbolRules("ETHUSDC", Decimal("0.01"), Decimal("0.01"), Decimal("0.01"), Decimal("5"), 125)
+    assert payload["close_price"] == Decimal("2443.19")
+    assert payload["open_price"] == Decimal("2443.23")
+    assert payload["request_metadata"]["account_source"] == "test_template"
+    assert payload["request_metadata"]["test_template_id"] == "tpl_eth_drop_001"
+    assert payload["request_metadata"]["market_data_account_id"] == "market-main"
+    assert payload["request_metadata"]["template_runtime_account_map"] == {
+        "test-main": "tpl:tpl_eth_drop_001:main",
+        "test-sub-1": "tpl:tpl_eth_drop_001:sub:sub-1",
+    }
+    assert payload["account_snapshot_payload"]["account_source"] == "test_template"
+    assert [account["account_id"] for account in payload["account_snapshot_payload"]["accounts"]] == [
+        "tpl:tpl_eth_drop_001:main",
+        "tpl:tpl_eth_drop_001:sub:sub-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collect_template_plan_inputs_rejects_outside_accounts(monkeypatch, tmp_path) -> None:
+    install_template_settings(monkeypatch, tmp_path)
+    template = KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(template_payload())
+    monkeypatch.setattr(api_module.app.state, "runtime_manager", FakeTemplateRuntimeManager(FakeTemplateMarketGateway()), raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await api_module._collect_kanglong_plan_inputs(
+            KanglongPlanRequest(
+                main_account_id="tpl:tpl_eth_drop_001:main",
+                subaccount_ids=["external-sub"],
+                account_source="test_template",
+                test_template_id=template["id"],
+                template_content_hash=template["template_content_hash"],
+                market_data_account_id="market-main",
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "kanglong_test_template_account_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_collect_template_plan_inputs_rejects_stale_hash(monkeypatch, tmp_path) -> None:
+    install_template_settings(monkeypatch, tmp_path)
+    template = KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(template_payload())
+    monkeypatch.setattr(api_module.app.state, "runtime_manager", FakeTemplateRuntimeManager(FakeTemplateMarketGateway()), raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await api_module._collect_kanglong_plan_inputs(
+            KanglongPlanRequest(
+                main_account_id="tpl:tpl_eth_drop_001:main",
+                subaccount_ids=["tpl:tpl_eth_drop_001:sub:sub-1"],
+                account_source="test_template",
+                test_template_id=template["id"],
+                template_content_hash="sha256:stale",
+                market_data_account_id="market-main",
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "blocked_plan_stale"
+
+
+@pytest.mark.asyncio
+async def test_collect_runtime_plan_inputs_rejects_template_fields_before_building_gateways(monkeypatch) -> None:
+    runtime_manager = FakeTemplateRuntimeManager(FakeTemplateMarketGateway())
+    monkeypatch.setattr(api_module.app.state, "runtime_manager", runtime_manager, raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await api_module._collect_kanglong_plan_inputs(
+            KanglongPlanRequest(
+                main_account_id="main",
+                subaccount_ids=["sub1"],
+                test_template_id="tpl_eth_drop_001",
+                template_content_hash="sha256:abc",
+                market_data_account_id="market-main",
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "kanglong_test_template_account_mismatch"
+    assert runtime_manager.build_calls == []

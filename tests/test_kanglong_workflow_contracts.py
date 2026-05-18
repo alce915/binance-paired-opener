@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
+from paired_opener import api as api_module
 from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
 from paired_opener.kanglong.models import KanglongRunStatus
@@ -384,6 +387,127 @@ def test_service_blocks_plan_when_first_group_exceeds_round_limit(tmp_path) -> N
     assert plan["status"] == "blocked_group_round_limit_exceeded"
     assert plan["available_actions"] == ["refresh_plan"]
     assert plan["report"]["blocks"] == ["blocked_group_round_limit_exceeded"]
+
+
+def test_service_plan_persists_template_metadata_and_account_snapshot_report(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    request_metadata = {
+        "account_source": "test_template",
+        "test_template_id": "tpl_eth_drop_001",
+        "template_content_hash": "sha256:abc",
+        "template_input_digest": "digest-1",
+        "market_data_account_id": "market-main",
+        "fee_rate_source": "kanglong_symbol_config",
+        "fee_rate": "0.0005",
+        "snapshot_bundle_id": "snap-template",
+        "template_runtime_account_map": {"test-main": "tpl:tpl_eth_drop_001:main"},
+    }
+    account_snapshot_payload = {
+        "account_source": "test_template",
+        "template_id": "tpl_eth_drop_001",
+        "template_content_hash": "sha256:abc",
+        "snapshot_bundle_id": "snap-template",
+        "accounts": [{"account_id": "tpl:tpl_eth_drop_001:main"}],
+    }
+
+    try:
+        plan = service.create_plan(
+            run_id="run-template-metadata",
+            symbol="ETHUSDC",
+            main_snapshot=snapshot("tpl:tpl_eth_drop_001:main", "0.01", "0", "0", "0"),
+            subaccount_snapshots=[snapshot("tpl:tpl_eth_drop_001:sub:sub-1", "1", "1", "100", "0")],
+            main_account_id="tpl:tpl_eth_drop_001:main",
+            subaccount_ids=["tpl:tpl_eth_drop_001:sub:sub-1"],
+            selected_side=PositionSide.LONG,
+            snapshot_bundle_id="snap-template",
+            config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25")),
+            rules=_rules(),
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            request_metadata=request_metadata,
+            account_snapshot_payload=account_snapshot_payload,
+        )
+        stored = repository.get_kanglong_run("run-template-metadata")
+    finally:
+        repository.close()
+
+    assert plan["status"] == "blocked_main_not_flat"
+    assert plan["report"]["account_snapshot"] == account_snapshot_payload
+    assert stored is not None
+    assert stored["request"]["account_source"] == "test_template"
+    assert stored["request"]["test_template_id"] == "tpl_eth_drop_001"
+    assert stored["request"]["template_runtime_account_map"] == {"test-main": "tpl:tpl_eth_drop_001:main"}
+    assert stored["report"]["account_snapshot"] == account_snapshot_payload
+
+
+@pytest.mark.asyncio
+async def test_execute_recheck_restores_template_account_source_from_stored_request(monkeypatch) -> None:
+    captured_requests: list[KanglongPlanRequest] = []
+
+    async def fake_collector(request: KanglongPlanRequest) -> dict:
+        captured_requests.append(request)
+        return {
+            "close_price": Decimal("3100.00"),
+            "open_price": Decimal("3100.50"),
+            "fee_rate": Decimal("0.0005"),
+            "main_snapshot": snapshot(request.main_account_id, "0", "0", "0", "0"),
+            "subaccount_snapshots": [snapshot(account_id, "1", "1", "100", "0") for account_id in request.subaccount_ids],
+            "selected_side": request.selected_side,
+            "config": KanglongSymbolConfig(),
+            "snapshot_bundle_id": "snap-template-recheck",
+        }
+
+    class TemplateExecuteService:
+        def get_run(self, run_id: str) -> dict:
+            return {
+                "run_id": run_id,
+                "symbol": "ETHUSDC",
+                "status": "plan_confirmed",
+                "plan_version": "plan-1",
+                "plan": {"selected_side": "LONG"},
+                "request": {
+                    "mode": "simulation",
+                    "symbol": "ETHUSDC",
+                    "main_account_id": "tpl:tpl_eth_drop_001:main",
+                    "subaccount_ids": ["tpl:tpl_eth_drop_001:sub:sub-1"],
+                    "account_source": "test_template",
+                    "test_template_id": "tpl_eth_drop_001",
+                    "template_content_hash": "sha256:abc",
+                    "market_data_account_id": "market-main",
+                },
+            }
+
+        def execute_plan(self, **kwargs) -> dict:
+            return {
+                "run_id": kwargs["run_id"],
+                "status": "completed",
+                "plan_version": kwargs["plan_version"],
+                "snapshot_bundle_id": kwargs["recheck_snapshot_bundle_id"],
+                "available_actions": ["view_report"],
+                "report": {},
+            }
+
+    original_collector = api_module._collect_kanglong_plan_inputs
+    original_service = getattr(api_module.app.state, "kanglong_service", None)
+    monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", fake_collector)
+    monkeypatch.setattr(api_module.app.state, "kanglong_service", TemplateExecuteService(), raising=False)
+    try:
+        await api_module.execute_kanglong_simulation_plan(
+            "run-template",
+            KanglongActionRequest(plan_version="plan-1", idempotency_key="execute-template-0001"),
+        )
+    finally:
+        monkeypatch.setattr(api_module, "_collect_kanglong_plan_inputs", original_collector)
+        if original_service is not None:
+            monkeypatch.setattr(api_module.app.state, "kanglong_service", original_service, raising=False)
+
+    assert len(captured_requests) == 1
+    assert captured_requests[0].account_source == "test_template"
+    assert captured_requests[0].test_template_id == "tpl_eth_drop_001"
+    assert captured_requests[0].template_content_hash == "sha256:abc"
+    assert captured_requests[0].market_data_account_id == "market-main"
 
 
 def test_service_blocks_overlapping_ready_plan_until_lock_is_released(tmp_path) -> None:

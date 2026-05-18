@@ -13,6 +13,9 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 
+from paired_opener.domain import PositionSide, SymbolRules
+from paired_opener.kanglong.models import KanglongAccountSnapshot, KanglongPositionSnapshot
+
 
 KANGLONG_TEST_TEMPLATE_VERSION = 1
 
@@ -369,6 +372,54 @@ def _optional_decimal_payload(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return _decimal_payload(value)
+
+
+def preview_account_to_kanglong_snapshot(account: dict[str, Any], *, leverage: int) -> KanglongAccountSnapshot:
+    account_id = str(account.get("account_id") or "")
+    positions: dict[PositionSide, KanglongPositionSnapshot] = {}
+    for raw_position in account.get("positions") or []:
+        if not isinstance(raw_position, dict):
+            continue
+        side = PositionSide(str(raw_position.get("position_side") or "").strip().upper())
+        positions[side] = KanglongPositionSnapshot(
+            symbol=str(raw_position.get("symbol") or "").strip().upper(),
+            side=side,
+            qty=_decimal_value(raw_position.get("qty") or "0", field_name="positions.qty"),
+            entry_price=_decimal_value(raw_position.get("entry_price") or "0", field_name="positions.entry_price"),
+            mark_price=_decimal_value(raw_position.get("mark_price") or "0", field_name="positions.mark_price"),
+            unrealized_pnl=_decimal_value(
+                raw_position.get("unrealized_pnl") or "0",
+                field_name="positions.unrealized_pnl",
+            ),
+        )
+    snapshot_version_parts = [
+        "test_template",
+        account_id,
+        str(account.get("template_account_id") or ""),
+        str(account.get("row_id") or account.get("role") or ""),
+    ]
+    return KanglongAccountSnapshot(
+        account_id=account_id,
+        account_name=str(account.get("name") or account_id),
+        available_balance=_decimal_value(account.get("available_balance") or "0", field_name="available_balance"),
+        equity=_decimal_value(account.get("equity") or "0", field_name="equity"),
+        margin=_decimal_value(account.get("margin") or "0", field_name="margin"),
+        leverage=int(leverage),
+        positions=positions,
+        open_orders=[],
+        snapshot_version=":".join(snapshot_version_parts),
+    )
+
+
+def symbol_rules_from_preview_payload(preview_symbol_rules: dict[str, Any], *, symbol: str) -> SymbolRules:
+    return SymbolRules(
+        symbol=symbol.strip().upper(),
+        tick_size=_decimal_value(preview_symbol_rules.get("tick_size"), field_name="symbol_rules.tick_size"),
+        step_size=_decimal_value(preview_symbol_rules.get("step_size"), field_name="symbol_rules.step_size"),
+        min_qty=_decimal_value(preview_symbol_rules.get("min_qty"), field_name="symbol_rules.min_qty"),
+        min_notional=_decimal_value(preview_symbol_rules.get("min_notional"), field_name="symbol_rules.min_notional"),
+        max_leverage=int(preview_symbol_rules.get("max_leverage") or 0),
+    )
 
 
 class KanglongTemplateStore:
