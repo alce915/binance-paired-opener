@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from app_i18n.runtime import event_registry, log_registry, messages, precheck_registry, reason_registry
@@ -39,17 +40,26 @@ KANGLONG_TEMPLATE_REASON_KEYS = {
     "kanglong_test_template_quote_unavailable": "reasons.kanglong.test_template.quote_unavailable",
     "kanglong_test_template_orderbook_unavailable": "reasons.kanglong.test_template.orderbook_unavailable",
     "kanglong_test_template_store_corrupted": "reasons.kanglong.test_template.store_corrupted",
+    "kanglong_test_template_store_unreadable": "reasons.kanglong.test_template.store_unreadable",
     "kanglong_test_template_store_write_conflict": "reasons.kanglong.test_template.store_write_conflict",
     "kanglong_test_template_unsupported_version": "reasons.kanglong.test_template.unsupported_version",
     "kanglong_test_template_migration_failed": "reasons.kanglong.test_template.migration_failed",
     "kanglong_test_template_active_run_exists": "reasons.kanglong.test_template.active_run_exists",
+    "kanglong_test_template_invalid_template": "reasons.kanglong.test_template.invalid_template",
     "blocked_plan_stale": "reasons.kanglong.blocked_plan_stale",
     "blocked_plan_recheck_failed": "reasons.kanglong.blocked_plan_recheck_failed",
 }
 
+KANGLONG_TEMPLATE_REASON_CODE_RE = re.compile(r'"(kanglong_test_template_[a-z0-9_]+)"')
+
 
 def load_messages() -> dict[str, str]:
     return json.loads(Path("i18n/messages/zh-CN.json").read_text(encoding="utf-8"))
+
+
+def reachable_template_reason_codes() -> set[str]:
+    source = Path("paired_opener/kanglong/test_templates.py").read_text(encoding="utf-8")
+    return set(KANGLONG_TEMPLATE_REASON_CODE_RE.findall(source))
 
 
 def test_kanglong_i18n_messages_and_registries_exist() -> None:
@@ -134,6 +144,23 @@ def test_kanglong_test_template_reason_registry_entries_have_messages() -> None:
     for code, message_key in KANGLONG_TEMPLATE_REASON_KEYS.items():
         assert registry[code]["key"] == message_key
         assert message_key in catalog
+
+
+def test_reachable_kanglong_test_template_reason_codes_are_registered_and_localized() -> None:
+    catalog = load_messages()
+    registry = reason_registry()
+    reachable_codes = reachable_template_reason_codes()
+
+    assert reachable_codes
+    assert sorted(reachable_codes - set(registry)) == []
+    assert sorted(reachable_codes - set(KANGLONG_TEMPLATE_REASON_KEYS)) == []
+
+    missing_messages = sorted(
+        registry[code]["key"]
+        for code in reachable_codes
+        if registry[code]["key"] not in catalog
+    )
+    assert missing_messages == []
 
 
 def test_all_kanglong_run_statuses_have_display_copy() -> None:
