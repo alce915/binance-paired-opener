@@ -139,6 +139,32 @@ class KanglongPlanRequest(BaseModel):
     main_account_id: str
     subaccount_ids: list[str] = Field(..., min_length=1)
     selected_side: PositionSide | None = None
+    account_source: str = Field(default="runtime", pattern="^(runtime|test_template)$")
+    test_template_id: str | None = None
+    template_content_hash: str | None = None
+    market_data_account_id: str | None = None
+
+
+class KanglongTemplatePreviewRequest(BaseModel):
+    market_data_account_id: str = Field(..., min_length=1)
+
+
+class KanglongTemplateMutationResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    template: dict[str, Any]
+
+
+class KanglongTemplateListResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    version: int
+    templates: list[dict[str, Any]]
+    recoverable_backup: bool = False
+
+
+class KanglongTemplateDeleteResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    status: str
+    template_id: str
 
 
 class KanglongActionRequest(BaseModel):

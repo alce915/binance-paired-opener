@@ -5,11 +5,14 @@ import json
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app_i18n.runtime import DEFAULT_LOCALE, DEFAULT_TIMEZONE, format_copy, frontend_bootstrap_payload, make_api_detail
@@ -20,6 +23,12 @@ from paired_opener.errors import TradingError, ensure_trading_error, http_status
 from paired_opener.kanglong.config import load_kanglong_symbol_config
 from paired_opener.kanglong.service import KanglongSimulationService
 from paired_opener.kanglong.snapshots import build_snapshot_bundle
+from paired_opener.kanglong.test_templates import (
+    KanglongTemplateStore,
+    TemplateStoreError,
+    TemplateValidationError,
+    build_template_preview_payload,
+)
 from paired_opener.market_stream import format_sse
 from paired_opener.schemas import (
     AccountListResponse,
@@ -32,6 +41,10 @@ from paired_opener.schemas import (
     KanglongPlanRequest,
     KanglongPlanResponse,
     KanglongSimulationRunRequest,
+    KanglongTemplateDeleteResponse,
+    KanglongTemplateListResponse,
+    KanglongTemplateMutationResponse,
+    KanglongTemplatePreviewRequest,
     MarketConnectRequest,
     OpenSessionRequest,
     SessionActionResponse,
@@ -86,6 +99,19 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    path = request.url.path
+    if path.startswith("/kanglong/simulation/test-templates/") and path.endswith("/preview"):
+        for error in exc.errors():
+            if "market_data_account_id" in error.get("loc", ()):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": {"code": "kanglong_test_template_market_data_account_required"}},
+                )
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+
+
 def current_runtime(app: FastAPI):
     return app.state.runtime_manager.current()
 
@@ -105,6 +131,22 @@ def _validate_kanglong_account_ids(request: KanglongPlanRequest) -> None:
                 detail={"code": "kanglong_duplicate_account", "account_id": subaccount_id},
             )
         seen_subaccounts.add(normalized)
+
+
+def _kanglong_template_store() -> KanglongTemplateStore:
+    return KanglongTemplateStore(app.state.settings.kanglong_test_templates_file)
+
+
+def _raise_kanglong_template_error(exc: Exception) -> None:
+    if isinstance(exc, TemplateValidationError):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exc.code, "field": exc.field, "value": exc.value},
+        ) from exc
+    if isinstance(exc, TemplateStoreError):
+        status_code = 404 if exc.code == "kanglong_test_template_not_found" else 400
+        raise HTTPException(status_code=status_code, detail={"code": exc.code, **exc.detail}) from exc
+    raise exc
 
 
 def _api_text(value: object) -> str:
@@ -441,6 +483,109 @@ async def create_kanglong_simulation_plan(request: KanglongPlanRequest) -> Kangl
     except Exception as exc:
         _raise_api_error(exc, code="kanglong_plan_failed", source="service")
     return KanglongPlanResponse.model_validate(payload)
+
+
+@app.get("/kanglong/simulation/test-templates", response_model=KanglongTemplateListResponse)
+async def list_kanglong_test_templates() -> KanglongTemplateListResponse:
+    try:
+        payload = _kanglong_template_store().list_templates()
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    return KanglongTemplateListResponse.model_validate(payload)
+
+
+@app.post("/kanglong/simulation/test-templates", response_model=KanglongTemplateMutationResponse)
+async def create_kanglong_test_template(template: dict[str, Any]) -> KanglongTemplateMutationResponse:
+    try:
+        saved = _kanglong_template_store().upsert_template(template)
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    return KanglongTemplateMutationResponse(template=saved)
+
+
+@app.put("/kanglong/simulation/test-templates/{template_id}", response_model=KanglongTemplateMutationResponse)
+async def update_kanglong_test_template(template_id: str, template: dict[str, Any]) -> KanglongTemplateMutationResponse:
+    try:
+        saved = _kanglong_template_store().upsert_template({**template, "id": template_id})
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    return KanglongTemplateMutationResponse(template=saved)
+
+
+@app.post("/kanglong/simulation/test-templates/{template_id}/clone", response_model=KanglongTemplateMutationResponse)
+async def clone_kanglong_test_template(template_id: str) -> KanglongTemplateMutationResponse:
+    try:
+        cloned = _kanglong_template_store().clone_template(template_id)
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    return KanglongTemplateMutationResponse(template=cloned)
+
+
+@app.delete("/kanglong/simulation/test-templates/{template_id}", response_model=KanglongTemplateDeleteResponse)
+async def delete_kanglong_test_template(template_id: str) -> KanglongTemplateDeleteResponse:
+    try:
+        deleted = _kanglong_template_store().delete_template(template_id)
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    return KanglongTemplateDeleteResponse(status="deleted", template_id=str(deleted.get("id") or template_id))
+
+
+@app.post("/kanglong/simulation/test-templates/store/recover-backup", response_model=KanglongTemplateListResponse)
+async def recover_kanglong_test_template_backup() -> KanglongTemplateListResponse:
+    try:
+        payload = _kanglong_template_store().recover_backup()
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+    return KanglongTemplateListResponse.model_validate(payload)
+
+
+@app.post("/kanglong/simulation/test-templates/{template_id}/preview")
+async def preview_kanglong_test_template(template_id: str, request: KanglongTemplatePreviewRequest) -> dict[str, Any]:
+    market_data_account_id = request.market_data_account_id.strip()
+    if not market_data_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_test_template_market_data_account_required"},
+        )
+    try:
+        template = _kanglong_template_store().get_template(template_id)
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        _raise_kanglong_template_error(exc)
+
+    runtime_manager: AccountRuntimeManager = app.state.runtime_manager
+    gateway = None
+    template_error: TemplateValidationError | TemplateStoreError | None = None
+    market_error: Exception | None = None
+    preview_payload: dict[str, Any] | None = None
+    try:
+        gateway = runtime_manager.build_temporary_gateway(market_data_account_id)
+        rules = await gateway.get_symbol_rules(template["symbol"])
+        quote = await gateway.get_quote(template["symbol"])
+        orderbook = await gateway.get_order_book(template["symbol"])
+        config = load_kanglong_symbol_config(app.state.settings, template["symbol"])
+        preview_payload = build_template_preview_payload(template, quote, orderbook, rules, config)
+    except (TemplateValidationError, TemplateStoreError) as exc:
+        template_error = exc
+    except Exception as exc:
+        market_error = exc
+    finally:
+        if gateway is not None:
+            try:
+                await gateway.close()
+            except Exception as exc:
+                if template_error is None and market_error is None:
+                    market_error = exc
+    if template_error is not None:
+        _raise_kanglong_template_error(template_error)
+    if market_error is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "kanglong_test_template_market_data_account_unavailable",
+                "account_id": market_data_account_id,
+            },
+        ) from market_error
+    return preview_payload or {}
 
 
 @app.get("/kanglong/simulation/accounts", response_model=AccountListResponse)
