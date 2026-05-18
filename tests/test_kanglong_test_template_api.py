@@ -357,6 +357,37 @@ def test_kanglong_template_execute_uses_market_data_without_rebuilding_template_
     ]
 
 
+def test_kanglong_template_execution_snapshots_restore_non_default_leverage(monkeypatch, tmp_path) -> None:
+    install_template_settings(monkeypatch, tmp_path)
+    repository = SqliteRepository(tmp_path / "kanglong.sqlite3")
+    monkeypatch.setattr(api_module.app.state, "kanglong_service", KanglongSimulationService(repository), raising=False)
+    runtime_manager = FakeTemplateRuntimeManager(FakeTemplateMarketGateway())
+    monkeypatch.setattr(api_module.app.state, "runtime_manager", runtime_manager, raising=False)
+    payload = template_payload()
+    payload["main_account"]["leverage"] = 50
+    payload["subaccounts"][0]["leverage"] = 50
+    payload["subaccounts"][0]["qty"] = "1"
+    template = KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).upsert_template(payload)
+    client = TestClient(api_module.app)
+    try:
+        created = create_template_backed_plan(client, template, run_id="run-template-leverage")
+        stored = repository.get_kanglong_run(created["run_id"])
+    finally:
+        repository.close()
+
+    assert 50 != api_module.DEFAULT_LEVERAGE
+    assert stored is not None
+    assert stored["request"]["leverage_by_account_id"] == {
+        "tpl:tpl_eth_drop_001:main": 50,
+        "tpl:tpl_eth_drop_001:sub:sub-1": 50,
+    }
+    main_snapshot, subaccount_snapshots = api_module._template_execution_snapshots(stored)
+    assert main_snapshot is not None
+    assert subaccount_snapshots is not None
+    assert main_snapshot.leverage == 50
+    assert [snapshot.leverage for snapshot in subaccount_snapshots] == [50]
+
+
 def test_kanglong_template_execute_blocks_when_frozen_account_snapshot_missing(monkeypatch, tmp_path) -> None:
     repository, runtime_manager, template = install_template_api_runtime(monkeypatch, tmp_path)
     client = TestClient(api_module.app)

@@ -297,6 +297,50 @@ def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
     assert main["positions"][0]["qty"] == "0.00"
 
 
+def test_execute_plan_idempotency_reuses_completed_response_after_recheck_prices_are_gone(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-idempotent-execute")
+        confirmed = service.confirm_plan(
+            run_id="run-idempotent-execute",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-idempotent-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        first = service.execute_plan(
+            run_id="run-idempotent-execute",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-idempotent-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            recheck_main_snapshot=snapshot("main", "0", "0", "0", "0"),
+            recheck_subaccount_snapshots=[
+                snapshot("sub1", "1", "1", "100", "0"),
+                snapshot("sub2", "1", "1", "80", "0"),
+            ],
+            recheck_selected_side=PositionSide.LONG,
+            recheck_config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25")),
+            recheck_snapshot_bundle_id="snap-idempotent-execute",
+        )
+        repeated = service.execute_plan(
+            run_id="run-idempotent-execute",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-idempotent-0001",
+            close_price=Decimal("0"),
+            open_price=Decimal("0"),
+            fee_rate=Decimal("0"),
+        )
+    finally:
+        repository.close()
+
+    assert confirmed["status"] == "plan_confirmed"
+    assert first["status"] == "completed"
+    assert repeated == first
+
+
 def test_apply_group_result_does_not_open_receiver_when_donor_side_missing() -> None:
     accounts = [
         {

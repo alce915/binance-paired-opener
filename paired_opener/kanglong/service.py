@@ -582,9 +582,6 @@ class KanglongSimulationService:
                 "action": "execute",
                 "run_id": run_id,
                 "plan_version": plan_version,
-                "close_price": close_price,
-                "open_price": open_price,
-                "fee_rate": fee_rate,
             }
         )
         existing = self._repository.get_kanglong_idempotency(idempotency_key, request_hash)

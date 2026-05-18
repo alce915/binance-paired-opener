@@ -251,6 +251,19 @@ def _reject_runtime_template_fields(request: KanglongPlanRequest) -> None:
             status_code=400,
             detail={"code": "kanglong_test_template_account_mismatch"},
         )
+    synthetic_account_ids = [
+        account_id
+        for account_id in [request.main_account_id, *request.subaccount_ids]
+        if _is_template_runtime_account_id(account_id)
+    ]
+    if synthetic_account_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "kanglong_test_template_account_mismatch",
+                "account_ids": list(dict.fromkeys(synthetic_account_ids)),
+            },
+        )
 
 
 async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
@@ -466,6 +479,7 @@ async def _collect_template_kanglong_plan_inputs(request: KanglongPlanRequest) -
         "fee_rate": preview_payload.get("fee_rate"),
         "snapshot_bundle_id": preview_payload["snapshot_bundle_id"],
         "template_runtime_account_map": _template_runtime_account_map(preview_payload),
+        "leverage_by_account_id": leverage_by_account_id,
     }
     return {
         "symbol": request.symbol,

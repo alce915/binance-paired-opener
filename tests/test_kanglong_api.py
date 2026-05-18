@@ -307,6 +307,41 @@ async def test_kanglong_plan_rejects_duplicate_subaccounts_before_gateway_build(
     assert runtime_manager.build_calls == []
 
 
+@pytest.mark.parametrize(
+    ("main_account_id", "subaccount_ids", "rejected_account_ids"),
+    [
+        ("tpl:tpl_eth_drop_001:main", ["sub1"], ["tpl:tpl_eth_drop_001:main"]),
+        ("main", ["tpl:tpl_eth_drop_001:sub:sub-1"], ["tpl:tpl_eth_drop_001:sub:sub-1"]),
+    ],
+)
+def test_runtime_kanglong_plan_rejects_template_account_ids_before_gateway_build(
+    main_account_id: str,
+    subaccount_ids: list[str],
+    rejected_account_ids: list[str],
+) -> None:
+    service = StubKanglongService()
+    runtime_manager = FakeRuntimeManager()
+    api_module.app.state.kanglong_service = service
+    api_module.app.state.runtime_manager = runtime_manager
+    api_module.app.state.settings = Settings()
+
+    response = TestClient(api_module.app).post(
+        "/kanglong/simulation/plan",
+        json={
+            "main_account_id": main_account_id,
+            "subaccount_ids": subaccount_ids,
+            "account_source": "runtime",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == {
+        "code": "kanglong_test_template_account_mismatch",
+        "account_ids": rejected_account_ids,
+    }
+    assert runtime_manager.build_calls == []
+
+
 @pytest.mark.asyncio
 async def test_confirm_kanglong_plan_preserves_service_error_metadata() -> None:
     class StalePlanService:
