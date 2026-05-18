@@ -28,6 +28,7 @@ _TEMPLATE_KNOWN_FIELDS = {
     "updated_at",
     "template_content_hash",
 }
+_DOCUMENT_KNOWN_FIELDS = {"version", "templates"}
 
 
 class TemplateValidationError(ValueError):
@@ -124,7 +125,7 @@ class KanglongTemplateStore:
                 templates.append(normalized)
             else:
                 templates[existing_index] = normalized
-            self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": templates})
+            self._write_document(_document_for_write(document, templates))
             return copy.deepcopy(normalized)
 
     def clone_template(self, template_id: str, new_id: str | None = None) -> dict[str, Any]:
@@ -153,7 +154,7 @@ class KanglongTemplateStore:
             if len(remaining) == len(document["templates"]):
                 raise TemplateStoreError("kanglong_test_template_not_found", {"template_id": normalized_id})
             deleted = next(item for item in document["templates"] if item.get("id") == normalized_id)
-            self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": remaining})
+            self._write_document(_document_for_write(document, remaining))
             return copy.deepcopy(deleted)
 
     def recover_backup(self) -> dict[str, Any]:
@@ -208,7 +209,14 @@ class KanglongTemplateStore:
                 "kanglong_test_template_unsupported_version",
                 {"path": str(path), "version": version},
             )
-        return {"version": version, "templates": [_normalize_loaded_template(item) for item in payload["templates"]]}
+        document = {key: copy.deepcopy(value) for key, value in payload.items() if key not in _DOCUMENT_KNOWN_FIELDS}
+        document.update(
+            {
+                "version": version,
+                "templates": [_normalize_loaded_template(item) for item in payload["templates"]],
+            }
+        )
+        return document
 
     def _write_document(self, document: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +271,12 @@ def _normalize_hash_payload(template: dict[str, Any]) -> dict[str, Any]:
             key=lambda item: item["row_id"],
         ),
     }
+
+
+def _document_for_write(document: dict[str, Any], templates: list[dict[str, Any]]) -> dict[str, Any]:
+    preserved = {key: copy.deepcopy(value) for key, value in document.items() if key not in _DOCUMENT_KNOWN_FIELDS}
+    preserved.update({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": templates})
+    return preserved
 
 
 def _normalize_template(template: dict[str, Any], *, existing: dict[str, Any] | None) -> dict[str, Any]:

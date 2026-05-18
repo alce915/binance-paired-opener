@@ -238,6 +238,51 @@ def test_upsert_preserves_unknown_fields_on_unrelated_templates(tmp_path) -> Non
     assert by_id["tpl_eth_drop_001"]["ui_collapsed"] is True
 
 
+def test_upsert_preserves_document_metadata_without_exposing_it(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": KANGLONG_TEST_TEMPLATE_VERSION,
+                "store_meta": {"owner": "api"},
+                "templates": [template_payload("tpl_eth_drop_001")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = KanglongTemplateStore(path)
+
+    store.upsert_template(template_payload("tpl_btc_drop_001"))
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    listed = store.list_templates()
+    assert payload["store_meta"] == {"owner": "api"}
+    assert "store_meta" not in listed
+    assert {item["id"] for item in listed["templates"]} == {"tpl_eth_drop_001", "tpl_btc_drop_001"}
+
+
+def test_delete_preserves_document_metadata(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": KANGLONG_TEST_TEMPLATE_VERSION,
+                "store_meta": {"owner": "api"},
+                "templates": [template_payload("tpl_eth_drop_001"), template_payload("tpl_btc_drop_001")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = KanglongTemplateStore(path)
+
+    deleted = store.delete_template("tpl_btc_drop_001")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert deleted["id"] == "tpl_btc_drop_001"
+    assert payload["store_meta"] == {"owner": "api"}
+    assert [item["id"] for item in payload["templates"]] == ["tpl_eth_drop_001"]
+
+
 def test_store_rejects_corrupted_json(tmp_path) -> None:
     path = tmp_path / "kanglong_test_templates.json"
     path.write_text("{", encoding="utf-8")
