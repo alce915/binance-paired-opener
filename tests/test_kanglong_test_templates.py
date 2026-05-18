@@ -124,6 +124,44 @@ def test_store_missing_file_lists_empty_templates(tmp_path) -> None:
     assert store.list_templates() == []
 
 
+def test_list_templates_normalizes_legacy_templates_and_adds_hash(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    legacy = template_payload()
+    legacy["main_account"]["collateral"] = "10000.00"
+    legacy["subaccounts"][0].pop("row_id")
+    legacy["subaccounts"][0]["qty"] = "10.000"
+    legacy["subaccounts"].append({**legacy["subaccounts"][0], "account_id": "test-sub-1"})
+    path.write_text(
+        json.dumps({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": [legacy]}),
+        encoding="utf-8",
+    )
+    store = KanglongTemplateStore(path)
+
+    [loaded] = store.list_templates()
+
+    assert loaded["template_content_hash"].startswith("sha256:")
+    assert loaded["main_account"]["collateral"] == "10000"
+    assert loaded["subaccounts"][0]["row_id"] == "test-sub-1"
+    assert loaded["subaccounts"][1]["row_id"] == "test-sub-1-2"
+    assert loaded["subaccounts"][0]["qty"] == "10"
+
+
+def test_get_template_returns_normalized_legacy_template(tmp_path) -> None:
+    path = tmp_path / "kanglong_test_templates.json"
+    legacy = template_payload()
+    legacy["subaccounts"][0].pop("row_id")
+    path.write_text(
+        json.dumps({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": [legacy]}),
+        encoding="utf-8",
+    )
+    store = KanglongTemplateStore(path)
+
+    loaded = store.get_template("tpl_eth_drop_001")
+
+    assert loaded["template_content_hash"] == template_content_hash(loaded)
+    assert loaded["subaccounts"][0]["row_id"] == "test-sub-1"
+
+
 def test_store_creates_file_and_backup_on_second_save(tmp_path) -> None:
     path = tmp_path / "kanglong_test_templates.json"
     store = KanglongTemplateStore(path)
@@ -149,6 +187,8 @@ def test_store_rejects_corrupted_json(tmp_path) -> None:
         store.list_templates()
 
     assert excinfo.value.code == "kanglong_test_template_store_corrupted"
+    assert excinfo.value.detail["path"] == str(path)
+    assert "error" in excinfo.value.detail
 
 
 def test_store_rejects_higher_version(tmp_path) -> None:
@@ -160,6 +200,17 @@ def test_store_rejects_higher_version(tmp_path) -> None:
         store.list_templates()
 
     assert excinfo.value.code == "kanglong_test_template_unsupported_version"
+    assert excinfo.value.detail == {"path": str(path), "version": KANGLONG_TEST_TEMPLATE_VERSION + 1}
+
+
+def test_get_template_not_found_uses_structured_detail(tmp_path) -> None:
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    with pytest.raises(TemplateStoreError) as excinfo:
+        store.get_template("missing_tpl")
+
+    assert excinfo.value.code == "kanglong_test_template_not_found"
+    assert excinfo.value.detail == {"template_id": "missing_tpl"}
 
 
 def test_clone_generates_new_template_id_and_row_ids(tmp_path) -> None:

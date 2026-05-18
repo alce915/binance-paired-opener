@@ -30,7 +30,7 @@ class TemplateValidationError(ValueError):
 
 
 class TemplateStoreError(RuntimeError):
-    def __init__(self, code: str, detail: str) -> None:
+    def __init__(self, code: str, detail: dict[str, Any]) -> None:
         self.code = code
         self.detail = detail
         super().__init__(str(self))
@@ -94,7 +94,7 @@ class KanglongTemplateStore:
         for template in self.list_templates():
             if template.get("id") == normalized_id:
                 return template
-        raise TemplateStoreError("kanglong_test_template_not_found", normalized_id)
+        raise TemplateStoreError("kanglong_test_template_not_found", {"template_id": normalized_id})
 
     def upsert_template(self, template: dict[str, Any]) -> dict[str, Any]:
         document = self._read_document()
@@ -132,7 +132,7 @@ class KanglongTemplateStore:
         document = self._read_document()
         remaining = [item for item in document["templates"] if item.get("id") != normalized_id]
         if len(remaining) == len(document["templates"]):
-            raise TemplateStoreError("kanglong_test_template_not_found", normalized_id)
+            raise TemplateStoreError("kanglong_test_template_not_found", {"template_id": normalized_id})
         deleted = next(item for item in document["templates"] if item.get("id") == normalized_id)
         self._write_document({"version": KANGLONG_TEST_TEMPLATE_VERSION, "templates": remaining})
         return copy.deepcopy(deleted)
@@ -158,17 +158,32 @@ class KanglongTemplateStore:
         try:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
-            raise TemplateStoreError("kanglong_test_template_store_corrupted", str(exc)) from exc
+            raise TemplateStoreError(
+                "kanglong_test_template_store_corrupted",
+                {"path": str(path), "error": str(exc)},
+            ) from exc
         except OSError as exc:
-            raise TemplateStoreError("kanglong_test_template_store_unreadable", str(exc)) from exc
+            raise TemplateStoreError(
+                "kanglong_test_template_store_unreadable",
+                {"path": str(path), "error": str(exc)},
+            ) from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("templates"), list):
-            raise TemplateStoreError("kanglong_test_template_store_corrupted", "expected object with templates list")
+            raise TemplateStoreError(
+                "kanglong_test_template_store_corrupted",
+                {"path": str(path), "error": "expected object with templates list"},
+            )
         version = payload.get("version", KANGLONG_TEST_TEMPLATE_VERSION)
         if not isinstance(version, int):
-            raise TemplateStoreError("kanglong_test_template_store_corrupted", "expected integer version")
+            raise TemplateStoreError(
+                "kanglong_test_template_store_corrupted",
+                {"path": str(path), "error": "expected integer version"},
+            )
         if version > KANGLONG_TEST_TEMPLATE_VERSION:
-            raise TemplateStoreError("kanglong_test_template_unsupported_version", str(version))
-        return {"version": version, "templates": payload["templates"]}
+            raise TemplateStoreError(
+                "kanglong_test_template_unsupported_version",
+                {"path": str(path), "version": version},
+            )
+        return {"version": version, "templates": [_normalize_loaded_template(item) for item in payload["templates"]]}
 
     def _write_document(self, document: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +253,22 @@ def _normalize_template(template: dict[str, Any], *, existing: dict[str, Any] | 
     return normalized
 
 
+def _normalize_loaded_template(template: Any) -> dict[str, Any]:
+    source = _require_mapping(template, "templates[]")
+    timestamp = str(source.get("updated_at") or source.get("created_at") or _fresh_timestamp(None))
+    normalized = {
+        "id": validate_template_identifier(source.get("id"), field_name="template_id"),
+        "name": str(source.get("name", source.get("id", ""))),
+        "symbol": str(source.get("symbol", "")).strip().upper(),
+        "main_account": _normalize_main_account(source.get("main_account")),
+        "subaccounts": _normalize_subaccounts(source.get("subaccounts")),
+        "created_at": str(source.get("created_at") or timestamp),
+        "updated_at": timestamp,
+    }
+    normalized["template_content_hash"] = template_content_hash(normalized)
+    return normalized
+
+
 def _normalize_main_account(value: Any) -> dict[str, Any]:
     account = _require_mapping(value, "main_account")
     return {
@@ -255,7 +286,7 @@ def _normalize_subaccounts(value: Any) -> list[dict[str, Any]]:
     used_row_ids: set[str] = set()
     for index, item in enumerate(subaccounts, start=1):
         subaccount = _require_mapping(item, f"subaccounts[{index - 1}]")
-        raw_row_id = subaccount.get("row_id") or f"row-{index}"
+        raw_row_id = subaccount.get("row_id") or subaccount.get("account_id") or f"row-{index}"
         row_id = _unique_row_id(validate_template_identifier(raw_row_id, field_name="subaccounts.row_id"), used_row_ids)
         used_row_ids.add(row_id)
         normalized.append(
