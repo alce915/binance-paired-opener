@@ -421,6 +421,7 @@
   "console.kanglong.test_template.validation.market_data_unavailable": "行情源账号不可用",
   "console.kanglong.test_template.validation.subaccount_required": "至少需要 1 个子账号",
   "console.kanglong.test_template.validation.warning_confirm_required": "确认警告后才能应用",
+  "console.kanglong.test_template.confirm_discard_dirty": "当前模板有未保存改动，确认放弃这些改动吗？",
   "console.kanglong.test_template.default_main_name": "测试主账号",
   "console.kanglong.test_template.default_sub_name": "测试子账号 1",
   "console.kanglong.test_template.default_sub_name_index": "测试子账号 {index}",

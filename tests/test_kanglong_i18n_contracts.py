@@ -64,6 +64,7 @@ KANGLONG_TEMPLATE_MESSAGE_COPY = {
     "console.kanglong.test_template.validation.market_data_unavailable": "行情源账号不可用",
     "console.kanglong.test_template.validation.subaccount_required": "至少需要 1 个子账号",
     "console.kanglong.test_template.validation.warning_confirm_required": "确认警告后才能应用",
+    "console.kanglong.test_template.confirm_discard_dirty": "当前模板有未保存改动，确认放弃这些改动吗？",
     "console.kanglong.test_template.exit_mode": "退出测试模板",
     "console.kanglong.test_template.applied": "已应用测试模板",
     "console.kanglong.test_template.snapshot_stale": "模板已更新，当前快照已过期",

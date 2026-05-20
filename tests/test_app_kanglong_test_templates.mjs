@@ -99,6 +99,7 @@ function makeTemplateHarness() {
   const helpers = appSlice("function renderKanglongWorkspace()", "function renderKanglongSelectedSubaccounts");
   const modalHelpers = appSlice("function nextKanglongTemplateRowId", "function buildSimulationRunPayload");
   const requestCalls = [];
+  const confirmCalls = [];
   const sandbox = {
     console,
     Array,
@@ -199,6 +200,12 @@ function makeTemplateHarness() {
     function setEmptyState(container, className, text) { container.emptyState = { className, text }; }
     function userVisibleErrorMessage(error, fallback = "") { return error?.message || fallback || "error"; }
     function appendLog() {}
+    const window = {
+      confirm(message) {
+        globalThis.__confirmCalls.push(message);
+        return globalThis.__confirmResult;
+      },
+    };
     async function request(path, options = {}) {
       requestCalls.push({ path, options });
       if (String(path).includes("/kanglong/simulation/test-templates/") && options.method === "PUT") {
@@ -235,6 +242,10 @@ function makeTemplateHarness() {
       validateKanglongTemplateForm,
       isKanglongTemplateFormDirty,
       kanglongPreviewConfirmationKey,
+      acceptKanglongTemplatePreviewResponse,
+      isKanglongTemplateWarningConfirmed,
+      confirmDiscardKanglongTemplateDraft,
+      isCurrentTemplateLockedByActiveRun,
       applyKanglongTemplatePreview,
       createKanglongPlan,
       exitKanglongTemplateMode,
@@ -251,9 +262,13 @@ function makeTemplateHarness() {
       preview: kanglongTemplatePreview,
       renderCalls,
       requestCalls,
+      confirmCalls: globalThis.__confirmCalls,
+      setConfirmResult(value) { globalThis.__confirmResult = value; },
     };
   `;
   sandbox.__requestCalls = requestCalls;
+  sandbox.__confirmCalls = confirmCalls;
+  sandbox.__confirmResult = true;
   vm.runInNewContext(script, sandbox);
   return sandbox.api;
 }
@@ -360,6 +375,49 @@ function collectNodeText(node) {
   });
 
   assert.notEqual(first, second);
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.templatePreviewSeq = 1;
+
+  api.acceptKanglongTemplatePreviewResponse(1, { template_id: "tpl_a", accounts: [] });
+  api.acceptKanglongTemplatePreviewResponse(0, { template_id: "stale", accounts: [] });
+
+  assert.equal(api.state.templatePreview.template_id, "tpl_a");
+}
+
+{
+  const api = makeTemplateHarness();
+  const preview = {
+    template_content_hash: "sha256:a",
+    snapshot_bundle_id: "snap-a",
+    request_seq: 3,
+    warnings: [{ code: "warn_a" }],
+  };
+  const key = api.kanglongPreviewConfirmationKey(preview);
+  api.state.templatePreviewWarningsConfirmedKey = key;
+
+  assert.equal(api.isKanglongTemplateWarningConfirmed(preview), true);
+  assert.equal(api.isKanglongTemplateWarningConfirmed({ ...preview, snapshot_bundle_id: "snap-b" }), false);
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDirty = true;
+  api.setConfirmResult(false);
+
+  assert.equal(api.confirmDiscardKanglongTemplateDraft(), false);
+  assert.equal(api.confirmCalls.length, 1);
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.accountSource = "test_template";
+  api.state.activeTestTemplateId = "tpl_a";
+  api.state.plan = { run_id: "run-a" };
+
+  assert.equal(api.isCurrentTemplateLockedByActiveRun(), true);
 }
 
 {

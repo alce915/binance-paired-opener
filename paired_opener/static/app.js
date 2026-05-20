@@ -3934,6 +3934,62 @@ function kanglongPreviewConfirmationKey(preview = kanglongState.templatePreview)
   ].join("|");
 }
 
+function templatePreviewWarnings(preview = kanglongState.templatePreview) {
+  return Array.isArray(preview?.warnings) ? preview.warnings : [];
+}
+
+function templatePreviewBlocks(preview = kanglongState.templatePreview) {
+  return Array.isArray(preview?.blocks) ? preview.blocks : [];
+}
+
+function acceptKanglongTemplatePreviewResponse(requestSeq, preview) {
+  if (requestSeq !== kanglongState.templatePreviewSeq) {
+    return false;
+  }
+  kanglongState.templatePreview = { ...preview, request_seq: requestSeq };
+  kanglongState.templatePreviewStatus = templatePreviewBlocks(preview).length ? "blocked" : "ready";
+  kanglongState.templatePreviewError = null;
+  kanglongState.templatePreviewWarningsConfirmedKey = "";
+  return true;
+}
+
+function isKanglongTemplateWarningConfirmed(preview = kanglongState.templatePreview) {
+  const warnings = templatePreviewWarnings(preview);
+  if (!warnings.length) return true;
+  return kanglongState.templatePreviewWarningsConfirmedKey === kanglongPreviewConfirmationKey(preview);
+}
+
+function confirmKanglongTemplateWarnings(preview = kanglongState.templatePreview) {
+  kanglongState.templatePreviewWarningsConfirmedKey = kanglongPreviewConfirmationKey(preview);
+}
+
+function validateCurrentKanglongTemplateDraft() {
+  if (!kanglongState.testTemplateDraft) return { valid: true, errors: [] };
+  const validation = validateKanglongTemplateForm(kanglongState.testTemplateDraft);
+  if (!validation.valid) {
+    kanglongState.templatePreviewStatus = "blocked";
+    kanglongState.templatePreviewError = validation.errors[0] || null;
+  }
+  return validation;
+}
+
+function confirmDiscardKanglongTemplateDraft() {
+  if (!kanglongState.testTemplateDirty) return true;
+  return window.confirm(copyOrDefault(
+    "console.kanglong.test_template.confirm_discard_dirty",
+    "当前模板有未保存改动，确认放弃这些改动吗？",
+  ));
+}
+
+function isCurrentTemplateLockedByActiveRun() {
+  return Boolean(
+    kanglongState.activeTestTemplateId
+    && kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE
+    && kanglongState.plan
+    && kanglongRunId(kanglongState.plan)
+  );
+}
+
 function selectedKanglongTemplate() {
   const templateId = kanglongState.activeTestTemplateId;
   if (!templateId) return kanglongState.testTemplates[0] || null;
@@ -4048,6 +4104,9 @@ function renderKanglongTemplateStatusBar(container) {
   const statusKeys = [];
   if (kanglongState.testTemplateDirty) {
     statusKeys.push(["console.kanglong.test_template.status.dirty", "存在未保存改动"]);
+  }
+  if (isCurrentTemplateLockedByActiveRun()) {
+    statusKeys.push(["console.kanglong.test_template.status.active_run_locked", "当前模板被运行占用"]);
   }
   if (kanglongState.templatePreviewStatus === "stale") {
     statusKeys.push(["console.kanglong.test_template.status.preview_stale", "预览已过期"]);
@@ -4211,6 +4270,7 @@ function renderKanglongTemplateAdvancedJson(container, form) {
 }
 
 function selectKanglongTestTemplate(template = {}) {
+  if (!confirmDiscardKanglongTemplateDraft()) return;
   const nextTemplateId = template.id || null;
   if (
     kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE
@@ -4308,6 +4368,7 @@ function renderKanglongTemplatePreviewPanel() {
     exitButton.className = "inline-btn secondary";
     exitButton.textContent = copyOrDefault("console.kanglong.test_template.exit_mode", "退出测试模板");
     exitButton.addEventListener("click", () => {
+      if (!confirmDiscardKanglongTemplateDraft()) return;
       exitKanglongTemplateMode();
       renderKanglongTestTemplateModal();
     });
@@ -4319,6 +4380,17 @@ function renderKanglongTestTemplateModal() {
   renderKanglongTemplateLibrary();
   renderKanglongTemplateEditor();
   renderKanglongTemplatePreviewPanel();
+  syncKanglongTemplateActionButtons();
+}
+
+function syncKanglongTemplateActionButtons() {
+  const locked = isCurrentTemplateLockedByActiveRun();
+  if (typeof kanglongTemplateSaveButton !== "undefined" && kanglongTemplateSaveButton) {
+    kanglongTemplateSaveButton.disabled = locked;
+  }
+  if (typeof kanglongTemplateSaveApplyButton !== "undefined" && kanglongTemplateSaveApplyButton) {
+    kanglongTemplateSaveApplyButton.disabled = locked;
+  }
 }
 
 async function openKanglongTestTemplateModal() {
@@ -4332,6 +4404,7 @@ async function openKanglongTestTemplateModal() {
       kanglongState.activeTestTemplateId = activeTemplate.id || null;
       kanglongState.activeTemplateContentHash = activeTemplate.template_content_hash || kanglongState.activeTemplateContentHash;
     }
+    setKanglongTemplateDraft(activeTemplate || null);
   } catch (error) {
     appendLog("error", "", undefined, {
       messageCode: "runtime.kanglong.request_failed",
@@ -4342,11 +4415,38 @@ async function openKanglongTestTemplateModal() {
 }
 
 function closeKanglongTestTemplateModal() {
+  if (!confirmDiscardKanglongTemplateDraft()) return;
   kanglongTestTemplateModal?.classList.add("hidden");
+}
+
+async function previewCurrentKanglongTemplate(savedTemplate) {
+  const savedTemplateId = savedTemplate?.id || kanglongState.activeTestTemplateId;
+  if (!savedTemplateId) return null;
+  const marketDataAccountId = kanglongState.testTemplateDraft?.marketDataAccountId
+    || kanglongState.marketDataAccountId
+    || document.getElementById("kanglongTemplateMarketDataAccount")?.value
+    || currentAccount.id;
+  const requestSeq = kanglongState.templatePreviewSeq + 1;
+  kanglongState.templatePreviewSeq = requestSeq;
+  kanglongState.templatePreviewStatus = "loading";
+  const preview = await previewKanglongTestTemplate(savedTemplateId, marketDataAccountId);
+  const nextPreview = {
+    ...preview,
+    template_id: preview.template_id || savedTemplateId,
+    template_content_hash: preview.template_content_hash || savedTemplate?.template_content_hash,
+    market_data_account_id: marketDataAccountId,
+  };
+  acceptKanglongTemplatePreviewResponse(requestSeq, nextPreview);
+  return kanglongState.templatePreview;
 }
 
 async function saveCurrentKanglongTemplate({ applyPreview = false } = {}) {
   const template = readKanglongTemplateEditorPayload();
+  const validation = validateCurrentKanglongTemplateDraft();
+  if (!validation.valid) {
+    renderKanglongTestTemplateModal();
+    throw new Error(copyOrDefault(validation.errors[0]?.messageCode, "console.kanglong.test_template.validation.empty_numeric"));
+  }
   const payload = await saveKanglongTestTemplate(template);
   const savedTemplate = payload?.template || payload;
   const savedTemplateId = savedTemplate?.id || template.id;
@@ -4356,10 +4456,30 @@ async function saveCurrentKanglongTemplate({ applyPreview = false } = {}) {
   ].filter(Boolean);
   kanglongState.activeTestTemplateId = savedTemplateId || null;
   kanglongState.activeTemplateContentHash = savedTemplate?.template_content_hash || null;
+  if (kanglongState.testTemplateDraft) {
+    kanglongState.testTemplateDraft = kanglongTemplateToFormState(savedTemplate || template);
+    kanglongState.testTemplateOriginalPayload = kanglongTemplateFormToPayload(kanglongState.testTemplateDraft);
+    kanglongState.testTemplateDirty = false;
+    kanglongState.marketDataAccountId = kanglongState.testTemplateDraft.marketDataAccountId || kanglongState.marketDataAccountId;
+  }
   if (applyPreview && savedTemplateId) {
-    const marketDataAccountId = kanglongState.marketDataAccountId || document.getElementById("kanglongTemplateMarketDataAccount")?.value || currentAccount.id;
-    const preview = await previewKanglongTestTemplate(savedTemplateId, marketDataAccountId);
-    applyKanglongTemplatePreview({ ...preview, market_data_account_id: marketDataAccountId });
+    const preview = await previewCurrentKanglongTemplate(savedTemplate);
+    if (!preview || templatePreviewBlocks(preview).length) {
+      renderKanglongTestTemplateModal();
+      throw new Error(copyOrDefault("console.kanglong.test_template.status.blocked", "存在阻断"));
+    }
+    if (!isKanglongTemplateWarningConfirmed(preview)) {
+      const confirmed = window.confirm(copyOrDefault(
+        "console.kanglong.test_template.validation.warning_confirm_required",
+        "当前预览存在警告，确认后才能应用。",
+      ));
+      if (!confirmed) {
+        renderKanglongTestTemplateModal();
+        return savedTemplate;
+      }
+      confirmKanglongTemplateWarnings(preview);
+    }
+    applyKanglongTemplatePreview(preview);
   }
   renderKanglongTestTemplateModal();
   return savedTemplate;
