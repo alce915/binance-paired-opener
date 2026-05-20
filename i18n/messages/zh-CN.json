@@ -403,6 +403,7 @@
   "console.kanglong.test_template.actions.apply": "应用",
   "console.kanglong.test_template.actions.clone": "复制",
   "console.kanglong.test_template.actions.delete": "删除",
+  "console.kanglong.test_template.actions.generate": "生成配平子账号",
   "console.kanglong.test_template.actions.validate_import": "校验并导入表单",
   "console.kanglong.test_template.status.unsaved": "未保存",
   "console.kanglong.test_template.status.saved": "已保存",

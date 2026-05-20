@@ -3770,6 +3770,30 @@ function nextKanglongTemplateRowId(index = 1) {
   return `sub-${index}`;
 }
 
+function buildKanglongTemplateBatchSubaccounts({
+  count = 1,
+  collateral = "",
+  leverage = 75,
+  longEntryPrice = "",
+  shortEntryPrice = "",
+  qty = "",
+} = {}) {
+  const rowCount = Math.max(1, Number.parseInt(String(count || 1), 10) || 1);
+  return Array.from({ length: rowCount }, (_, index) => {
+    const number = index + 1;
+    return {
+      rowId: nextKanglongTemplateRowId(number),
+      accountId: `test-sub-${number}`,
+      name: copyOrDefault("console.kanglong.test_template.default_sub_name_index", "测试子账号 {index}", { index: number }),
+      collateral: String(collateral ?? ""),
+      leverage: Number(leverage || 75),
+      longEntryPrice: String(longEntryPrice ?? ""),
+      shortEntryPrice: String(shortEntryPrice ?? ""),
+      qty: String(qty ?? ""),
+    };
+  });
+}
+
 function buildDefaultKanglongTemplateDraft() {
   return {
     id: "",
@@ -3795,6 +3819,31 @@ function buildDefaultKanglongTemplateDraft() {
       },
     ],
   };
+}
+
+function importKanglongTemplateJsonText(rawText) {
+  let payload;
+  try {
+    payload = JSON.parse(rawText || "{}");
+  } catch (error) {
+    kanglongState.templatePreviewStatus = "blocked";
+    kanglongState.templatePreviewError = {
+      field: "advanced_json",
+      messageCode: "console.kanglong.test_template.validation.invalid_json",
+      error,
+    };
+    return false;
+  }
+  const nextDraft = kanglongTemplateToFormState(payload);
+  const validation = validateKanglongTemplateForm(nextDraft);
+  if (!validation.valid) {
+    kanglongState.templatePreviewStatus = "blocked";
+    kanglongState.templatePreviewError = validation.errors[0] || null;
+    return false;
+  }
+  kanglongState.testTemplateDraft = nextDraft;
+  markKanglongTemplateDraftChanged();
+  return true;
 }
 
 function kanglongTemplateToFormState(template = {}) {
@@ -4250,12 +4299,67 @@ function renderKanglongTemplateSubaccountRows(container, form) {
   container.appendChild(section);
 }
 
-function renderKanglongTemplateBatchGenerator(container) {
+function renderKanglongTemplateBatchGenerator(container, form) {
   const section = createKanglongTemplateSection("console.kanglong.test_template.editor.batch_generator", "批量生成");
-  const note = document.createElement("div");
-  note.className = "kanglong-account-detail";
-  note.textContent = copyOrDefault("console.kanglong.test_template.batch_note", "填写参数后可批量生成配平子账号。");
-  section.appendChild(note);
+  const firstRow = (Array.isArray(form.subaccounts) && form.subaccounts[0]) || {};
+  const grid = createKanglongTemplateFieldGrid();
+  const countField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.subaccount_count",
+    fallback: "子账号数量",
+    value: Math.max(1, form.subaccounts?.length || 1),
+    type: "number",
+    onInput: () => {},
+  });
+  const collateralField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.collateral",
+    fallback: "保证金",
+    value: firstRow.collateral || "",
+    onInput: () => {},
+  });
+  const leverageField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.leverage",
+    fallback: "杠杆",
+    value: firstRow.leverage || 75,
+    type: "number",
+    onInput: () => {},
+  });
+  const longField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.long_entry_price",
+    fallback: "LONG 开仓价",
+    value: firstRow.longEntryPrice || "",
+    onInput: () => {},
+  });
+  const shortField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.short_entry_price",
+    fallback: "SHORT 开仓价",
+    value: firstRow.shortEntryPrice || "",
+    onInput: () => {},
+  });
+  const qtyField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.qty",
+    fallback: "持仓数量",
+    value: firstRow.qty || "",
+    onInput: () => {},
+  });
+  grid.append(countField, collateralField, leverageField, longField, shortField, qtyField);
+  const generateButton = document.createElement("button");
+  generateButton.type = "button";
+  generateButton.className = "inline-btn success";
+  generateButton.textContent = copyOrDefault("console.kanglong.test_template.actions.generate", "生成配平子账号");
+  generateButton.addEventListener("click", () => {
+    updateKanglongTemplateDraft((draft) => {
+      draft.subaccounts = buildKanglongTemplateBatchSubaccounts({
+        count: countField.querySelector?.("input")?.value || countField.children?.[1]?.value || 1,
+        collateral: collateralField.querySelector?.("input")?.value || collateralField.children?.[1]?.value || "",
+        leverage: leverageField.querySelector?.("input")?.value || leverageField.children?.[1]?.value || 75,
+        longEntryPrice: longField.querySelector?.("input")?.value || longField.children?.[1]?.value || "",
+        shortEntryPrice: shortField.querySelector?.("input")?.value || shortField.children?.[1]?.value || "",
+        qty: qtyField.querySelector?.("input")?.value || qtyField.children?.[1]?.value || "",
+      });
+    });
+    renderKanglongTestTemplateModal();
+  });
+  section.append(grid, generateButton);
   container.appendChild(section);
 }
 
@@ -4265,7 +4369,15 @@ function renderKanglongTemplateAdvancedJson(container, form) {
   textarea.id = "kanglongTemplateEditorText";
   textarea.spellcheck = false;
   textarea.value = JSON.stringify(kanglongTemplateFormToPayload(form), null, 2);
-  section.appendChild(textarea);
+  const importButton = document.createElement("button");
+  importButton.type = "button";
+  importButton.className = "inline-btn secondary";
+  importButton.textContent = copyOrDefault("console.kanglong.test_template.actions.validate_import", "校验并导入表单");
+  importButton.addEventListener("click", () => {
+    importKanglongTemplateJsonText(textarea.value);
+    renderKanglongTestTemplateModal();
+  });
+  section.append(textarea, importButton);
   container.appendChild(section);
 }
 
@@ -4292,7 +4404,7 @@ function renderKanglongTemplateEditor() {
   renderKanglongTemplateBasicFields(kanglongTemplateEditor, form);
   renderKanglongTemplateMainAccountFields(kanglongTemplateEditor, form);
   renderKanglongTemplateSubaccountRows(kanglongTemplateEditor, form);
-  renderKanglongTemplateBatchGenerator(kanglongTemplateEditor);
+  renderKanglongTemplateBatchGenerator(kanglongTemplateEditor, form);
   renderKanglongTemplateAdvancedJson(kanglongTemplateEditor, form);
 }
 

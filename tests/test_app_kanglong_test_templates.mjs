@@ -242,6 +242,8 @@ function makeTemplateHarness() {
       validateKanglongTemplateForm,
       isKanglongTemplateFormDirty,
       kanglongPreviewConfirmationKey,
+      buildKanglongTemplateBatchSubaccounts,
+      importKanglongTemplateJsonText,
       acceptKanglongTemplatePreviewResponse,
       isKanglongTemplateWarningConfirmed,
       confirmDiscardKanglongTemplateDraft,
@@ -375,6 +377,51 @@ function collectNodeText(node) {
   });
 
   assert.notEqual(first, second);
+}
+
+{
+  const api = makeTemplateHarness();
+  const rows = api.buildKanglongTemplateBatchSubaccounts({
+    count: 2,
+    collateral: "500",
+    leverage: 75,
+    longEntryPrice: "2400",
+    shortEntryPrice: "2600",
+    qty: "1.5",
+  });
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].rowId, "sub-1");
+  assert.equal(rows[1].accountId, "test-sub-2");
+  assert.equal(rows[0].longEntryPrice, "2400");
+  assert.equal(rows[0].shortEntryPrice, "2600");
+  assert.equal(rows[0].qty, "1.5");
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDraft = api.buildDefaultKanglongTemplateDraft();
+  const imported = api.importKanglongTemplateJsonText(JSON.stringify({
+    id: "tpl_imported",
+    name: "Imported",
+    symbol: "ETHUSDC",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [{
+      row_id: "sub-1",
+      account_id: "test-sub-1",
+      name: "Sub 1",
+      collateral: "500",
+      leverage: 75,
+      long_entry_price: "2400",
+      short_entry_price: "2600",
+      qty: "1",
+    }],
+  }));
+
+  assert.equal(imported, true);
+  assert.equal(api.state.testTemplateDraft.name, "Imported");
+  assert.equal(api.state.testTemplateDirty, true);
 }
 
 {
