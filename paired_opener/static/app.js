@@ -4439,6 +4439,12 @@ function renderKanglongTemplateEditor() {
   renderKanglongTemplateAdvancedJson(kanglongTemplateEditor, form);
 }
 
+function kanglongTemplatePreviewDisplayId(account = {}) {
+  const accountId = String(account.account_id || account.id || "").trim();
+  if (!accountId || accountId.startsWith("tpl:")) return "";
+  return accountId;
+}
+
 function renderKanglongTemplatePreviewPanel() {
   if (!kanglongTemplatePreview) return;
   kanglongTemplatePreview.replaceChildren();
@@ -4499,7 +4505,7 @@ function renderKanglongTemplatePreviewPanel() {
       const detail = document.createElement("div");
       detail.className = "kanglong-account-detail";
       detail.textContent = [
-        account.account_id || account.id,
+        kanglongTemplatePreviewDisplayId(account),
         account.available_balance ? copyOrDefault("console.kanglong.test_template.preview.available_balance", "可用 {value}", { value: account.available_balance }) : "",
         account.total_unrealized_pnl ? copyOrDefault("console.kanglong.test_template.preview.unrealized_pnl", "未实现 {value}", { value: account.total_unrealized_pnl }) : "",
       ].filter(Boolean).join(" · ");

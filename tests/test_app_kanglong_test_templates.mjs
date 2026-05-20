@@ -680,6 +680,33 @@ function findNodeByText(node, text) {
 
 {
   const api = makeTemplateHarness();
+  api.state.activeTemplateContentHash = "sha256:template-v1";
+  api.state.templatePreview = {
+    template_id: "tpl_eth_drop_001",
+    template_content_hash: "sha256:template-v1",
+    market_data_account_id: "market-main",
+    accounts: [
+      {
+        account_id: "tpl:tpl_eth_drop_001:sub:sub-1",
+        name: "Template Sub",
+        role: "subaccount",
+        available_balance: "630.2804",
+        total_unrealized_pnl: "0",
+        positions: [],
+      },
+    ],
+  };
+
+  api.renderKanglongTestTemplateModal();
+
+  const previewText = collectNodeText(api.preview);
+  assert.match(previewText, /Template Sub/, "preview should still show the readable account name");
+  assert.doesNotMatch(previewText, /tpl:tpl_eth_drop_001:sub:sub-1/, "preview should hide synthetic template account ids");
+  assert.match(previewText, /console\.kanglong\.test_template\.preview\.available_balance/, "preview should keep account balance information visible");
+}
+
+{
+  const api = makeTemplateHarness();
   api.state.testTemplates = [
     { id: "tpl_a", name: "Template A", template_content_hash: "sha256:a" },
     { id: "tpl_b", name: "Template B", template_content_hash: "sha256:b" },
