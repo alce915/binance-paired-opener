@@ -3940,7 +3940,37 @@ function selectedKanglongTemplate() {
   return kanglongState.testTemplates.find((template) => template.id === templateId) || kanglongState.testTemplates[0] || null;
 }
 
+function setKanglongTemplateDraft(template = null) {
+  const source = template || selectedKanglongTemplate();
+  kanglongState.testTemplateDraft = source
+    ? kanglongTemplateToFormState(source)
+    : buildDefaultKanglongTemplateDraft();
+  kanglongState.testTemplateOriginalPayload = source
+    ? kanglongTemplateFormToPayload(kanglongState.testTemplateDraft)
+    : {};
+  kanglongState.testTemplateDirty = false;
+  kanglongState.templatePreviewStatus = kanglongState.templatePreview ? "ready" : "empty";
+  kanglongState.templatePreviewError = null;
+  kanglongState.marketDataAccountId = kanglongState.testTemplateDraft.marketDataAccountId || kanglongState.marketDataAccountId;
+}
+
+function ensureKanglongTemplateDraft() {
+  if (!kanglongState.testTemplateDraft) {
+    setKanglongTemplateDraft(selectedKanglongTemplate());
+  }
+  return kanglongState.testTemplateDraft;
+}
+
+function updateKanglongTemplateDraft(mutator) {
+  const draft = ensureKanglongTemplateDraft();
+  mutator(draft);
+  markKanglongTemplateDraftChanged();
+}
+
 function readKanglongTemplateEditorPayload() {
+  if (kanglongState.testTemplateDraft) {
+    return kanglongTemplateFormToPayload(kanglongState.testTemplateDraft);
+  }
   const editor = document.getElementById("kanglongTemplateEditorText");
   if (!editor) return selectedKanglongTemplate() || {};
   return JSON.parse(editor.value || "{}");
@@ -3983,27 +4013,80 @@ function renderKanglongTemplateLibrary() {
   });
 }
 
-function selectKanglongTestTemplate(template = {}) {
-  const nextTemplateId = template.id || null;
-  if (
-    kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE
-    && kanglongState.templatePreview?.template_id
-    && kanglongState.templatePreview.template_id !== nextTemplateId
-  ) {
-    exitKanglongTemplateMode();
-  }
-  kanglongState.activeTestTemplateId = nextTemplateId;
-  kanglongState.activeTemplateContentHash = template.template_content_hash || null;
+function createKanglongTemplateSection(titleKey, fallback) {
+  const section = document.createElement("section");
+  section.className = "kanglong-template-section";
+  const title = document.createElement("h3");
+  title.className = "kanglong-template-section-title";
+  title.textContent = copyOrDefault(titleKey, fallback);
+  section.appendChild(title);
+  return section;
 }
 
-function renderKanglongTemplateEditor() {
-  if (!kanglongTemplateEditor) return;
-  kanglongTemplateEditor.replaceChildren();
-  const template = selectedKanglongTemplate() || {};
-  const marketField = document.createElement("div");
-  marketField.className = "field";
-  const marketLabel = document.createElement("label");
-  marketLabel.htmlFor = "kanglongTemplateMarketDataAccount";
+function createKanglongTemplateField({ labelKey, fallback, value, onInput, type = "text" }) {
+  const field = document.createElement("label");
+  field.className = "kanglong-template-field";
+  const label = document.createElement("span");
+  label.textContent = copyOrDefault(labelKey, fallback);
+  const input = document.createElement("input");
+  input.type = type;
+  input.value = value ?? "";
+  input.addEventListener("input", () => onInput(input.value));
+  field.append(label, input);
+  return field;
+}
+
+function createKanglongTemplateFieldGrid() {
+  const grid = document.createElement("div");
+  grid.className = "kanglong-template-field-grid";
+  return grid;
+}
+
+function renderKanglongTemplateStatusBar(container) {
+  const bar = document.createElement("div");
+  bar.className = "kanglong-template-status-bar";
+  const statusKeys = [];
+  if (kanglongState.testTemplateDirty) {
+    statusKeys.push(["console.kanglong.test_template.status.dirty", "存在未保存改动"]);
+  }
+  if (kanglongState.templatePreviewStatus === "stale") {
+    statusKeys.push(["console.kanglong.test_template.status.preview_stale", "预览已过期"]);
+  } else if (kanglongState.templatePreviewStatus === "ready") {
+    statusKeys.push(["console.kanglong.test_template.status.preview_ready", "预览可应用"]);
+  } else if (kanglongState.templatePreviewStatus === "blocked") {
+    statusKeys.push(["console.kanglong.test_template.status.blocked", "存在阻断"]);
+  } else if (!statusKeys.length) {
+    statusKeys.push(["console.kanglong.test_template.status.unsaved", "未保存"]);
+  }
+  statusKeys.forEach(([key, fallback]) => {
+    const badge = document.createElement("span");
+    badge.className = "badge warn";
+    badge.textContent = copyOrDefault(key, fallback);
+    bar.appendChild(badge);
+  });
+  container.appendChild(bar);
+}
+
+function renderKanglongTemplateBasicFields(container, form) {
+  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.basic", "基础信息");
+  const grid = createKanglongTemplateFieldGrid();
+  grid.append(
+    createKanglongTemplateField({
+      labelKey: "console.kanglong.test_template.field.name",
+      fallback: "模板名称",
+      value: form.name,
+      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.name = value; }),
+    }),
+    createKanglongTemplateField({
+      labelKey: "console.kanglong.test_template.field.symbol",
+      fallback: "交易对",
+      value: form.symbol,
+      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.symbol = value; }),
+    }),
+  );
+  const marketField = document.createElement("label");
+  marketField.className = "kanglong-template-field";
+  const marketLabel = document.createElement("span");
   marketLabel.textContent = copyOrDefault("console.kanglong.test_template.market_data_account", "行情源账号");
   const marketSelect = document.createElement("select");
   marketSelect.id = "kanglongTemplateMarketDataAccount";
@@ -4017,28 +4100,149 @@ function renderKanglongTemplateEditor() {
     option.textContent = account.name || account.account_id || account.id || "--";
     marketSelect.appendChild(option);
   });
-  marketSelect.value = kanglongState.marketDataAccountId || currentAccount.id || marketSelect.value;
+  marketSelect.value = form.marketDataAccountId || currentAccount?.id || marketSelect.value;
   marketSelect.addEventListener("change", () => {
+    updateKanglongTemplateDraft((draft) => {
+      draft.marketDataAccountId = marketSelect.value || "";
+    });
     kanglongState.marketDataAccountId = marketSelect.value || null;
   });
   marketField.append(marketLabel, marketSelect);
+  grid.appendChild(marketField);
+  section.appendChild(grid);
+  container.appendChild(section);
+}
 
-  const editorField = document.createElement("div");
-  editorField.className = "field";
-  const editorLabel = document.createElement("label");
-  editorLabel.htmlFor = "kanglongTemplateEditorText";
-  editorLabel.textContent = copyOrDefault("console.kanglong.test_template.modal_title", "亢龙测试账号模板");
+function renderKanglongTemplateMainAccountFields(container, form) {
+  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.main_account", "主账号");
+  const grid = createKanglongTemplateFieldGrid();
+  grid.append(
+    createKanglongTemplateField({
+      labelKey: "console.kanglong.test_template.field.main_name",
+      fallback: "主账号名称",
+      value: form.mainAccount.name,
+      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.name = value; }),
+    }),
+    createKanglongTemplateField({
+      labelKey: "console.kanglong.test_template.field.collateral",
+      fallback: "保证金",
+      value: form.mainAccount.collateral,
+      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.collateral = value; }),
+    }),
+    createKanglongTemplateField({
+      labelKey: "console.kanglong.test_template.field.leverage",
+      fallback: "杠杆",
+      value: form.mainAccount.leverage,
+      type: "number",
+      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.leverage = value; }),
+    }),
+  );
+  section.appendChild(grid);
+  container.appendChild(section);
+}
+
+function renderKanglongTemplateSubaccountRows(container, form) {
+  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.subaccounts", "子账号");
+  const rows = Array.isArray(form.subaccounts) ? form.subaccounts : [];
+  rows.forEach((row, index) => {
+    const rowEl = document.createElement("div");
+    rowEl.className = "kanglong-template-sub-row";
+    rowEl.append(
+      createKanglongTemplateField({
+        labelKey: "console.kanglong.test_template.field.sub_name",
+        fallback: "子账号名称",
+        value: row.name,
+        onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.subaccounts[index].name = value; }),
+      }),
+      createKanglongTemplateField({
+        labelKey: "console.kanglong.test_template.field.collateral",
+        fallback: "保证金",
+        value: row.collateral,
+        onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.subaccounts[index].collateral = value; }),
+      }),
+      createKanglongTemplateField({
+        labelKey: "console.kanglong.test_template.field.leverage",
+        fallback: "杠杆",
+        value: row.leverage,
+        type: "number",
+        onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.subaccounts[index].leverage = value; }),
+      }),
+      createKanglongTemplateField({
+        labelKey: "console.kanglong.test_template.field.long_entry_price",
+        fallback: "LONG 开仓价",
+        value: row.longEntryPrice,
+        onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.subaccounts[index].longEntryPrice = value; }),
+      }),
+      createKanglongTemplateField({
+        labelKey: "console.kanglong.test_template.field.short_entry_price",
+        fallback: "SHORT 开仓价",
+        value: row.shortEntryPrice,
+        onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.subaccounts[index].shortEntryPrice = value; }),
+      }),
+      createKanglongTemplateField({
+        labelKey: "console.kanglong.test_template.field.qty",
+        fallback: "持仓数量",
+        value: row.qty,
+        onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.subaccounts[index].qty = value; }),
+      }),
+    );
+    section.appendChild(rowEl);
+  });
+  container.appendChild(section);
+}
+
+function renderKanglongTemplateBatchGenerator(container) {
+  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.batch_generator", "批量生成");
+  const note = document.createElement("div");
+  note.className = "kanglong-account-detail";
+  note.textContent = copyOrDefault("console.kanglong.test_template.batch_note", "填写参数后可批量生成配平子账号。");
+  section.appendChild(note);
+  container.appendChild(section);
+}
+
+function renderKanglongTemplateAdvancedJson(container, form) {
+  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.advanced_json", "高级 JSON");
   const textarea = document.createElement("textarea");
   textarea.id = "kanglongTemplateEditorText";
   textarea.spellcheck = false;
-  textarea.value = JSON.stringify(template, null, 2);
-  editorField.append(editorLabel, textarea);
-  kanglongTemplateEditor.append(marketField, editorField);
+  textarea.value = JSON.stringify(kanglongTemplateFormToPayload(form), null, 2);
+  section.appendChild(textarea);
+  container.appendChild(section);
+}
+
+function selectKanglongTestTemplate(template = {}) {
+  const nextTemplateId = template.id || null;
+  if (
+    kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE
+    && kanglongState.templatePreview?.template_id
+    && kanglongState.templatePreview.template_id !== nextTemplateId
+  ) {
+    exitKanglongTemplateMode();
+  }
+  kanglongState.activeTestTemplateId = nextTemplateId;
+  kanglongState.activeTemplateContentHash = template.template_content_hash || null;
+  setKanglongTemplateDraft(template);
+}
+
+function renderKanglongTemplateEditor() {
+  if (!kanglongTemplateEditor) return;
+  kanglongTemplateEditor.replaceChildren();
+  const form = ensureKanglongTemplateDraft();
+  renderKanglongTemplateStatusBar(kanglongTemplateEditor);
+  renderKanglongTemplateBasicFields(kanglongTemplateEditor, form);
+  renderKanglongTemplateMainAccountFields(kanglongTemplateEditor, form);
+  renderKanglongTemplateSubaccountRows(kanglongTemplateEditor, form);
+  renderKanglongTemplateBatchGenerator(kanglongTemplateEditor);
+  renderKanglongTemplateAdvancedJson(kanglongTemplateEditor, form);
 }
 
 function renderKanglongTemplatePreviewPanel() {
   if (!kanglongTemplatePreview) return;
   kanglongTemplatePreview.replaceChildren();
+  const title = document.createElement("h3");
+  title.className = "kanglong-template-section-title";
+  title.textContent = copyOrDefault("console.kanglong.test_template.preview.title", "预览快照");
+  kanglongTemplatePreview.appendChild(title);
   const preview = kanglongState.templatePreview;
   if (preview) {
     const hashChanged = isKanglongTemplateSnapshotStale();
@@ -4049,15 +4253,53 @@ function renderKanglongTemplatePreviewPanel() {
     kanglongTemplatePreview.appendChild(status);
     const accounts = Array.isArray(preview.accounts) ? preview.accounts : [];
     accounts.forEach((account) => {
-      const row = document.createElement("div");
-      row.className = "kanglong-account-detail";
-      row.textContent = `${account.role || "--"} · ${account.name || account.account_id || account.id || "--"}`;
-      kanglongTemplatePreview.appendChild(row);
+      const card = document.createElement("div");
+      card.className = "kanglong-template-preview-card";
+      const heading = document.createElement("div");
+      heading.className = "kanglong-account-heading";
+      const name = document.createElement("strong");
+      name.className = "kanglong-account-name";
+      name.textContent = account.name || account.account_id || account.id || "--";
+      const role = document.createElement("span");
+      role.className = "badge soft";
+      role.textContent = account.role || "--";
+      heading.append(name, role);
+      const detail = document.createElement("div");
+      detail.className = "kanglong-account-detail";
+      detail.textContent = [
+        account.account_id || account.id,
+        account.available_balance ? copyOrDefault("console.kanglong.test_template.preview.available_balance", "可用 {value}", { value: account.available_balance }) : "",
+        account.total_unrealized_pnl ? copyOrDefault("console.kanglong.test_template.preview.unrealized_pnl", "未实现 {value}", { value: account.total_unrealized_pnl }) : "",
+      ].filter(Boolean).join(" · ");
+      card.append(heading, detail);
+      const positions = Array.isArray(account.positions) ? account.positions : [];
+      positions.forEach((position) => {
+        const metrics = document.createElement("div");
+        metrics.className = "kanglong-account-position-metrics";
+        [
+          [copyOrDefault("console.kanglong.test_template.preview.position_side", "方向"), position.position_side || position.side || "--"],
+          [copyOrDefault("console.kanglong.test_template.preview.qty", "数量"), position.qty || "--"],
+          [copyOrDefault("console.kanglong.test_template.preview.entry_price", "开仓均价"), position.entry_price || "--"],
+          [copyOrDefault("console.kanglong.test_template.preview.mark_price", "标记价格"), position.mark_price || "--"],
+          [copyOrDefault("console.kanglong.test_template.preview.unrealized_pnl_label", "未实现盈亏"), position.unrealized_pnl || "--"],
+        ].forEach(([label, value]) => {
+          const item = document.createElement("div");
+          item.className = "kanglong-account-position-metric";
+          const small = document.createElement("small");
+          small.textContent = label;
+          const strong = document.createElement("strong");
+          strong.textContent = value;
+          item.append(small, strong);
+          metrics.appendChild(item);
+        });
+        card.appendChild(metrics);
+      });
+      kanglongTemplatePreview.appendChild(card);
     });
   } else {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = copyOrDefault("console.kanglong.test_template.preview", "预览快照");
+    empty.textContent = copyOrDefault("console.kanglong.test_template.preview.empty", "尚未生成预览");
     kanglongTemplatePreview.appendChild(empty);
   }
   if (kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {

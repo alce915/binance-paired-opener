@@ -280,11 +280,15 @@
         padding: 8px 10px;
         background: #6e6253;
       }
+      .kanglong-template-modal {
+        width: min(1220px, calc(100vw - 32px));
+      }
       .kanglong-template-grid {
         display: grid;
-        grid-template-columns: 220px minmax(0, 1fr) minmax(240px, 0.8fr);
+        grid-template-columns: 220px minmax(420px, 1fr) minmax(300px, 0.85fr);
         gap: 12px;
         padding: 16px;
+        align-items: start;
       }
       .kanglong-template-library,
       .kanglong-template-editor,
@@ -295,7 +299,7 @@
         gap: 10px;
       }
       .kanglong-template-editor textarea {
-        min-height: 320px;
+        min-height: 160px;
         resize: vertical;
         font-family: Consolas, Monaco, monospace;
         font-size: 13px;
@@ -306,6 +310,53 @@
         border: 1px solid rgba(216, 197, 170, 0.8);
         border-radius: 8px;
         background: #fffdf8;
+      }
+      .kanglong-template-section {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+        border: 1px solid rgba(216, 197, 170, 0.72);
+        border-radius: 8px;
+        background: rgba(255, 253, 248, 0.74);
+      }
+      .kanglong-template-section-title {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 800;
+      }
+      .kanglong-template-field-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .kanglong-template-field {
+        display: grid;
+        gap: 5px;
+        min-width: 0;
+      }
+      .kanglong-template-field span {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      .kanglong-template-sub-row {
+        display: grid;
+        grid-template-columns: minmax(120px, 1.1fr) repeat(5, minmax(82px, 0.8fr));
+        gap: 8px;
+        align-items: end;
+      }
+      .kanglong-template-status-bar,
+      .kanglong-template-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .kanglong-template-preview-card {
+        display: grid;
+        gap: 8px;
+        padding: 10px;
+        border: 1px solid rgba(216, 197, 170, 0.72);
+        border-radius: 8px;
+        background: #fffaf3;
       }
       .compact-actions {
         display: grid;
@@ -803,7 +854,9 @@
       @media (max-width: 860px) {
         .kanglong-layout,
         .kanglong-toolbar,
-        .kanglong-template-grid { grid-template-columns: 1fr; }
+        .kanglong-template-grid,
+        .kanglong-template-field-grid,
+        .kanglong-template-sub-row { grid-template-columns: 1fr; }
       }
       @media (max-width: 1240px) {
         .dashboard,

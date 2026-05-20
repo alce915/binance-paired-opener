@@ -239,6 +239,7 @@ function makeTemplateHarness() {
       createKanglongPlan,
       exitKanglongTemplateMode,
       renderKanglongTemplateLibrary,
+      renderKanglongTestTemplateModal,
       saveCurrentKanglongTemplate,
       state: kanglongState,
       get availableAccounts() { return availableAccounts; },
@@ -246,6 +247,8 @@ function makeTemplateHarness() {
         elementById.set("kanglongTemplateEditorText", { value: JSON.stringify(payload) });
       },
       library: kanglongTemplateLibrary,
+      editor: kanglongTemplateEditor,
+      preview: kanglongTemplatePreview,
       renderCalls,
       requestCalls,
     };
@@ -253,6 +256,13 @@ function makeTemplateHarness() {
   sandbox.__requestCalls = requestCalls;
   vm.runInNewContext(script, sandbox);
   return sandbox.api;
+}
+
+function collectNodeText(node) {
+  if (!node) return "";
+  const ownText = typeof node.textContent === "string" ? node.textContent : "";
+  const childText = Array.isArray(node.children) ? node.children.map(collectNodeText).join(" ") : "";
+  return `${ownText} ${childText}`.trim();
 }
 
 {
@@ -350,6 +360,17 @@ function makeTemplateHarness() {
   });
 
   assert.notEqual(first, second);
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDraft = api.buildDefaultKanglongTemplateDraft();
+  api.renderKanglongTestTemplateModal();
+
+  const editorText = collectNodeText(api.editor);
+  assert.match(editorText, /基础信息|console\.kanglong\.test_template\.editor\.basic/);
+  assert.match(editorText, /主账号|console\.kanglong\.test_template\.editor\.main_account/);
+  assert.match(editorText, /子账号|console\.kanglong\.test_template\.editor\.subaccounts/);
 }
 
 {
