@@ -89,6 +89,21 @@ def test_kanglong_test_template_crud_round_trip(monkeypatch, tmp_path) -> None:
     }
 
 
+def test_kanglong_test_template_create_generates_id_when_visual_form_omits_it(monkeypatch, tmp_path) -> None:
+    install_template_settings(monkeypatch, tmp_path)
+    payload = template_payload()
+    payload.pop("id")
+
+    response = TestClient(api_module.app).post("/kanglong/simulation/test-templates", json=payload)
+
+    assert response.status_code == 200
+    created = response.json()["template"]
+    assert created["id"].startswith("tpl_")
+    assert created["template_content_hash"].startswith("sha256:")
+    listed = KanglongTemplateStore(api_module.app.state.settings.kanglong_test_templates_file).list_templates()
+    assert [template["id"] for template in listed["templates"]] == [created["id"]]
+
+
 def test_kanglong_test_template_list_missing_file_returns_empty_envelope(monkeypatch, tmp_path) -> None:
     install_template_settings(monkeypatch, tmp_path)
     response = TestClient(api_module.app).get("/kanglong/simulation/test-templates")

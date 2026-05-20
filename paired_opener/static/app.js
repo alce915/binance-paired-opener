@@ -95,6 +95,7 @@ const DEFAULT_SYMBOL = "ETHUSDC";
 const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
 const KANGLONG_ACCOUNT_SOURCE_RUNTIME = "runtime";
 const KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE = "test_template";
+const KANGLONG_TEMPLATE_MAX_BATCH_SUBACCOUNTS = 50;
 const KANGLONG_LOG_FILTERS = ["all", "warning", "error", "current_group", "cost", "ledger"];
 let eventSource = null;
 let executionMode = "paired_open";
@@ -3778,7 +3779,8 @@ function buildKanglongTemplateBatchSubaccounts({
   shortEntryPrice = "",
   qty = "",
 } = {}) {
-  const rowCount = Math.max(1, Number.parseInt(String(count || 1), 10) || 1);
+  const requestedCount = Math.max(1, Number.parseInt(String(count || 1), 10) || 1);
+  const rowCount = Math.min(KANGLONG_TEMPLATE_MAX_BATCH_SUBACCOUNTS, requestedCount);
   return Array.from({ length: rowCount }, (_, index) => {
     const number = index + 1;
     return {
@@ -3927,6 +3929,9 @@ function validateKanglongTemplateForm(form = kanglongState.testTemplateDraft) {
   if (!isPositiveTemplateNumber(form?.mainAccount?.leverage)) add("main_account.leverage", "console.kanglong.test_template.validation.positive_number");
   const rows = Array.isArray(form?.subaccounts) ? form.subaccounts : [];
   if (!rows.length) add("subaccounts", "console.kanglong.test_template.validation.subaccount_required");
+  if (rows.length > KANGLONG_TEMPLATE_MAX_BATCH_SUBACCOUNTS) {
+    add("subaccounts", "console.kanglong.test_template.validation.too_many_subaccounts");
+  }
   rows.forEach((row, index) => {
     const prefix = `subaccounts.${index}`;
     if (!String(row.name || "").trim()) add(`${prefix}.name`, "console.kanglong.test_template.validation.name_required");
@@ -3989,6 +3994,32 @@ function templatePreviewWarnings(preview = kanglongState.templatePreview) {
 
 function templatePreviewBlocks(preview = kanglongState.templatePreview) {
   return Array.isArray(preview?.blocks) ? preview.blocks : [];
+}
+
+function kanglongTemplatePreviewErrorMessage(error = kanglongState.templatePreviewError) {
+  if (!error) return "";
+  const detail = error.detail && typeof error.detail === "object" ? error.detail : error;
+  if (detail.messageCode) {
+    return copyOrDefault(detail.messageCode, detail.message || detail.code || detail.messageCode);
+  }
+  if (detail.code) {
+    return copyOrDefault(
+      `reasons.${detail.code}`,
+      detail.message || copyOrDefault(`runtime.kanglong.${detail.code}`, detail.code),
+    );
+  }
+  return detail.message || userVisibleErrorMessage(error, copyOrDefault("runtime.kanglong.request_failed", "请求失败"));
+}
+
+function setKanglongTemplatePreviewError(error) {
+  const detail = error?.detail && typeof error.detail === "object" ? error.detail : {};
+  kanglongState.templatePreviewStatus = "blocked";
+  kanglongState.templatePreviewError = {
+    ...detail,
+    code: error?.code || detail.code || error?.messageCode || "kanglong_test_template_preview_failed",
+    message: detail.message || error?.message || copyOrDefault("runtime.kanglong.request_failed", "请求失败"),
+    detail,
+  };
 }
 
 function acceptKanglongTemplatePreviewResponse(requestSeq, preview) {
@@ -4415,6 +4446,12 @@ function renderKanglongTemplatePreviewPanel() {
   title.className = "kanglong-template-section-title";
   title.textContent = copyOrDefault("console.kanglong.test_template.preview.title", "预览快照");
   kanglongTemplatePreview.appendChild(title);
+  if (kanglongState.templatePreviewError) {
+    const errorBox = document.createElement("div");
+    errorBox.className = "alert error kanglong-template-error";
+    errorBox.textContent = kanglongTemplatePreviewErrorMessage(kanglongState.templatePreviewError);
+    kanglongTemplatePreview.appendChild(errorBox);
+  }
   const preview = kanglongState.templatePreview;
   if (preview) {
     const hashChanged = isKanglongTemplateSnapshotStale();
@@ -4541,7 +4578,14 @@ async function previewCurrentKanglongTemplate(savedTemplate) {
   const requestSeq = kanglongState.templatePreviewSeq + 1;
   kanglongState.templatePreviewSeq = requestSeq;
   kanglongState.templatePreviewStatus = "loading";
-  const preview = await previewKanglongTestTemplate(savedTemplateId, marketDataAccountId);
+  let preview;
+  try {
+    preview = await previewKanglongTestTemplate(savedTemplateId, marketDataAccountId);
+  } catch (error) {
+    setKanglongTemplatePreviewError(error);
+    renderKanglongTestTemplateModal();
+    throw error;
+  }
   const nextPreview = {
     ...preview,
     template_id: preview.template_id || savedTemplateId,

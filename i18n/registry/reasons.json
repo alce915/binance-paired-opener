@@ -151,6 +151,10 @@
     "key": "reasons.kanglong.test_template.invalid_template",
     "params": ["field", "value"]
   },
+  "kanglong_test_template_too_many_subaccounts": {
+    "key": "reasons.kanglong.test_template.too_many_subaccounts",
+    "params": ["field", "value"]
+  },
   "blocked_plan_stale": {
     "key": "reasons.kanglong.blocked_plan_stale",
     "params": ["run_id", "template_id", "current_template_content_hash", "requested_template_content_hash"]

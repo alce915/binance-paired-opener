@@ -18,6 +18,7 @@ from paired_opener.kanglong.models import KanglongAccountSnapshot, KanglongPosit
 
 
 KANGLONG_TEST_TEMPLATE_VERSION = 1
+KANGLONG_TEST_TEMPLATE_MAX_SUBACCOUNTS = 50
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _STORE_LOCK = threading.RLock()
@@ -695,6 +696,8 @@ def _normalize_main_account(value: Any) -> dict[str, Any]:
 
 def _normalize_subaccounts(value: Any) -> list[dict[str, Any]]:
     subaccounts = _require_list(value, "subaccounts")
+    if len(subaccounts) > KANGLONG_TEST_TEMPLATE_MAX_SUBACCOUNTS:
+        raise TemplateValidationError("kanglong_test_template_too_many_subaccounts", "subaccounts", len(subaccounts))
     normalized: list[dict[str, Any]] = []
     used_row_ids: set[str] = set()
     for index, item in enumerate(subaccounts, start=1):

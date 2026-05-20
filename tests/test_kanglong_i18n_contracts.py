@@ -64,6 +64,7 @@ KANGLONG_TEMPLATE_MESSAGE_COPY = {
     "console.kanglong.test_template.validation.market_data_required": "请选择行情源账号",
     "console.kanglong.test_template.validation.market_data_unavailable": "行情源账号不可用",
     "console.kanglong.test_template.validation.subaccount_required": "至少需要 1 个子账号",
+    "console.kanglong.test_template.validation.too_many_subaccounts": "子账号数量不能超过 50 个",
     "console.kanglong.test_template.validation.warning_confirm_required": "确认警告后才能应用",
     "console.kanglong.test_template.confirm_discard_dirty": "当前模板有未保存改动，确认放弃这些改动吗？",
     "console.kanglong.test_template.exit_mode": "退出测试模板",
@@ -96,6 +97,7 @@ KANGLONG_TEMPLATE_REASON_KEYS = {
     "kanglong_test_template_migration_failed": "reasons.kanglong.test_template.migration_failed",
     "kanglong_test_template_active_run_exists": "reasons.kanglong.test_template.active_run_exists",
     "kanglong_test_template_invalid_template": "reasons.kanglong.test_template.invalid_template",
+    "kanglong_test_template_too_many_subaccounts": "reasons.kanglong.test_template.too_many_subaccounts",
     "blocked_plan_stale": "reasons.kanglong.blocked_plan_stale",
     "blocked_plan_recheck_failed": "reasons.kanglong.blocked_plan_recheck_failed",
 }

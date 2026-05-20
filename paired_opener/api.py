@@ -141,6 +141,12 @@ def _kanglong_template_store() -> KanglongTemplateStore:
     return KanglongTemplateStore(app.state.settings.kanglong_test_templates_file)
 
 
+def _template_with_generated_id(template: dict[str, Any]) -> dict[str, Any]:
+    if str(template.get("id") or "").strip():
+        return template
+    return {**template, "id": f"tpl_{uuid4().hex[:12]}"}
+
+
 def _raise_kanglong_template_error(exc: Exception) -> None:
     if isinstance(exc, TemplateValidationError):
         raise HTTPException(
@@ -734,7 +740,7 @@ async def list_kanglong_test_templates() -> KanglongTemplateListResponse:
 @app.post("/kanglong/simulation/test-templates", response_model=KanglongTemplateMutationResponse)
 async def create_kanglong_test_template(template: dict[str, Any]) -> KanglongTemplateMutationResponse:
     try:
-        saved = _kanglong_template_store().upsert_template(template)
+        saved = _kanglong_template_store().upsert_template(_template_with_generated_id(template))
     except (TemplateValidationError, TemplateStoreError) as exc:
         _raise_kanglong_template_error(exc)
     return KanglongTemplateMutationResponse(template=saved)

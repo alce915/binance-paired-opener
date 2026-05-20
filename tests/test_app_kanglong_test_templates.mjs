@@ -114,6 +114,7 @@ function makeTemplateHarness() {
   const script = `
     const KANGLONG_ACCOUNT_SOURCE_RUNTIME = "runtime";
     const KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE = "test_template";
+    const KANGLONG_TEMPLATE_MAX_BATCH_SUBACCOUNTS = 50;
     const KANGLONG_LOG_FILTERS = ["all", "warning", "error", "current_group", "cost", "ledger"];
     const DEFAULT_SYMBOL = "ETHUSDC";
     const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
@@ -208,6 +209,13 @@ function makeTemplateHarness() {
     };
     async function request(path, options = {}) {
       requestCalls.push({ path, options });
+      const failure = globalThis.__requestFailures.find((item) => String(path).includes(item.includes));
+      if (failure) {
+        const error = new Error(failure.message || "request failed");
+        error.detail = failure.detail || null;
+        error.code = failure.detail?.code || null;
+        throw error;
+      }
       if (String(path).includes("/kanglong/simulation/test-templates/") && options.method === "PUT") {
         return {
           template: {
@@ -215,6 +223,26 @@ function makeTemplateHarness() {
             name: "Template A Edited",
             template_content_hash: "sha256:saved-template",
           },
+        };
+      }
+      if (String(path).endsWith("/kanglong/simulation/test-templates") && options.method === "POST") {
+        return {
+          template: {
+            id: "tpl_generated",
+            name: "Generated Template",
+            template_content_hash: "sha256:generated-template",
+          },
+        };
+      }
+      if (String(path).includes("/preview")) {
+        return {
+          template_id: "tpl_a",
+          template_content_hash: "sha256:saved-template",
+          snapshot_bundle_id: "snap-preview",
+          market_data_account_id: "market-main",
+          warnings: [],
+          blocks: [],
+          accounts: [],
         };
       }
       return { run_id: "captured-plan", available_actions: [] };
@@ -259,6 +287,13 @@ function makeTemplateHarness() {
       setEditorPayload(payload) {
         elementById.set("kanglongTemplateEditorText", { value: JSON.stringify(payload) });
       },
+      failRequestsMatching(includes, detail = {}) {
+        globalThis.__requestFailures.push({
+          includes,
+          detail,
+          message: detail.message || detail.code || "request failed",
+        });
+      },
       library: kanglongTemplateLibrary,
       editor: kanglongTemplateEditor,
       preview: kanglongTemplatePreview,
@@ -270,6 +305,7 @@ function makeTemplateHarness() {
   `;
   sandbox.__requestCalls = requestCalls;
   sandbox.__confirmCalls = confirmCalls;
+  sandbox.__requestFailures = [];
   sandbox.__confirmResult = true;
   vm.runInNewContext(script, sandbox);
   return sandbox.api;
@@ -340,6 +376,34 @@ function collectNodeText(node) {
     symbol: "ETHUSDC",
     market_data_account_id: "market-main",
     main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: Array.from({ length: 51 }, (_, index) => ({
+      row_id: `sub-${index + 1}`,
+      account_id: `test-sub-${index + 1}`,
+      name: `Sub ${index + 1}`,
+      collateral: "500",
+      leverage: 75,
+      long_entry_price: "2400",
+      short_entry_price: "2600",
+      qty: "1",
+    })),
+  });
+  const result = api.validateKanglongTemplateForm(form);
+
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((item) => (
+    item.field === "subaccounts"
+    && item.messageCode === "console.kanglong.test_template.validation.too_many_subaccounts"
+  )));
+}
+
+{
+  const api = makeTemplateHarness();
+  const form = api.kanglongTemplateToFormState({
+    id: "tpl_a",
+    name: "Template A",
+    symbol: "ETHUSDC",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
     subaccounts: [
       {
         row_id: "sub-1",
@@ -400,6 +464,20 @@ function collectNodeText(node) {
 
 {
   const api = makeTemplateHarness();
+  const rows = api.buildKanglongTemplateBatchSubaccounts({
+    count: 5000,
+    collateral: "500",
+    leverage: 75,
+    longEntryPrice: "2400",
+    shortEntryPrice: "2600",
+    qty: "1.5",
+  });
+
+  assert.equal(rows.length, 50, "batch generation should cap generated subaccounts");
+}
+
+{
+  const api = makeTemplateHarness();
   api.state.testTemplateDraft = api.buildDefaultKanglongTemplateDraft();
   const imported = api.importKanglongTemplateJsonText(JSON.stringify({
     id: "tpl_imported",
@@ -422,6 +500,44 @@ function collectNodeText(node) {
   assert.equal(imported, true);
   assert.equal(api.state.testTemplateDraft.name, "Imported");
   assert.equal(api.state.testTemplateDirty, true);
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDraft = api.kanglongTemplateToFormState({
+    id: "tpl_a",
+    name: "Template A",
+    symbol: "ETHUSDC",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [{
+      row_id: "sub-1",
+      account_id: "test-sub-1",
+      name: "Sub 1",
+      collateral: "500",
+      leverage: 75,
+      long_entry_price: "2400",
+      short_entry_price: "2600",
+      qty: "1",
+    }],
+  });
+  api.state.testTemplateOriginalPayload = api.kanglongTemplateFormToPayload(api.state.testTemplateDraft);
+  api.failRequestsMatching("/preview", {
+    code: "kanglong_test_template_market_data_account_unavailable",
+    message: "行情源账号不可用",
+  });
+
+  let previewError = null;
+  try {
+    await api.saveCurrentKanglongTemplate({ applyPreview: true });
+  } catch (error) {
+    previewError = error;
+  }
+
+  assert.ok(previewError, "preview failure should still reject save-and-apply");
+  assert.equal(api.state.templatePreviewStatus, "blocked");
+  assert.equal(api.state.templatePreviewError.code, "kanglong_test_template_market_data_account_unavailable");
+  assert.match(collectNodeText(api.preview), /行情源账号不可用|kanglong_test_template_market_data_account_unavailable/);
 }
 
 {

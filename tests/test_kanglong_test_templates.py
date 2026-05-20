@@ -691,6 +691,21 @@ def test_explicit_duplicate_row_id_rejects_template(tmp_path) -> None:
     assert excinfo.value.field == "subaccounts.row_id"
 
 
+def test_upsert_rejects_excessive_subaccount_count(tmp_path) -> None:
+    template = template_payload()
+    template["subaccounts"] = [
+        {**template["subaccounts"][0], "row_id": f"sub-{index}", "account_id": f"test-sub-{index}"}
+        for index in range(1, 52)
+    ]
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    with pytest.raises(TemplateValidationError) as excinfo:
+        store.upsert_template(template)
+
+    assert excinfo.value.code == "kanglong_test_template_too_many_subaccounts"
+    assert excinfo.value.field == "subaccounts"
+
+
 def test_clone_generates_new_template_id_and_row_ids(tmp_path) -> None:
     store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
     created = store.upsert_template(template_payload())
