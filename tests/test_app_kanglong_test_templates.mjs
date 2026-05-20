@@ -140,6 +140,10 @@ function makeTemplateHarness() {
       activeTemplateContentHash: null,
       marketDataAccountId: null,
       templatePreview: null,
+      templatePreviewSeq: 0,
+      templatePreviewStatus: "empty",
+      templatePreviewWarningsConfirmedKey: "",
+      templatePreviewError: null,
       realAccountPoolSnapshot: null,
     };
     const renderCalls = [];
@@ -316,6 +320,17 @@ function collectNodeText(node) {
   const ownText = typeof node.textContent === "string" ? node.textContent : "";
   const childText = Array.isArray(node.children) ? node.children.map(collectNodeText).join(" ") : "";
   return `${ownText} ${childText}`.trim();
+}
+
+function findNodeByText(node, text) {
+  if (!node) return null;
+  if (node.textContent === text) return node;
+  if (!Array.isArray(node.children)) return null;
+  for (const child of node.children) {
+    const match = findNodeByText(child, text);
+    if (match) return match;
+  }
+  return null;
 }
 
 {
@@ -548,6 +563,49 @@ function collectNodeText(node) {
   api.acceptKanglongTemplatePreviewResponse(0, { template_id: "stale", accounts: [] });
 
   assert.equal(api.state.templatePreview.template_id, "tpl_a");
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDraft = api.kanglongTemplateToFormState({
+    id: "tpl_a",
+    name: "Template A",
+    symbol: "ETHUSDC",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [{
+      row_id: "sub-1",
+      account_id: "test-sub-1",
+      name: "Sub 1",
+      collateral: "500",
+      leverage: 75,
+      long_entry_price: "2400",
+      short_entry_price: "2600",
+      qty: "1",
+    }],
+  });
+  api.state.testTemplateOriginalPayload = api.kanglongTemplateFormToPayload(api.state.testTemplateDraft);
+  api.state.activeTestTemplateId = "tpl_a";
+  api.renderKanglongTestTemplateModal();
+
+  const generatePreviewButton = findNodeByText(api.preview, "console.kanglong.test_template.preview.generate");
+  assert.ok(generatePreviewButton, "empty preview panel should expose an explicit generate preview action");
+  await generatePreviewButton.onclick();
+
+  assert.equal(api.state.templatePreviewStatus, "ready", "generate preview should fetch a ready template snapshot");
+  assert.equal(api.state.templatePreview?.snapshot_bundle_id, "snap-preview", "generated preview should be stored for display");
+  assert.equal(api.state.accountSource, "runtime", "generating preview should not apply the template account pool");
+  assert.equal(api.availableAccounts[0].account_id, "runtime-main", "runtime account pool should stay active after preview-only generation");
+  assert.match(
+    collectNodeText(api.preview),
+    /console\.kanglong\.test_template\.preview\.generated/,
+    "preview-only generation should not claim that the template was applied",
+  );
+  assert.equal(
+    api.requestCalls.some((call) => String(call.path).includes("/preview")),
+    true,
+    "generate preview should call the backend preview endpoint",
+  );
 }
 
 {

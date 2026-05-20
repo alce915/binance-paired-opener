@@ -4442,10 +4442,29 @@ function renderKanglongTemplateEditor() {
 function renderKanglongTemplatePreviewPanel() {
   if (!kanglongTemplatePreview) return;
   kanglongTemplatePreview.replaceChildren();
+  const header = document.createElement("div");
+  header.className = "kanglong-template-preview-header";
   const title = document.createElement("h3");
   title.className = "kanglong-template-section-title";
   title.textContent = copyOrDefault("console.kanglong.test_template.preview.title", "预览快照");
-  kanglongTemplatePreview.appendChild(title);
+  const refreshButton = document.createElement("button");
+  refreshButton.type = "button";
+  refreshButton.className = "inline-btn success";
+  refreshButton.disabled = isCurrentTemplateLockedByActiveRun() || kanglongState.templatePreviewStatus === "loading";
+  refreshButton.textContent = kanglongState.templatePreviewStatus === "loading"
+    ? copyOrDefault("console.kanglong.test_template.preview.loading", "生成中")
+    : copyOrDefault(
+      kanglongState.templatePreview ? "console.kanglong.test_template.preview.refresh" : "console.kanglong.test_template.preview.generate",
+      kanglongState.templatePreview ? "刷新预览" : "生成预览",
+    );
+  refreshButton.addEventListener("click", () => (
+    saveCurrentKanglongTemplate({ refreshPreview: true }).catch((error) => appendLog("error", "", undefined, {
+      messageCode: "runtime.kanglong.request_failed",
+      messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+    }))
+  ));
+  header.append(title, refreshButton);
+  kanglongTemplatePreview.appendChild(header);
   if (kanglongState.templatePreviewError) {
     const errorBox = document.createElement("div");
     errorBox.className = "alert error kanglong-template-error";
@@ -4455,10 +4474,14 @@ function renderKanglongTemplatePreviewPanel() {
   const preview = kanglongState.templatePreview;
   if (preview) {
     const hashChanged = isKanglongTemplateSnapshotStale();
+    const previewApplied = kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE && !hashChanged;
     const status = document.createElement("div");
     status.textContent = hashChanged
       ? copyOrDefault("console.kanglong.test_template.snapshot_stale", "console.kanglong.test_template.snapshot_stale")
-      : copyOrDefault("console.kanglong.test_template.applied", "已应用测试模板");
+      : copyOrDefault(
+        previewApplied ? "console.kanglong.test_template.applied" : "console.kanglong.test_template.preview.generated",
+        previewApplied ? "已应用测试模板" : "预览已生成",
+      );
     kanglongTemplatePreview.appendChild(status);
     const accounts = Array.isArray(preview.accounts) ? preview.accounts : [];
     accounts.forEach((account) => {
@@ -4578,6 +4601,7 @@ async function previewCurrentKanglongTemplate(savedTemplate) {
   const requestSeq = kanglongState.templatePreviewSeq + 1;
   kanglongState.templatePreviewSeq = requestSeq;
   kanglongState.templatePreviewStatus = "loading";
+  renderKanglongTestTemplateModal();
   let preview;
   try {
     preview = await previewKanglongTestTemplate(savedTemplateId, marketDataAccountId);
@@ -4596,7 +4620,7 @@ async function previewCurrentKanglongTemplate(savedTemplate) {
   return kanglongState.templatePreview;
 }
 
-async function saveCurrentKanglongTemplate({ applyPreview = false } = {}) {
+async function saveCurrentKanglongTemplate({ applyPreview = false, refreshPreview = false } = {}) {
   const template = readKanglongTemplateEditorPayload();
   const validation = validateCurrentKanglongTemplateDraft();
   if (!validation.valid) {
@@ -4618,8 +4642,12 @@ async function saveCurrentKanglongTemplate({ applyPreview = false } = {}) {
     kanglongState.testTemplateDirty = false;
     kanglongState.marketDataAccountId = kanglongState.testTemplateDraft.marketDataAccountId || kanglongState.marketDataAccountId;
   }
-  if (applyPreview && savedTemplateId) {
+  if ((applyPreview || refreshPreview) && savedTemplateId) {
     const preview = await previewCurrentKanglongTemplate(savedTemplate);
+    if (refreshPreview && !applyPreview) {
+      renderKanglongTestTemplateModal();
+      return savedTemplate;
+    }
     if (!preview || templatePreviewBlocks(preview).length) {
       renderKanglongTestTemplateModal();
       throw new Error(copyOrDefault("console.kanglong.test_template.status.blocked", "存在阻断"));
