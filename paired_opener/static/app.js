@@ -128,6 +128,14 @@ const kanglongState = {
   activeTemplateContentHash: null,
   marketDataAccountId: null,
   templatePreview: null,
+  testTemplateDraft: null,
+  testTemplateOriginalPayload: null,
+  testTemplateDirty: false,
+  templatePreviewSeq: 0,
+  templatePreviewStatus: "empty",
+  templatePreviewWarningsConfirmedKey: "",
+  templatePreviewError: null,
+  activeTemplateRunLock: null,
   realAccountPoolSnapshot: null,
 };
 let kanglongActiveRunRestored = false;
@@ -3756,6 +3764,174 @@ async function applyAppPage(page) {
     await restoreActiveKanglongRun();
   }
   return true;
+}
+
+function nextKanglongTemplateRowId(index = 1) {
+  return `sub-${index}`;
+}
+
+function buildDefaultKanglongTemplateDraft() {
+  return {
+    id: "",
+    name: "",
+    symbol: DEFAULT_SYMBOL,
+    marketDataAccountId: kanglongState.marketDataAccountId || currentAccount?.id || "",
+    mainAccount: {
+      accountId: "test-main",
+      name: copyOrDefault("console.kanglong.test_template.default_main_name", "测试主账号"),
+      collateral: "",
+      leverage: 75,
+    },
+    subaccounts: [
+      {
+        rowId: "sub-1",
+        accountId: "test-sub-1",
+        name: copyOrDefault("console.kanglong.test_template.default_sub_name", "测试子账号 1"),
+        collateral: "",
+        leverage: 75,
+        longEntryPrice: "",
+        shortEntryPrice: "",
+        qty: "",
+      },
+    ],
+  };
+}
+
+function kanglongTemplateToFormState(template = {}) {
+  const subaccounts = Array.isArray(template.subaccounts) ? template.subaccounts : [];
+  const draft = buildDefaultKanglongTemplateDraft();
+  return {
+    ...draft,
+    id: String(template.id || ""),
+    name: String(template.name || ""),
+    symbol: String(template.symbol || DEFAULT_SYMBOL).trim().toUpperCase(),
+    marketDataAccountId: String(template.market_data_account_id || kanglongState.marketDataAccountId || currentAccount?.id || ""),
+    mainAccount: {
+      accountId: String(template.main_account?.account_id || "test-main"),
+      name: String(template.main_account?.name || draft.mainAccount.name),
+      collateral: String(template.main_account?.collateral ?? ""),
+      leverage: Number(template.main_account?.leverage || 75),
+    },
+    subaccounts: subaccounts.length
+      ? subaccounts.map((item, index) => ({
+        rowId: String(item.row_id || nextKanglongTemplateRowId(index + 1)),
+        accountId: String(item.account_id || `test-sub-${index + 1}`),
+        name: String(item.name || copyOrDefault("console.kanglong.test_template.default_sub_name_index", "测试子账号 {index}", { index: index + 1 })),
+        collateral: String(item.collateral ?? ""),
+        leverage: Number(item.leverage || 75),
+        longEntryPrice: String(item.long_entry_price ?? ""),
+        shortEntryPrice: String(item.short_entry_price ?? ""),
+        qty: String(item.qty ?? ""),
+      }))
+      : draft.subaccounts,
+  };
+}
+
+function kanglongTemplateFormToPayload(form = kanglongState.testTemplateDraft || buildDefaultKanglongTemplateDraft()) {
+  return {
+    ...(form.id ? { id: form.id } : {}),
+    name: String(form.name || "").trim(),
+    symbol: String(form.symbol || DEFAULT_SYMBOL).trim().toUpperCase(),
+    market_data_account_id: String(form.marketDataAccountId || "").trim(),
+    main_account: {
+      account_id: String(form.mainAccount?.accountId || "test-main").trim(),
+      name: String(form.mainAccount?.name || "").trim(),
+      collateral: String(form.mainAccount?.collateral ?? "").trim(),
+      leverage: Number(form.mainAccount?.leverage || 0),
+      positions: [],
+    },
+    subaccounts: (Array.isArray(form.subaccounts) ? form.subaccounts : []).map((item, index) => ({
+      row_id: String(item.rowId || nextKanglongTemplateRowId(index + 1)).trim(),
+      account_id: String(item.accountId || `test-sub-${index + 1}`).trim(),
+      name: String(item.name || "").trim(),
+      collateral: String(item.collateral ?? "").trim(),
+      leverage: Number(item.leverage || 0),
+      long_entry_price: String(item.longEntryPrice ?? "").trim(),
+      short_entry_price: String(item.shortEntryPrice ?? "").trim(),
+      qty: String(item.qty ?? "").trim(),
+    })),
+  };
+}
+
+function isBlankTemplateValue(value) {
+  return String(value ?? "").trim() === "";
+}
+
+function isPositiveTemplateNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0;
+}
+
+function isNonNegativeTemplateNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0;
+}
+
+function validateKanglongTemplateForm(form = kanglongState.testTemplateDraft) {
+  const errors = [];
+  const add = (field, messageCode) => errors.push({ field, messageCode });
+  if (!String(form?.name || "").trim()) add("name", "console.kanglong.test_template.validation.name_required");
+  if (!String(form?.symbol || "").trim()) add("symbol", "console.kanglong.test_template.validation.symbol_required");
+  if (!String(form?.marketDataAccountId || "").trim()) add("market_data_account_id", "console.kanglong.test_template.validation.market_data_required");
+  if (isBlankTemplateValue(form?.mainAccount?.collateral)) add("main_account.collateral", "console.kanglong.test_template.validation.empty_numeric");
+  if (!isBlankTemplateValue(form?.mainAccount?.collateral) && !isNonNegativeTemplateNumber(form.mainAccount.collateral)) add("main_account.collateral", "console.kanglong.test_template.validation.non_negative_number");
+  if (!isPositiveTemplateNumber(form?.mainAccount?.leverage)) add("main_account.leverage", "console.kanglong.test_template.validation.positive_number");
+  const rows = Array.isArray(form?.subaccounts) ? form.subaccounts : [];
+  if (!rows.length) add("subaccounts", "console.kanglong.test_template.validation.subaccount_required");
+  rows.forEach((row, index) => {
+    const prefix = `subaccounts.${index}`;
+    if (!String(row.name || "").trim()) add(`${prefix}.name`, "console.kanglong.test_template.validation.name_required");
+    if (isBlankTemplateValue(row.collateral)) add(`${prefix}.collateral`, "console.kanglong.test_template.validation.empty_numeric");
+    if (!isBlankTemplateValue(row.collateral) && !isNonNegativeTemplateNumber(row.collateral)) add(`${prefix}.collateral`, "console.kanglong.test_template.validation.non_negative_number");
+    if (!isPositiveTemplateNumber(row.leverage)) add(`${prefix}.leverage`, "console.kanglong.test_template.validation.positive_number");
+    if (!isPositiveTemplateNumber(row.longEntryPrice)) add(`${prefix}.long_entry_price`, "console.kanglong.test_template.validation.positive_number");
+    if (!isPositiveTemplateNumber(row.shortEntryPrice)) add(`${prefix}.short_entry_price`, "console.kanglong.test_template.validation.positive_number");
+    if (!isPositiveTemplateNumber(row.qty)) add(`${prefix}.qty`, "console.kanglong.test_template.validation.positive_number");
+  });
+  return { valid: errors.length === 0, errors };
+}
+
+function stableTemplateValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => stableTemplateValue(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = stableTemplateValue(value[key]);
+      return result;
+    }, {});
+  }
+  return value;
+}
+
+function normalizedTemplatePayloadText(payload) {
+  return JSON.stringify(stableTemplateValue(payload || {}));
+}
+
+function isKanglongTemplateFormDirty() {
+  const original = kanglongState.testTemplateOriginalPayload || {};
+  const current = kanglongTemplateFormToPayload(kanglongState.testTemplateDraft);
+  return normalizedTemplatePayloadText(original) !== normalizedTemplatePayloadText(current);
+}
+
+function markKanglongTemplateDraftChanged() {
+  kanglongState.testTemplateDirty = isKanglongTemplateFormDirty();
+  kanglongState.templatePreviewStatus = "stale";
+  kanglongState.templatePreviewWarningsConfirmedKey = "";
+}
+
+function kanglongPreviewConfirmationKey(preview = kanglongState.templatePreview) {
+  const warnings = Array.isArray(preview?.warnings) ? preview.warnings : [];
+  const warningCodes = warnings
+    .map((warning) => String(warning.code || warning.messageCode || warning))
+    .sort()
+    .join(",");
+  return [
+    preview?.template_content_hash || preview?.templateContentHash || "",
+    preview?.snapshot_bundle_id || preview?.snapshotBundleId || "",
+    preview?.request_seq || preview?.requestSeq || kanglongState.templatePreviewSeq || "",
+    warningCodes,
+  ].join("|");
 }
 
 function selectedKanglongTemplate() {

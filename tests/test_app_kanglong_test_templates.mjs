@@ -97,7 +97,7 @@ function appSlice(start, end) {
 function makeTemplateHarness() {
   const apiHelpers = appSlice("function fetchKanglongTestTemplates()", "function formatNumber");
   const helpers = appSlice("function renderKanglongWorkspace()", "function renderKanglongSelectedSubaccounts");
-  const modalHelpers = appSlice("function selectedKanglongTemplate()", "function buildSimulationRunPayload");
+  const modalHelpers = appSlice("function nextKanglongTemplateRowId", "function buildSimulationRunPayload");
   const requestCalls = [];
   const sandbox = {
     console,
@@ -229,6 +229,12 @@ function makeTemplateHarness() {
     ${helpers}
     ${modalHelpers}
     globalThis.api = {
+      buildDefaultKanglongTemplateDraft,
+      kanglongTemplateToFormState,
+      kanglongTemplateFormToPayload,
+      validateKanglongTemplateForm,
+      isKanglongTemplateFormDirty,
+      kanglongPreviewConfirmationKey,
       applyKanglongTemplatePreview,
       createKanglongPlan,
       exitKanglongTemplateMode,
@@ -247,6 +253,103 @@ function makeTemplateHarness() {
   sandbox.__requestCalls = requestCalls;
   vm.runInNewContext(script, sandbox);
   return sandbox.api;
+}
+
+{
+  const api = makeTemplateHarness();
+  const draft = api.buildDefaultKanglongTemplateDraft();
+
+  assert.equal(draft.symbol, "ETHUSDC");
+  assert.equal(draft.mainAccount.leverage, 75);
+  assert.equal(draft.mainAccount.collateral, "");
+  assert.equal(draft.subaccounts.length, 1);
+  assert.equal(draft.subaccounts[0].qty, "");
+}
+
+{
+  const api = makeTemplateHarness();
+  const form = api.kanglongTemplateToFormState({
+    id: "tpl_a",
+    name: "Template A",
+    symbol: "ethusdc",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [
+      {
+        row_id: "sub-1",
+        account_id: "test-sub-1",
+        name: "Sub 1",
+        collateral: "500",
+        leverage: 75,
+        long_entry_price: "2400",
+        short_entry_price: "2600",
+        qty: "1.2",
+      },
+    ],
+  });
+  const payload = api.kanglongTemplateFormToPayload(form);
+
+  assert.equal(payload.symbol, "ETHUSDC");
+  assert.equal(payload.market_data_account_id, "market-main");
+  assert.equal(payload.main_account.collateral, "1000");
+  assert.equal(payload.subaccounts[0].row_id, "sub-1");
+}
+
+{
+  const api = makeTemplateHarness();
+  const form = api.buildDefaultKanglongTemplateDraft();
+  const result = api.validateKanglongTemplateForm(form);
+
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((item) => item.field === "name"));
+  assert.ok(result.errors.some((item) => item.field === "main_account.collateral"));
+}
+
+{
+  const api = makeTemplateHarness();
+  const form = api.kanglongTemplateToFormState({
+    id: "tpl_a",
+    name: "Template A",
+    symbol: "ETHUSDC",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [
+      {
+        row_id: "sub-1",
+        account_id: "test-sub-1",
+        name: "Sub 1",
+        collateral: "500",
+        leverage: 75,
+        long_entry_price: "2400",
+        short_entry_price: "2600",
+        qty: "1",
+      },
+    ],
+  });
+  api.state.testTemplateDraft = structuredClone(form);
+  api.state.testTemplateOriginalPayload = api.kanglongTemplateFormToPayload(form);
+
+  assert.equal(api.isKanglongTemplateFormDirty(), false);
+  api.state.testTemplateDraft.mainAccount.collateral = "1001";
+  assert.equal(api.isKanglongTemplateFormDirty(), true);
+}
+
+{
+  const api = makeTemplateHarness();
+  const first = api.kanglongPreviewConfirmationKey({
+    template_content_hash: "sha256:a",
+    snapshot_bundle_id: "snap-a",
+    request_seq: 1,
+    warnings: [{ code: "w1" }],
+  });
+  const second = api.kanglongPreviewConfirmationKey({
+    template_content_hash: "sha256:a",
+    snapshot_bundle_id: "snap-b",
+    request_seq: 1,
+    warnings: [{ code: "w1" }],
+  });
+
+  assert.notEqual(first, second);
 }
 
 {
