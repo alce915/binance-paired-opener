@@ -81,6 +81,16 @@ assert.equal(
   false,
   "account selection stage badge should not render in the Kanglong workspace shell",
 );
+assert.match(
+  indexSource,
+  /\.kanglong-template-modal\s*\{[\s\S]*width:\s*min\(1680px,\s*calc\(100vw - 24px\)\);[\s\S]*max-height:\s*min\(900px,\s*calc\(100vh - 24px\)\);[\s\S]*\}/,
+  "Kanglong template modal should use a wide desktop layout so the preview column is not cramped",
+);
+assert.match(
+  indexSource,
+  /grid-template-columns:\s*240px minmax\(620px,\s*1\.25fr\) minmax\(420px,\s*0\.95fr\);/,
+  "Kanglong template grid should reserve enough width for the editor and preview columns",
+);
 
 const zhMessages = JSON.parse(zhSource);
 const kanglongStatusLabels = {

@@ -239,7 +239,7 @@
         z-index: 60;
         display: grid;
         place-items: center;
-        padding: 18px;
+        padding: 12px;
         background: rgba(29, 26, 22, 0.42);
       }
       .modal-panel {
@@ -281,13 +281,14 @@
         background: #6e6253;
       }
       .kanglong-template-modal {
-        width: min(1220px, calc(100vw - 32px));
+        width: min(1680px, calc(100vw - 24px));
+        max-height: min(900px, calc(100vh - 24px));
       }
       .kanglong-template-grid {
         display: grid;
-        grid-template-columns: 220px minmax(420px, 1fr) minmax(300px, 0.85fr);
-        gap: 12px;
-        padding: 16px;
+        grid-template-columns: 240px minmax(620px, 1.25fr) minmax(420px, 0.95fr);
+        gap: 14px;
+        padding: 18px;
         align-items: start;
       }
       .kanglong-template-library,
@@ -851,12 +852,21 @@
       .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; background: #aa9a85; }
       .dot.live { background: var(--success); }
       .mono { font-variant-numeric: tabular-nums; font-family: Consolas, Monaco, monospace; }
+      @media (max-width: 1500px) {
+        .kanglong-template-grid {
+          grid-template-columns: 240px minmax(0, 1fr);
+        }
+        .kanglong-template-preview {
+          grid-column: 2;
+        }
+      }
       @media (max-width: 860px) {
         .kanglong-layout,
         .kanglong-toolbar,
         .kanglong-template-grid,
         .kanglong-template-field-grid,
         .kanglong-template-sub-row { grid-template-columns: 1fr; }
+        .kanglong-template-preview { grid-column: auto; }
       }
       @media (max-width: 1240px) {
         .dashboard,
