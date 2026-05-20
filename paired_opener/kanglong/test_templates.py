@@ -25,6 +25,7 @@ _TEMPLATE_KNOWN_FIELDS = {
     "id",
     "name",
     "symbol",
+    "market_data_account_id",
     "main_account",
     "subaccounts",
     "created_at",
@@ -73,6 +74,15 @@ def validate_template_identifier(value: Any, field_name: str = "id") -> str:
     text = str(value).strip()
     if not text or _IDENTIFIER_RE.fullmatch(text) is None:
         raise TemplateValidationError("kanglong_test_template_invalid_id", field_name, value)
+    return text
+
+
+def normalize_optional_text(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
     return text
 
 
@@ -618,6 +628,13 @@ def _normalize_template(template: dict[str, Any], *, existing: dict[str, Any] | 
     template_id = validate_template_identifier(template.get("id"), field_name="template_id")
     created_at = existing.get("created_at") if existing else template.get("created_at")
     normalized = _preserved_template_fields(existing, template)
+    market_data_account_id = normalize_optional_text(
+        template.get(
+            "market_data_account_id",
+            existing.get("market_data_account_id") if existing else None,
+        ),
+        "market_data_account_id",
+    )
     normalized.update(
         {
         "id": template_id,
@@ -629,6 +646,10 @@ def _normalize_template(template: dict[str, Any], *, existing: dict[str, Any] | 
         "updated_at": now,
         }
     )
+    if market_data_account_id is not None:
+        normalized["market_data_account_id"] = market_data_account_id
+    else:
+        normalized.pop("market_data_account_id", None)
     normalized["template_content_hash"] = template_content_hash(normalized)
     return normalized
 
@@ -637,6 +658,7 @@ def _normalize_loaded_template(template: Any) -> dict[str, Any]:
     source = _require_mapping(template, "templates[]")
     timestamp = str(source.get("updated_at") or source.get("created_at") or _fresh_timestamp(None))
     normalized = {key: copy.deepcopy(value) for key, value in source.items() if key not in _TEMPLATE_KNOWN_FIELDS}
+    market_data_account_id = normalize_optional_text(source.get("market_data_account_id"), "market_data_account_id")
     normalized.update(
         {
         "id": validate_template_identifier(source.get("id"), field_name="template_id"),
@@ -648,6 +670,10 @@ def _normalize_loaded_template(template: Any) -> dict[str, Any]:
         "updated_at": timestamp,
         }
     )
+    if market_data_account_id is not None:
+        normalized["market_data_account_id"] = market_data_account_id
+    else:
+        normalized.pop("market_data_account_id", None)
     normalized["template_content_hash"] = template_content_hash(normalized)
     return normalized
 

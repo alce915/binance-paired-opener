@@ -379,6 +379,22 @@ def test_template_hash_ignores_display_name_and_decimal_format() -> None:
     assert template_content_hash(first) == template_content_hash(second)
 
 
+def test_template_store_normalizes_market_data_account_id_without_hashing_it(tmp_path) -> None:
+    template = template_payload()
+    template["market_data_account_id"] = "  market-main  "
+    store = KanglongTemplateStore(tmp_path / "kanglong_test_templates.json")
+
+    saved = store.upsert_template(template)
+    reloaded = store.get_template(saved["id"])
+
+    assert saved["market_data_account_id"] == "market-main"
+    assert reloaded["market_data_account_id"] == "market-main"
+
+    changed_market = dict(reloaded)
+    changed_market["market_data_account_id"] = "market-other"
+    assert template_content_hash(reloaded) == template_content_hash(changed_market)
+
+
 def test_runtime_account_ids_are_derived_from_template_ids() -> None:
     assert runtime_main_account_id("tpl_eth_drop_001") == "tpl:tpl_eth_drop_001:main"
     assert runtime_subaccount_id("tpl_eth_drop_001", "sub-1") == "tpl:tpl_eth_drop_001:sub:sub-1"
@@ -586,12 +602,17 @@ def test_get_template_not_found_uses_structured_detail(tmp_path) -> None:
     ("section", "field", "value", "code"),
     [
         ("main", "collateral", "-0.01", "kanglong_test_template_negative_collateral"),
+        ("main", "collateral", "", "kanglong_test_template_invalid_decimal"),
         ("main", "leverage", 0, "kanglong_test_template_invalid_leverage"),
         ("sub", "collateral", "-0.01", "kanglong_test_template_negative_collateral"),
+        ("sub", "collateral", "", "kanglong_test_template_invalid_decimal"),
         ("sub", "leverage", 0, "kanglong_test_template_invalid_leverage"),
         ("sub", "qty", "0", "kanglong_test_template_non_positive_qty"),
+        ("sub", "qty", "", "kanglong_test_template_invalid_decimal"),
         ("sub", "long_entry_price", "0", "kanglong_test_template_invalid_price"),
+        ("sub", "long_entry_price", "", "kanglong_test_template_invalid_decimal"),
         ("sub", "short_entry_price", "-1", "kanglong_test_template_invalid_price"),
+        ("sub", "short_entry_price", "", "kanglong_test_template_invalid_decimal"),
     ],
 )
 def test_upsert_rejects_invalid_numeric_template_values(tmp_path, section, field, value, code) -> None:
