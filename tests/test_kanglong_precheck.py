@@ -7,9 +7,9 @@ import pytest
 from paired_opener.account_runtime import AccountRuntimeManager
 from paired_opener.config import AccountConfig, Settings
 from paired_opener.domain import PositionSide
-from paired_opener.kanglong.config import KanglongSymbolConfig
+from paired_opener.kanglong.config import KanglongSymbolConfig, load_kanglong_symbol_config
 from paired_opener.kanglong.models import KanglongAccountSnapshot, KanglongPositionSnapshot, KanglongRunStatus
-from paired_opener.kanglong.precheck import choose_selected_side, run_static_precheck
+from paired_opener.kanglong.precheck import choose_selected_side, estimate_main_receivable_capacity, run_static_precheck
 from paired_opener.storage import SqliteRepository
 
 
@@ -119,7 +119,9 @@ def test_precheck_blocks_when_main_capacity_is_below_first_release_qty() -> None
     )
 
     assert result.status == KanglongRunStatus.BLOCKED_MAIN_INSUFFICIENT_CAPACITY
+    assert result.details["planned_release_qty"] == Decimal("1")
     assert result.details["main_receivable_qty"] == Decimal("0.50")
+    assert result.details["temp_qty_capacity"] == Decimal("0.50")
     assert result.details["capacity_gap_qty"] == Decimal("0.50")
 
 
@@ -139,3 +141,36 @@ def test_precheck_blocks_when_main_margin_capacity_is_below_first_release_qty() 
     assert result.status == KanglongRunStatus.BLOCKED_MAIN_INSUFFICIENT_CAPACITY
     assert result.details["margin_capacity_qty"] < Decimal("1")
     assert result.details["capacity_gap_qty"] > Decimal("0")
+
+
+def test_main_capacity_uses_leverage_for_large_eth_transfer() -> None:
+    config = load_kanglong_symbol_config(Settings(_env_file=None), "ETHUSDC")
+    capacity = estimate_main_receivable_capacity(
+        snapshot("main", "0", "0", "0", "0", available_balance="20000", equity="20000", leverage=75),
+        PositionSide.LONG,
+        config,
+        reference_price=Decimal("2450"),
+        fee_rate=Decimal("0.0005"),
+    )
+
+    assert capacity["temp_qty_capacity"] >= Decimal("111")
+    assert capacity["notional_capacity_qty"] >= Decimal("111")
+    assert capacity["margin_capacity_qty"] >= Decimal("111")
+    assert capacity["liquidation_buffer_qty"] >= Decimal("111")
+    assert capacity["main_receivable_qty"] >= Decimal("111")
+
+
+def test_precheck_allows_111_eth_when_20000_usdc_main_uses_75x_leverage() -> None:
+    config = load_kanglong_symbol_config(Settings(_env_file=None), "ETHUSDC")
+    result = run_static_precheck(
+        main=snapshot("main", "0", "0", "0", "0", available_balance="20000", equity="20000", leverage=75),
+        subaccounts=[snapshot("sub1", "111", "111", "10", "0")],
+        symbol="ETHUSDC",
+        manual_side=PositionSide.LONG,
+        config=config,
+        reference_price=Decimal("2450"),
+        fee_rate=Decimal("0.0005"),
+    )
+
+    assert result.status == KanglongRunStatus.CHAIN_READY
+    assert result.planned_release_qty == Decimal("111")

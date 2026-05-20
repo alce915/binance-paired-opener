@@ -85,12 +85,14 @@ class StubKanglongService:
 
 
 class FakeKanglongGateway:
-    def __init__(self, account_id: str) -> None:
+    def __init__(self, account_id: str, *, symbol_leverage: int = 75) -> None:
         self.account_id = account_id
+        self.symbol_leverage = symbol_leverage
         self.closed = False
         self.snapshot_called = False
         self.rules_called = False
         self.quote_called = False
+        self.leverage_called = False
 
     async def get_unified_account_snapshot(self) -> dict:
         self.snapshot_called = True
@@ -124,12 +126,17 @@ class FakeKanglongGateway:
         self.quote_called = True
         return Quote(symbol, Decimal("3100.00"), Decimal("3100.50"))
 
+    async def get_symbol_leverage(self, symbol: str) -> int:
+        self.leverage_called = True
+        return self.symbol_leverage
+
     async def close(self) -> None:
         self.closed = True
 
 
 class FakeRuntimeManager:
-    def __init__(self) -> None:
+    def __init__(self, *, symbol_leverage: int | dict[str, int] = 75) -> None:
+        self.symbol_leverage = symbol_leverage
         self.gateways: dict[str, FakeKanglongGateway] = {}
         self.build_calls: list[str] = []
 
@@ -142,7 +149,12 @@ class FakeRuntimeManager:
 
     def build_temporary_gateway(self, account_id: str) -> FakeKanglongGateway:
         self.build_calls.append(account_id)
-        gateway = FakeKanglongGateway(account_id)
+        leverage = (
+            self.symbol_leverage.get(account_id, 75)
+            if isinstance(self.symbol_leverage, dict)
+            else self.symbol_leverage
+        )
+        gateway = FakeKanglongGateway(account_id, symbol_leverage=leverage)
         self.gateways[account_id] = gateway
         return gateway
 
@@ -235,7 +247,29 @@ async def test_collect_kanglong_plan_inputs_uses_snapshots_and_closes_gateways(m
     assert all(gateway.snapshot_called for gateway in runtime_manager.gateways.values())
     assert runtime_manager.gateways["main"].rules_called is True
     assert runtime_manager.gateways["main"].quote_called is True
+    assert runtime_manager.gateways["main"].leverage_called is True
     assert all(gateway.closed for gateway in runtime_manager.gateways.values())
+
+
+@pytest.mark.asyncio
+async def test_collect_kanglong_plan_inputs_uses_exchange_symbol_leverage(monkeypatch) -> None:
+    runtime_manager = FakeRuntimeManager(symbol_leverage={"main": 20, "sub1": 30})
+    api_module.app.state.runtime_manager = runtime_manager
+    api_module.app.state.settings = Settings()
+    monkeypatch.setattr(
+        api_module,
+        "load_kanglong_symbol_config",
+        lambda settings, symbol: KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25")),
+    )
+
+    payload = await api_module._collect_kanglong_plan_inputs(
+        KanglongPlanRequest(main_account_id="main", subaccount_ids=["sub1"])
+    )
+
+    assert payload["main_snapshot"].leverage == 20
+    assert payload["subaccount_snapshots"][0].leverage == 30
+    assert runtime_manager.gateways["main"].leverage_called is True
+    assert runtime_manager.gateways["sub1"].leverage_called is True
 
 
 @pytest.mark.asyncio

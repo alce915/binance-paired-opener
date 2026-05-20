@@ -153,6 +153,16 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
         "console.kanglong.account_pool.title",
         "console.kanglong.selected_accounts.title",
         "console.kanglong.plan.summary_title",
+        "console.kanglong.plan.capacity_bottleneck",
+        "console.kanglong.plan.capacity_value",
+        "console.kanglong.plan.capacity_receivable",
+        "console.kanglong.plan.capacity_gap",
+        "console.kanglong.plan.capacity_reference_price",
+        "console.kanglong.plan.capacity_margin_note",
+        "console.kanglong.plan.capacity.temp_qty_capacity",
+        "console.kanglong.plan.capacity.notional_capacity_qty",
+        "console.kanglong.plan.capacity.margin_capacity_qty",
+        "console.kanglong.plan.capacity.liquidation_buffer_qty",
         "console.kanglong.execution.log_title",
         "console.kanglong.actions.detect",
         "console.kanglong.actions.confirm",
@@ -174,6 +184,16 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
     assert catalog["console.kanglong.logs.filter.current_group"] == "当前组"
     assert catalog["console.kanglong.logs.filter.cost"] == "成本事件"
     assert catalog["console.kanglong.logs.filter.ledger"] == "账本事件"
+    assert catalog["console.kanglong.plan.capacity_bottleneck"] == "瓶颈：{label} {qty}"
+    assert catalog["console.kanglong.plan.capacity_value"] == "{label}：{qty}"
+    assert catalog["console.kanglong.plan.capacity_receivable"] == "主账号可承接：{qty}"
+    assert catalog["console.kanglong.plan.capacity_gap"] == "缺口：{qty}"
+    assert catalog["console.kanglong.plan.capacity_reference_price"] == "参考价格：{price}"
+    assert catalog["console.kanglong.plan.capacity_margin_note"] == "保证金已纳入计算；当前不足由上述瓶颈决定。"
+    assert catalog["console.kanglong.plan.capacity.temp_qty_capacity"] == "主账号临时仓位数量上限"
+    assert catalog["console.kanglong.plan.capacity.notional_capacity_qty"] == "主账号临时名义价值上限"
+    assert catalog["console.kanglong.plan.capacity.margin_capacity_qty"] == "可用保证金上限"
+    assert catalog["console.kanglong.plan.capacity.liquidation_buffer_qty"] == "爆仓缓冲上限"
     assert catalog["runtime.kanglong.idempotency_conflict"] == "重复请求的幂等键与原请求不一致，请刷新后重试。"
     assert catalog["runtime.kanglong.plan_stale"] == "检测链路已过期，请重新检测账号状态。"
     assert catalog["events.kanglong.group_simulated"] == "亢龙第 {group_id} 组模拟完成"

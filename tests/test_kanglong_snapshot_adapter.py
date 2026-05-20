@@ -217,3 +217,32 @@ def test_snapshot_bundle_id_is_stable_across_account_order() -> None:
     assert bundle_a["snapshot_bundle_id"] == bundle_b["snapshot_bundle_id"]
     assert [account.account_id for account in bundle_a["accounts"]] == ["sub1", "sub2"]
     assert [account.account_id for account in bundle_b["accounts"]] == ["sub2", "sub1"]
+
+
+def test_snapshot_bundle_id_changes_with_leverage() -> None:
+    account = {
+        "account_id": "main",
+        "account_name": "Main",
+        "updated_at": "2026-05-17T00:00:00+00:00",
+        "totals": {"available_balance": "20000", "equity": "20000", "margin": "0"},
+        "positions": [],
+    }
+
+    bundle_a = build_snapshot_bundle(
+        symbol="ETHUSDC",
+        accounts=[account],
+        config_version="cfg-1",
+        symbol_rule_version="rules-1",
+        price_version="price-1",
+        leverage=20,
+    )
+    bundle_b = build_snapshot_bundle(
+        symbol="ETHUSDC",
+        accounts=[account],
+        config_version="cfg-1",
+        symbol_rule_version="rules-1",
+        price_version="price-1",
+        leverage=75,
+    )
+
+    assert bundle_a["snapshot_bundle_id"] != bundle_b["snapshot_bundle_id"]

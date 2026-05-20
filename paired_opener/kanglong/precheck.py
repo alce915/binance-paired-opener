@@ -56,7 +56,7 @@ def estimate_main_receivable_capacity(
         liquidation_buffer_qty = temp_qty_capacity
     else:
         notional_capacity_qty = max(
-            (main.equity * config.max_main_temp_notional_ratio) / price,
+            (main.equity * leverage * config.max_main_temp_notional_ratio) / price,
             Decimal("0"),
         )
         available_after_safety = max(
@@ -70,7 +70,7 @@ def estimate_main_receivable_capacity(
         cost_per_qty = estimated_margin_per_qty + estimated_fee_per_qty + estimated_buffer_per_qty
         margin_capacity_qty = available_after_safety / cost_per_qty if cost_per_qty > Decimal("0") else temp_qty_capacity
         liquidation_buffer_qty = max(
-            (main.equity * (Decimal("1") - config.min_liquidation_buffer_ratio)) / price,
+            (main.equity * leverage * (Decimal("1") - config.min_liquidation_buffer_ratio)) / price,
             Decimal("0"),
         )
     main_receivable_qty = min(
@@ -242,6 +242,7 @@ def run_static_precheck(
             other_side_preview=other_side_preview,
             details={
                 **capacity,
+                "planned_release_qty": planned_release_qty,
                 "capacity_gap_qty": planned_release_qty - main_receivable_qty,
             },
         )

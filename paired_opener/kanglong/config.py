@@ -77,9 +77,20 @@ def _apply_overrides(base: KanglongSymbolConfig, payload: dict[str, Any]) -> Kan
     )
 
 
+def _symbol_default_config(symbol: str) -> KanglongSymbolConfig:
+    base = KanglongSymbolConfig()
+    if symbol.strip().upper() != "ETHUSDC":
+        return base
+    return replace(
+        base,
+        per_round_qty_limit=Decimal("5"),
+        max_main_temp_qty=Decimal("150"),
+    )
+
+
 def load_kanglong_symbol_config(settings: Settings, symbol: str) -> KanglongSymbolConfig:
     normalized = symbol.strip().upper()
-    base = KanglongSymbolConfig()
+    base = _symbol_default_config(normalized)
     path = settings.kanglong_symbol_configs_file
     if not path.exists():
         return base

@@ -105,6 +105,16 @@ for (const [key, expected] of Object.entries({
   "console.kanglong.plan.groups": "组数：{count}",
   "console.kanglong.plan.rounds": "轮次：{count}",
   "console.kanglong.plan.release_qty": "计划释放：{qty}",
+  "console.kanglong.plan.capacity_bottleneck": "瓶颈：{label} {qty}",
+  "console.kanglong.plan.capacity_value": "{label}：{qty}",
+  "console.kanglong.plan.capacity_receivable": "主账号可承接：{qty}",
+  "console.kanglong.plan.capacity_gap": "缺口：{qty}",
+  "console.kanglong.plan.capacity_reference_price": "参考价格：{price}",
+  "console.kanglong.plan.capacity_margin_note": "保证金已纳入计算；当前不足由上述瓶颈决定。",
+  "console.kanglong.plan.capacity.temp_qty_capacity": "主账号临时仓位数量上限",
+  "console.kanglong.plan.capacity.notional_capacity_qty": "主账号临时名义价值上限",
+  "console.kanglong.plan.capacity.margin_capacity_qty": "可用保证金上限",
+  "console.kanglong.plan.capacity.liquidation_buffer_qty": "爆仓缓冲上限",
   "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
   "runtime.kanglong.status.plan_confirmed": "链路已确认",
   "runtime.kanglong.status.blocked_plan_stale": "检测链路已过期",
@@ -178,6 +188,16 @@ function makeKanglongHarness(requestImpl) {
       "console.kanglong.plan.groups": "组数：{count}",
       "console.kanglong.plan.rounds": "轮次：{count}",
       "console.kanglong.plan.release_qty": "计划释放：{qty}",
+      "console.kanglong.plan.capacity_bottleneck": "瓶颈：{label} {qty}",
+      "console.kanglong.plan.capacity_value": "{label}：{qty}",
+      "console.kanglong.plan.capacity_receivable": "主账号可承接：{qty}",
+      "console.kanglong.plan.capacity_gap": "缺口：{qty}",
+      "console.kanglong.plan.capacity_reference_price": "参考价格：{price}",
+      "console.kanglong.plan.capacity_margin_note": "保证金已纳入计算；当前不足由上述瓶颈决定。",
+      "console.kanglong.plan.capacity.temp_qty_capacity": "主账号临时仓位数量上限",
+      "console.kanglong.plan.capacity.notional_capacity_qty": "主账号临时名义价值上限",
+      "console.kanglong.plan.capacity.margin_capacity_qty": "可用保证金上限",
+      "console.kanglong.plan.capacity.liquidation_buffer_qty": "爆仓缓冲上限",
       "console.kanglong.log.empty": "暂无执行日志",
       "console.kanglong.logs.filter.all": "全部",
       "console.kanglong.logs.filter.warning": "警告",
@@ -373,6 +393,62 @@ function makeKanglongHarness(requestImpl) {
   api.renderKanglongPlanSummary({ status: "blocked_plan_stale" });
   assert.ok(api.planSummary.textContent.includes("状态：检测链路已过期"), "stale plan status should render through i18n");
   assert.equal(api.planSummary.textContent.includes("blocked_plan_stale"), false, "blocked status codes should stay out of user-visible summary text");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.renderKanglongPlanSummary({
+    status: "blocked_main_insufficient_capacity",
+    report: {
+      precheck: {
+        planned_release_qty: "111",
+        main_receivable_qty: "1.5",
+        temp_qty_capacity: "1.5",
+        notional_capacity_qty: "6.53",
+        margin_capacity_qty: "489.79",
+        liquidation_buffer_qty: "500",
+        capacity_gap_qty: "109.5",
+        reference_price: "2450",
+      },
+    },
+  });
+  const text = api.planSummary.textContent;
+  assert.ok(text.includes("计划释放：111"), "blocked capacity summary should read planned release from precheck details");
+  assert.ok(text.includes("瓶颈：主账号临时仓位数量上限 1.5"), "capacity block should identify the limiting risk cap");
+  assert.ok(text.includes("主账号临时名义价值上限：6.53"), "capacity block should show the notional cap");
+  assert.ok(text.includes("可用保证金上限：489.79"), "capacity block should show the margin-derived capacity");
+  assert.ok(text.includes("主账号可承接：1.5"), "capacity block should show computed receivable quantity");
+  assert.ok(text.includes("缺口：109.5"), "capacity block should show the capacity gap");
+  assert.ok(text.includes("参考价格：2450"), "capacity block should show the reference price when available");
+  assert.ok(text.includes("保证金已纳入计算；当前不足由上述瓶颈决定。"), "capacity block should explain that margin is not necessarily the bottleneck");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.renderKanglongPlanSummary({
+    status: "blocked_plan_recheck_failed",
+    report: {
+      execute_recheck: {
+        status: "blocked_plan_recheck_failed",
+        reason_code: "blocked_main_insufficient_capacity",
+        precheck: {
+          planned_release_qty: "111",
+          main_receivable_qty: "1.5",
+          temp_qty_capacity: "1.5",
+          notional_capacity_qty: "130",
+          margin_capacity_qty: "480",
+          liquidation_buffer_qty: "520",
+          capacity_gap_qty: "109.5",
+          reference_price: "2450",
+        },
+      },
+    },
+  });
+  const text = api.planSummary.textContent;
+  assert.ok(text.includes("计划释放：111"), "execute recheck capacity summary should read release qty from recheck precheck details");
+  assert.ok(text.includes("瓶颈：主账号临时仓位数量上限 1.5"), "execute recheck capacity block should show the limiting cap");
+  assert.ok(text.includes("主账号可承接：1.5"), "execute recheck capacity block should show receivable qty");
+  assert.ok(text.includes("缺口：109.5"), "execute recheck capacity block should show capacity gap");
 }
 
 for (const [status, label] of Object.entries(kanglongStatusLabels)) {

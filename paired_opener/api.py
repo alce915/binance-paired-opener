@@ -279,6 +279,7 @@ async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) ->
     account_ids = [request.main_account_id, *request.subaccount_ids]
     gateways = []
     account_payloads = []
+    leverages_by_account_id: dict[str, int] = {}
     operation_failed = False
     try:
         for account_id in account_ids:
@@ -288,6 +289,9 @@ async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) ->
         main_gateway = gateways[0]
         rules = await main_gateway.get_symbol_rules(request.symbol)
         quote = await main_gateway.get_quote(request.symbol)
+        for account_id, gateway in zip(account_ids, gateways, strict=True):
+            account_leverage = await gateway.get_symbol_leverage(request.symbol)
+            leverages_by_account_id[account_id] = max(int(account_leverage or 1), 1)
     except Exception:
         operation_failed = True
         raise
@@ -308,7 +312,7 @@ async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) ->
         config_version="default",
         symbol_rule_version=request.symbol,
         price_version=f"{quote.bid_price}:{quote.ask_price}",
-        leverage=DEFAULT_LEVERAGE,
+        leverage=leverages_by_account_id,
     )
     snapshots = snapshot_bundle["accounts"]
     return {

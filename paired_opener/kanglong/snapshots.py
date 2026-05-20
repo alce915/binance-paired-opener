@@ -71,6 +71,12 @@ def monitor_account_to_kanglong_snapshot(
     )
 
 
+def _leverage_for_account(leverage: int | dict[str, int], account_id: str) -> int:
+    if isinstance(leverage, dict):
+        return max(int(leverage.get(account_id) or 1), 1)
+    return max(int(leverage or 1), 1)
+
+
 def build_snapshot_bundle(
     *,
     symbol: str,
@@ -78,15 +84,23 @@ def build_snapshot_bundle(
     config_version: str,
     symbol_rule_version: str,
     price_version: str,
-    leverage: int,
+    leverage: int | dict[str, int],
 ) -> dict[str, Any]:
     snapshots = [
-        monitor_account_to_kanglong_snapshot(account, symbol=symbol, leverage=leverage)
+        monitor_account_to_kanglong_snapshot(
+            account,
+            symbol=symbol,
+            leverage=_leverage_for_account(leverage, str(account.get("account_id") or "")),
+        )
         for account in accounts
     ]
     versions = sorted(
         [
-            {"account_id": snapshot.account_id, "snapshot_version": snapshot.snapshot_version}
+            {
+                "account_id": snapshot.account_id,
+                "snapshot_version": snapshot.snapshot_version,
+                "leverage": snapshot.leverage,
+            }
             for snapshot in snapshots
         ],
         key=lambda item: (item["account_id"], item["snapshot_version"]),

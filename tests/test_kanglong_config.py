@@ -61,10 +61,18 @@ def test_residual_ledger_keeps_account_side_and_leg_type() -> None:
 def test_ethusdc_kanglong_config_defaults() -> None:
     config = load_kanglong_symbol_config(Settings(_env_file=None), "ETHUSDC")
 
-    assert config.per_round_qty_limit == Decimal("0.05")
+    assert config.per_round_qty_limit == Decimal("5")
     assert config.qty_tolerance == Decimal("0.0001")
     assert config.max_rounds_per_group == 30
     assert config.max_chain_groups == 100
+    assert config.max_main_temp_qty == Decimal("150")
+
+
+def test_non_ethusdc_kanglong_config_uses_conservative_defaults() -> None:
+    config = load_kanglong_symbol_config(Settings(_env_file=None), "BTCUSDC")
+
+    assert config.per_round_qty_limit == Decimal("0.05")
+    assert config.max_main_temp_qty == Decimal("1.50")
 
 
 def test_symbol_config_file_overrides_defaults(tmp_path) -> None:

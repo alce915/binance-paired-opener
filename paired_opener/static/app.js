@@ -1616,6 +1616,116 @@ function formatKanglongStatus(status) {
   return rawStatus;
 }
 
+function kanglongPrecheckDetails(payload = {}) {
+  const report = payload?.report || {};
+  const directDetails = report.precheck || payload?.precheck || {};
+  if (directDetails && typeof directDetails === "object" && Object.keys(directDetails).length > 0) {
+    return directDetails;
+  }
+  const executeRecheck = report.execute_recheck || report.executeRecheck || {};
+  const recheckDetails = executeRecheck.precheck || {};
+  const details = recheckDetails && typeof recheckDetails === "object" ? recheckDetails : directDetails;
+  return details && typeof details === "object" ? details : {};
+}
+
+function kanglongCapacityReasonCode(payload = {}) {
+  const report = payload?.report || {};
+  const executeRecheck = report.execute_recheck || report.executeRecheck || {};
+  return String(
+    payload.reason_code
+    ?? payload.reasonCode
+    ?? report.reason_code
+    ?? report.reasonCode
+    ?? executeRecheck.reason_code
+    ?? executeRecheck.reasonCode
+    ?? "",
+  );
+}
+
+function kanglongCapacityBottleneck(details = {}) {
+  const capacityKeys = [
+    "temp_qty_capacity",
+    "notional_capacity_qty",
+    "margin_capacity_qty",
+    "liquidation_buffer_qty",
+  ];
+  return capacityKeys
+    .map((key) => ({ key, value: details[key], numericValue: Number.parseFloat(details[key]) }))
+    .filter((item) => Number.isFinite(item.numericValue))
+    .sort((left, right) => left.numericValue - right.numericValue)[0] || null;
+}
+
+function renderKanglongCapacityDetails(payload = {}) {
+  const status = String(payload.status ?? payload?.report?.status ?? payload?.summary?.status ?? "");
+  const reasonCode = kanglongCapacityReasonCode(payload);
+  if (status !== "blocked_main_insufficient_capacity" && reasonCode !== "blocked_main_insufficient_capacity") return null;
+  const details = kanglongPrecheckDetails(payload);
+  const bottleneck = kanglongCapacityBottleneck(details);
+  const rows = [];
+  if (bottleneck) {
+    rows.push(copyOrDefault(
+      "console.kanglong.plan.capacity_bottleneck",
+      "瓶颈：{label} {qty}",
+      {
+        label: copyOrDefault(
+          `console.kanglong.plan.capacity.${bottleneck.key}`,
+          bottleneck.key,
+        ),
+        qty: bottleneck.value,
+      },
+    ));
+  }
+  [
+    "temp_qty_capacity",
+    "notional_capacity_qty",
+    "margin_capacity_qty",
+    "liquidation_buffer_qty",
+  ].forEach((key) => {
+    if (details[key] === undefined || key === bottleneck?.key) return;
+    rows.push(copyOrDefault(
+      "console.kanglong.plan.capacity_value",
+      "{label}：{qty}",
+      {
+        label: copyOrDefault(`console.kanglong.plan.capacity.${key}`, key),
+        qty: details[key],
+      },
+    ));
+  });
+  if (details.main_receivable_qty !== undefined) {
+    rows.push(copyOrDefault("console.kanglong.plan.capacity_receivable", "主账号可承接：{qty}", {
+      qty: details.main_receivable_qty,
+    }));
+  }
+  if (details.capacity_gap_qty !== undefined) {
+    rows.push(copyOrDefault("console.kanglong.plan.capacity_gap", "缺口：{qty}", {
+      qty: details.capacity_gap_qty,
+    }));
+  }
+  if (details.reference_price !== undefined) {
+    rows.push(copyOrDefault("console.kanglong.plan.capacity_reference_price", "参考价格：{price}", {
+      price: details.reference_price,
+    }));
+  }
+  if (rows.length === 0) return null;
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "kanglong-plan-capacity-details";
+  rows.forEach((text) => {
+    const item = document.createElement("span");
+    item.className = "kanglong-plan-capacity-chip";
+    item.textContent = text;
+    wrapper.appendChild(item);
+  });
+  const note = document.createElement("div");
+  note.className = "kanglong-plan-capacity-note";
+  note.textContent = copyOrDefault(
+    "console.kanglong.plan.capacity_margin_note",
+    "保证金已纳入计算；当前不足由上述瓶颈决定。",
+  );
+  wrapper.appendChild(note);
+  return wrapper;
+}
+
 function syncKanglongWorkflowButtons(payload = kanglongState.plan, options = {}) {
   const actions = kanglongAvailableActions(payload);
   if (kanglongConfirmPlanBtn) {
@@ -1629,18 +1739,29 @@ function syncKanglongWorkflowButtons(payload = kanglongState.plan, options = {})
 function renderKanglongPlanSummary(payload = {}) {
   if (!kanglongPlanSummary) return;
   const summary = payload?.report?.summary || payload?.summary || {};
+  const precheck = kanglongPrecheckDetails(payload);
   const status = payload.status ?? payload?.report?.status ?? summary.status ?? "--";
   const statusLabel = formatKanglongStatus(status);
   const groupCount = summary.group_count ?? summary.groups ?? payload.group_count ?? "--";
   const roundCount = summary.round_count ?? summary.rounds ?? payload.round_count ?? "--";
-  const releaseQty = summary.planned_release_qty ?? summary.release_qty ?? payload.planned_release_qty ?? "--";
+  const releaseQty = (
+    summary.planned_release_qty
+    ?? summary.release_qty
+    ?? payload.planned_release_qty
+    ?? precheck.planned_release_qty
+    ?? "--"
+  );
   const segments = [
     copyOrDefault("console.kanglong.plan.status", "状态：{status}", { status: statusLabel }),
     copyOrDefault("console.kanglong.plan.groups", "组数：{count}", { count: groupCount }),
     copyOrDefault("console.kanglong.plan.rounds", "轮次：{count}", { count: roundCount }),
     copyOrDefault("console.kanglong.plan.release_qty", "计划释放：{qty}", { qty: releaseQty }),
   ];
-  kanglongPlanSummary.textContent = segments.join(" | ");
+  const summaryLine = document.createElement("div");
+  summaryLine.className = "kanglong-plan-summary-line";
+  summaryLine.textContent = segments.join(" | ");
+  const capacityDetails = renderKanglongCapacityDetails(payload);
+  kanglongPlanSummary.replaceChildren(...[summaryLine, capacityDetails].filter(Boolean));
 }
 
 function kanglongExecutionEventTags(event = {}, payload = {}) {

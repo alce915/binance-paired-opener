@@ -66,11 +66,11 @@
 ```json
 {
   "ETHUSDC": {
-    "per_round_qty_limit": "0.05",
+    "per_round_qty_limit": "5",
     "qty_tolerance": "0.0001",
     "max_rounds_per_group": 30,
     "max_chain_groups": 100,
-    "max_main_temp_qty": "1.50",
+    "max_main_temp_qty": "150",
     "max_main_temp_notional_ratio": "0.80",
     "price_buffer_bps": 5,
     "margin_safety_ratio": "0.20",
@@ -226,7 +226,7 @@ main_receivable_qty = min(
 )
 ```
 
-其中 `margin_capacity_qty` 必须扣除预计手续费、价格漂移缓冲和预留安全保证金后再计算初始保证金占用；`liquidation_buffer_qty` 必须保证临时承接后仍满足预设爆仓距离或维护保证金缓冲。只要任一维度只能承接部分计划释放数量，第一组不能开始。
+其中 `notional_capacity_qty` 和 `liquidation_buffer_qty` 必须使用主账号当前杠杆折算可承接名义仓位，不能按未加杠杆的权益直接除以价格，否则会把 75x 这类测试和实盘配置误判为容量不足。`margin_capacity_qty` 必须扣除预计手续费、价格漂移缓冲和预留安全保证金后再计算初始保证金占用；`liquidation_buffer_qty` 必须保证临时承接后仍满足预设爆仓距离或维护保证金缓冲。只要任一维度只能承接部分计划释放数量，第一组不能开始。
 
 风险提示分两级：
 

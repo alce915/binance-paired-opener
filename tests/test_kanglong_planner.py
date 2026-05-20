@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from paired_opener.config import Settings
 from paired_opener.domain import PositionSide
-from paired_opener.kanglong.config import KanglongSymbolConfig
+from paired_opener.kanglong.config import KanglongSymbolConfig, load_kanglong_symbol_config
 from paired_opener.kanglong.models import KanglongBatchDebtBuffer, KanglongPlanningAccount
 import pytest
 
@@ -118,3 +119,21 @@ def test_planner_raises_when_group_requires_more_than_configured_rounds() -> Non
 
     assert exc.value.group_index == 1
     assert exc.value.required_rounds == 4
+
+
+def test_default_round_limit_supports_111_eth_transfer_with_30_rounds() -> None:
+    config = load_kanglong_symbol_config(Settings(_env_file=None), "ETHUSDC")
+    plan = build_kanglong_plan(
+        run_id="run-large",
+        symbol="ETHUSDC",
+        selected_side=PositionSide.LONG,
+        main_account_id="main",
+        first_donor_account_id="sub1",
+        planned_release_qty=Decimal("111"),
+        accounts=[account("sub1", "111", "1000")],
+        config=config,
+    )
+
+    assert len(plan.groups) == 2
+    assert [len(group.round_qtys) for group in plan.groups] == [23, 23]
+    assert max(plan.groups[0].round_qtys) == Decimal("5")
