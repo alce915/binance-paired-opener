@@ -455,6 +455,7 @@
   "reasons.kanglong.test_template.active_run_exists": "已有运行正在使用该测试模板。",
   "reasons.kanglong.test_template.invalid_template": "测试模板内容无效，请检查账号、保证金、杠杆和仓位配置。",
   "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
+  "events.kanglong.synthetic_ledger_failed": "亢龙第 {group_id} 组账本校验失败，已暂停等待人工恢复：{reason}",
   "events.kanglong.round_completed": "亢龙第 {group_id} 组第 {round_id} 轮完成，配对数量 {matched_qty}",
   "log.kanglong.abort_recovered": "亢龙运行 {run_id} 已完成人工恢复，释放锁原因：{release_reason}",
   "precheck.labels.kanglong.main_flat": "主账号空仓",

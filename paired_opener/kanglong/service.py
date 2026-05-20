@@ -244,6 +244,39 @@ def _apply_group_result_to_synthetic_accounts(
     return accounts
 
 
+def _synthetic_group_apply_issue(
+    accounts: list[dict[str, Any]],
+    group: dict[str, Any],
+    *,
+    matched_qty: Decimal,
+) -> dict[str, Any] | None:
+    if matched_qty <= Decimal("0"):
+        return None
+    side = str(group.get("side") or "").strip().upper()
+    from_account_id = str(group.get("from_account_id") or "")
+    to_account_id = str(group.get("to_account_id") or "")
+    from_account = _find_synthetic_account(accounts, from_account_id)
+    to_account = _find_synthetic_account(accounts, to_account_id)
+    base = {
+        "group_id": group.get("group_id"),
+        "from_account_id": from_account_id,
+        "to_account_id": to_account_id,
+        "side": side,
+        "matched_qty": decimal_text(matched_qty),
+    }
+    if from_account is None:
+        return {**base, "reason": "synthetic_donor_missing", "missing_account_id": from_account_id}
+    if to_account is None:
+        return {**base, "reason": "synthetic_receiver_missing", "missing_account_id": to_account_id}
+    from_position = _find_synthetic_position(from_account, side)
+    if from_position is None:
+        return {**base, "reason": "synthetic_donor_position_missing", "missing_account_id": from_account_id}
+    effective_matched_qty = min(matched_qty, _decimal_payload_value(from_position.get("qty")))
+    if effective_matched_qty <= Decimal("0"):
+        return {**base, "reason": "synthetic_donor_qty_unavailable", "missing_account_id": from_account_id}
+    return None
+
+
 class KanglongSimulationService:
     def __init__(self, repository: SqliteRepository) -> None:
         self._repository = repository
@@ -678,10 +711,62 @@ class KanglongSimulationService:
         for group_index, group in enumerate(groups, start=1):
             group_id = group.get("group_id")
             if synthetic_accounts:
+                matched_qty = _matched_qty_from_group(group)
+                synthetic_issue = _synthetic_group_apply_issue(
+                    synthetic_accounts,
+                    group,
+                    matched_qty=matched_qty,
+                )
+                if synthetic_issue is not None:
+                    report["synthetic_ledger_error"] = _payloadify(synthetic_issue)
+                    blocks = list(report.get("blocks") or [])
+                    if "synthetic_ledger_inconsistent" not in blocks:
+                        blocks.append("synthetic_ledger_inconsistent")
+                    report["blocks"] = blocks
+                    progress = {
+                        "current_group_id": group_id,
+                        "groups_completed": max(group_index - 1, 0),
+                        "group_count": len(groups),
+                    }
+                    available_actions = ["recover"]
+                    event_payload = {
+                        "message_key": "events.kanglong.synthetic_ledger_failed",
+                        "message_params": {
+                            "group_id": group_id,
+                            "reason": synthetic_issue["reason"],
+                        },
+                        **_payloadify(synthetic_issue),
+                    }
+                    self._repository.update_kanglong_run_and_events(
+                        run_id,
+                        status=KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+                        result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+                        available_actions=available_actions,
+                        progress=progress,
+                        report=report,
+                        events=[
+                            {
+                                "event_type": "kanglong_synthetic_ledger_failed",
+                                "group_id": group_id,
+                                "payload": event_payload,
+                            }
+                        ],
+                    )
+                    response = _response_base(
+                        run_id,
+                        KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+                        plan_version=plan_version,
+                        snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+                        available_actions=available_actions,
+                        report=report,
+                        result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+                        latest_event_id=self._repository.latest_kanglong_event_id(run_id),
+                    )
+                    return self._remember_idempotency(idempotency_key, request_hash, response)
                 synthetic_accounts = _apply_group_result_to_synthetic_accounts(
                     synthetic_accounts,
                     group,
-                    matched_qty=_matched_qty_from_group(group),
+                    matched_qty=matched_qty,
                     close_price=close_price,
                     open_price=open_price,
                 )

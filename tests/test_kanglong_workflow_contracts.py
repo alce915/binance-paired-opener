@@ -478,6 +478,69 @@ def test_apply_group_result_does_not_close_donor_when_receiver_missing() -> None
     assert donor["positions"][0]["qty"] == "1"
 
 
+def test_execute_template_plan_needs_recover_when_synthetic_receiver_missing(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    lock_scope = "kanglong:ETHUSDC:account:tpl:tpl_eth_drop_001:main"
+    try:
+        plan = _create_ready_template_plan(service, run_id="run-missing-synthetic-receiver")
+        service.confirm_plan(
+            run_id="run-missing-synthetic-receiver",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-missing-synthetic-receiver-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        stored_before = repository.get_kanglong_run("run-missing-synthetic-receiver")
+        assert stored_before is not None
+        report = stored_before["report"]
+        accounts = report["account_snapshot"]["accounts"]
+        donor_only = [
+            account
+            for account in accounts
+            if account["account_id"] == "tpl:tpl_eth_drop_001:sub:sub-1"
+        ]
+        report["synthetic_account_state"] = {
+            "account_source": "test_template",
+            "state_version": "corrupt-missing-receiver",
+            "accounts": donor_only,
+        }
+        repository.update_kanglong_run(
+            "run-missing-synthetic-receiver",
+            status="plan_confirmed",
+            report=report,
+        )
+
+        executed = service.execute_plan(
+            run_id="run-missing-synthetic-receiver",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-missing-synthetic-receiver-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+        )
+        stored_after = repository.get_kanglong_run("run-missing-synthetic-receiver")
+        events = service.list_events("run-missing-synthetic-receiver", after_event_id=0, limit=10)
+        lock_conflict = repository.acquire_kanglong_locks(
+            run_id="other-run",
+            lock_scopes=[lock_scope],
+            ttl_ms=60_000,
+        )
+    finally:
+        repository.close()
+
+    assert executed["status"] == "needs_abort_recover"
+    assert executed["result_grade"] == "unsafe_unclosed"
+    assert executed["available_actions"] == ["recover"]
+    assert stored_after is not None
+    assert stored_after["status"] == "needs_abort_recover"
+    assert stored_after["report"]["synthetic_ledger_error"]["reason"] == "synthetic_receiver_missing"
+    assert stored_after["report"]["synthetic_ledger_error"]["missing_account_id"] == "tpl:tpl_eth_drop_001:main"
+    assert events["events"][-1]["event_type"] == "kanglong_synthetic_ledger_failed"
+    assert lock_conflict is not None
+    assert lock_conflict["run_id"] == "run-missing-synthetic-receiver"
+
+
 def test_service_active_run_returns_latest_restorable_run_with_actions(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)

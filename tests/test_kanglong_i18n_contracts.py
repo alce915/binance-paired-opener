@@ -78,6 +78,7 @@ def test_kanglong_i18n_messages_and_registries_exist() -> None:
         "runtime.kanglong.request_failed",
         "runtime.kanglong.status.blocked_main_not_flat",
         "reasons.kanglong.blocked_main_not_flat",
+        "events.kanglong.synthetic_ledger_failed",
         "events.kanglong.round_completed",
         "log.kanglong.abort_recovered",
         "precheck.labels.kanglong.main_flat",
@@ -86,6 +87,7 @@ def test_kanglong_i18n_messages_and_registries_exist() -> None:
 
     assert required_message_keys.issubset(catalog)
     assert reason_registry()["kanglong.blocked_main_not_flat"]["key"] == "reasons.kanglong.blocked_main_not_flat"
+    assert event_registry()["kanglong.synthetic_ledger_failed"]["key"] == "events.kanglong.synthetic_ledger_failed"
     assert event_registry()["kanglong.round_completed"]["key"] == "events.kanglong.round_completed"
     assert log_registry()["kanglong.abort_recovered"]["key"] == "log.kanglong.abort_recovered"
     assert precheck_registry()["kanglong.main_flat"]["fail_key"] == "precheck.kanglong.main_flat.fail"
@@ -122,12 +124,16 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
     assert catalog["runtime.kanglong.idempotency_conflict"] == "重复请求的幂等键与原请求不一致，请刷新后重试。"
     assert catalog["runtime.kanglong.plan_stale"] == "检测链路已过期，请重新检测账号状态。"
     assert catalog["events.kanglong.group_simulated"] == "亢龙第 {group_id} 组模拟完成"
+    assert catalog["events.kanglong.synthetic_ledger_failed"] == "亢龙第 {group_id} 组账本校验失败，已暂停等待人工恢复：{reason}"
     assert catalog["reasons.kanglong.blocked_plan_stale"] == "计划版本已变化，需要重新检测并确认。"
     assert catalog["reasons.kanglong.idempotency_conflict"] == "同一个幂等键被用于不同请求。"
 
     group_simulated = event_registry()["kanglong.group_simulated"]
     assert group_simulated["key"] == "events.kanglong.group_simulated"
     assert group_simulated["level"] == "info"
+    synthetic_failed = event_registry()["kanglong.synthetic_ledger_failed"]
+    assert synthetic_failed["key"] == "events.kanglong.synthetic_ledger_failed"
+    assert synthetic_failed["level"] == "error"
     assert reason_registry()["kanglong.blocked_plan_stale"]["key"] == "reasons.kanglong.blocked_plan_stale"
     assert reason_registry()["kanglong.idempotency_conflict"]["key"] == "reasons.kanglong.idempotency_conflict"
 
