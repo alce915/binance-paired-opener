@@ -258,6 +258,125 @@ def test_service_plan_confirm_execute_records_state_and_events(tmp_path) -> None
     assert events["latest_event_id"] > 0
 
 
+def test_service_plan_report_contains_chain_order_config(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = service.create_plan(
+            run_id="run-chain-config",
+            symbol="ETHUSDC",
+            main_snapshot=snapshot("main", "0", "0", "0", "0"),
+            subaccount_snapshots=[
+                snapshot("sub1", "1", "1", "100", "0"),
+                snapshot("sub2", "1", "1", "80", "0"),
+            ],
+            main_account_id="main",
+            subaccount_ids=["sub1", "sub2"],
+            selected_side=PositionSide.LONG,
+            snapshot_bundle_id="snap-chain-config",
+            config=KanglongSymbolConfig(per_round_qty_limit=Decimal("0.25")),
+            rules=_rules(),
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            account_snapshot_payload={
+                "accounts": [
+                    {"account_id": "main", "name": "jiage-zhuhao"},
+                    {"account_id": "sub1", "name": "jiage4"},
+                    {"account_id": "sub2", "name": "jiage1"},
+                ]
+            },
+        )
+    finally:
+        repository.close()
+
+    chain_config = plan["report"]["chain_config"]
+    assert chain_config["symbol"] == "ETHUSDC"
+    assert chain_config["side"] == "long"
+    assert chain_config["count"] == len(plan["report"]["plan"]["groups"])
+    assert chain_config["items"][0]["from_account_label"] == "jiage4"
+    assert chain_config["items"][0]["to_account_label"] == "jiage-zhuhao"
+    assert chain_config["items"][0]["display_qty"].startswith("-")
+    assert chain_config["items"][-1]["from_account_label"] == "jiage-zhuhao"
+    assert not chain_config["items"][-1]["display_qty"].startswith("-")
+
+
+def test_service_execute_records_round_process_before_group_completion(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-round-process")
+        service.confirm_plan(
+            run_id="run-round-process",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-round-process-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        executed = service.execute_plan(
+            run_id="run-round-process",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-round-process-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+        )
+        events = service.list_events("run-round-process", after_event_id=0, limit=50)["events"]
+    finally:
+        repository.close()
+
+    assert executed["status"] == "completed"
+    event_types = [event["event_type"] for event in events]
+    assert "kanglong_round_completed" in event_types
+    assert event_types.index("kanglong_round_completed") < event_types.index("kanglong_group_simulated")
+    first_round = next(event for event in events if event["event_type"] == "kanglong_round_completed")
+    assert first_round["group_id"] == "group-0001"
+    assert first_round["round_id"] == "group-0001-round-0001"
+    assert first_round["payload"]["message_key"] == "events.kanglong.round_completed"
+    assert first_round["payload"]["message_params"]["round_id"] == "1"
+    assert Decimal(first_round["payload"]["matched_qty"]) > Decimal("0")
+
+
+def test_service_execute_records_simulated_trade_legs_before_round_completion(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-trade-leg-process")
+        service.confirm_plan(
+            run_id="run-trade-leg-process",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-trade-leg-process-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        executed = service.execute_plan(
+            run_id="run-trade-leg-process",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-trade-leg-process-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+        )
+        events = service.list_events("run-trade-leg-process", after_event_id=0, limit=50)["events"]
+    finally:
+        repository.close()
+
+    assert executed["status"] == "completed"
+    event_types = [event["event_type"] for event in events]
+    assert "kanglong_trade_executed" in event_types
+    assert event_types.index("kanglong_trade_executed") < event_types.index("kanglong_round_completed")
+    trade_events = [event for event in events if event["event_type"] == "kanglong_trade_executed"]
+    first_close, first_open = trade_events[:2]
+    assert first_close["round_id"] == "group-0001-round-0001"
+    assert first_open["round_id"] == "group-0001-round-0001"
+    assert first_close["payload"]["message_key"] == "events.kanglong.trade_executed"
+    assert first_close["payload"]["action_type"] == "single_close"
+    assert first_open["payload"]["action_type"] == "single_open"
+    assert first_close["payload"]["filled_qty"] == first_open["payload"]["filled_qty"]
+    assert first_close["payload"]["status"] == "filled"
+    assert first_open["payload"]["status"] == "filled"
+
+
 def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)
@@ -292,9 +411,9 @@ def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
     assert account_ids == ["tpl:tpl_eth_drop_001:main", "tpl:tpl_eth_drop_001:sub:sub-1"]
     sub = synthetic_state["accounts"][1]
     main = synthetic_state["accounts"][0]
-    assert sub["positions"][0]["qty"] == "1.00"
+    assert Decimal(sub["positions"][0]["qty"]) == Decimal("1.00")
     assert main["positions"][0]["position_side"] == "LONG"
-    assert main["positions"][0]["qty"] == "0.00"
+    assert Decimal(main["positions"][0]["qty"]) == Decimal("0.00")
 
 
 def test_execute_plan_idempotency_reuses_completed_response_after_recheck_prices_are_gone(tmp_path) -> None:

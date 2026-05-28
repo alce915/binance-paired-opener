@@ -116,6 +116,77 @@ def _price_snapshot(close_price: Decimal, open_price: Decimal, fee_rate: Decimal
     }
 
 
+def _display_qty(value: Decimal) -> str:
+    return format(value.quantize(Decimal("0.01")), "f")
+
+
+def _chain_config_account_labels(
+    *,
+    main_snapshot: KanglongAccountSnapshot,
+    subaccount_snapshots: list[KanglongAccountSnapshot],
+    account_snapshot_payload: dict[str, Any] | None,
+) -> dict[str, str]:
+    labels = {
+        snapshot.account_id: snapshot.account_name or snapshot.account_id
+        for snapshot in [main_snapshot, *subaccount_snapshots]
+    }
+    for account in (account_snapshot_payload or {}).get("accounts") or []:
+        if not isinstance(account, dict):
+            continue
+        account_id = str(account.get("account_id") or account.get("id") or "").strip()
+        if not account_id:
+            continue
+        label = str(
+            account.get("name")
+            or account.get("account_name")
+            or account.get("label")
+            or account.get("template_account_id")
+            or account_id
+        ).strip()
+        labels[account_id] = label or account_id
+    return labels
+
+
+def _chain_config_payload(
+    *,
+    symbol: str,
+    selected_side: PositionSide,
+    main_account_id: str,
+    main_snapshot: KanglongAccountSnapshot,
+    subaccount_snapshots: list[KanglongAccountSnapshot],
+    groups: list[KanglongGroupPlan],
+    account_snapshot_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    labels = _chain_config_account_labels(
+        main_snapshot=main_snapshot,
+        subaccount_snapshots=subaccount_snapshots,
+        account_snapshot_payload=account_snapshot_payload,
+    )
+    items = []
+    for index, group in enumerate(groups, start=1):
+        signed_qty = group.target_qty if group.from_account_id == main_account_id else -group.target_qty
+        items.append(
+            {
+                "index": index,
+                "group_id": group.group_id,
+                "from_account_id": group.from_account_id,
+                "from_account_label": labels.get(group.from_account_id, group.from_account_id),
+                "to_account_id": group.to_account_id,
+                "to_account_label": labels.get(group.to_account_id, group.to_account_id),
+                "qty": decimal_text(group.target_qty),
+                "signed_qty": decimal_text(signed_qty),
+                "display_qty": _display_qty(signed_qty),
+                "round_count": len(group.round_qtys),
+            }
+        )
+    return {
+        "symbol": symbol.strip().upper(),
+        "side": selected_side.value.lower(),
+        "count": len(items),
+        "items": items,
+    }
+
+
 def _price_drift_bps(previous: Decimal, current: Decimal) -> Decimal:
     if previous <= Decimal("0"):
         return Decimal("0")
@@ -194,8 +265,129 @@ def _update_existing_position_qty(position: dict[str, Any], qty: Decimal, price:
     _set_decimal_payload(position, "margin", margin)
 
 
-def _matched_qty_from_group(group: dict[str, Any]) -> Decimal:
-    return sum((_decimal_payload_value(qty) for qty in group.get("round_qtys") or []), Decimal("0"))
+def _default_execution_rules(symbol: str) -> SymbolRules:
+    return SymbolRules(
+        symbol.strip().upper() or "ETHUSDC",
+        Decimal("0.01"),
+        Decimal("0.001"),
+        Decimal("0.001"),
+        Decimal("5"),
+        125,
+    )
+
+
+def _group_plan_from_payload(group: dict[str, Any]) -> KanglongGroupPlan:
+    side = PositionSide(str(group.get("side") or PositionSide.LONG.value).strip().upper())
+    round_qtys = [_decimal_payload_value(qty) for qty in group.get("round_qtys") or []]
+    target_qty = _decimal_payload_value(group.get("target_qty")) or sum(round_qtys, Decimal("0"))
+    return KanglongGroupPlan(
+        group_id=str(group.get("group_id") or ""),
+        from_account_id=str(group.get("from_account_id") or ""),
+        to_account_id=str(group.get("to_account_id") or ""),
+        symbol=str(group.get("symbol") or "ETHUSDC").strip().upper(),
+        side=side,
+        target_qty=target_qty,
+        round_qtys=round_qtys,
+        batch_id=group.get("batch_id"),
+    )
+
+
+def _round_index_from_round_id(round_id: str) -> str:
+    try:
+        return str(int(str(round_id).rsplit("-", 1)[-1]))
+    except (TypeError, ValueError):
+        return str(round_id or "")
+
+
+def _kanglong_trade_events(
+    result: Any,
+    *,
+    group: KanglongGroupPlan,
+    plan_version: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for event in result.events:
+        payload = event.to_payload()
+        action_label = "平仓" if event.action_type == "single_close" else "开仓"
+        payload.update(
+            {
+                "message_key": "events.kanglong.trade_executed",
+                "message_params": {
+                    "group_id": event.group_id,
+                    "round_id": _round_index_from_round_id(event.round_id),
+                    "action_label": action_label,
+                    "account_id": event.account_id,
+                    "from_account_id": group.from_account_id,
+                    "to_account_id": group.to_account_id,
+                    "symbol": event.symbol,
+                    "side": event.position_side.value,
+                    "filled_qty": decimal_text(event.filled_qty),
+                    "avg_price": decimal_text(event.avg_price),
+                    "fee": decimal_text(event.fee),
+                    "status": event.status.value,
+                },
+                "plan_version": plan_version,
+                "from_account_id": group.from_account_id,
+                "to_account_id": group.to_account_id,
+            }
+        )
+        rows.append(
+            {
+                "event_type": "kanglong_trade_executed",
+                "group_id": event.group_id,
+                "round_id": event.round_id,
+                "payload": payload,
+            }
+        )
+    return rows
+
+
+def _round_process_events_from_result(
+    result: Any,
+    *,
+    plan_version: str,
+    close_price: Decimal,
+    open_price: Decimal,
+    fee_rate: Decimal,
+) -> list[dict[str, Any]]:
+    matched_by_round: dict[str, Decimal] = {}
+    status_by_round: dict[str, str] = {}
+    for event in result.events:
+        round_id = str(event.round_id or "")
+        matched_by_round[round_id] = max(
+            matched_by_round.get(round_id, Decimal("0")),
+            event.matched_qty,
+        )
+        status_by_round[round_id] = event.status.value
+    events: list[dict[str, Any]] = []
+    for round_index, round_id in enumerate(matched_by_round, start=1):
+        matched_qty = matched_by_round[round_id]
+        matched_qty_text = decimal_text(matched_qty)
+        events.append(
+            {
+                "event_type": "kanglong_round_completed",
+                "group_id": result.group_id,
+                "round_id": round_id,
+                "payload": {
+                    "message_key": "events.kanglong.round_completed",
+                    "message_params": {
+                        "group_id": result.group_id,
+                        "round_id": _round_index_from_round_id(round_id) or str(round_index),
+                        "matched_qty": matched_qty_text,
+                    },
+                    "group_id": result.group_id,
+                    "round_id": round_id,
+                    "round_index": round_index,
+                    "plan_version": plan_version,
+                    "matched_qty": matched_qty_text,
+                    "status": status_by_round.get(round_id, ""),
+                    "close_price": decimal_text(close_price),
+                    "open_price": decimal_text(open_price),
+                    "fee_rate": decimal_text(fee_rate),
+                },
+            }
+        )
+    return events
 
 
 def _synthetic_account_baseline(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -515,6 +707,15 @@ class KanglongSimulationService:
         report = {
             "summary": summary,
             "plan": plan_payload,
+            "chain_config": _chain_config_payload(
+                symbol=symbol,
+                selected_side=precheck.selected_side,
+                main_account_id=main_account_id,
+                main_snapshot=main_snapshot,
+                subaccount_snapshots=subaccount_snapshots,
+                groups=plan.groups,
+                account_snapshot_payload=account_snapshot_payload,
+            ),
             "costs": _payloadify(costs),
             "price_snapshot": _price_snapshot(close_price, open_price, fee_rate),
             "other_side_preview": _payloadify(precheck.other_side_preview),
@@ -656,6 +857,7 @@ class KanglongSimulationService:
         close_price: Decimal,
         open_price: Decimal,
         fee_rate: Decimal,
+        rules: SymbolRules | None = None,
         recheck_main_snapshot: KanglongAccountSnapshot | None = None,
         recheck_subaccount_snapshots: list[KanglongAccountSnapshot] | None = None,
         recheck_selected_side: PositionSide | None = None,
@@ -708,14 +910,25 @@ class KanglongSimulationService:
         request_payload = stored.get("request") or {}
         synthetic_accounts = _synthetic_account_baseline(report) if request_payload.get("account_source") == "test_template" else []
         groups = list(plan.get("groups") or [])
+        execution_rules = rules or _default_execution_rules(str(plan.get("symbol") or request_payload.get("symbol") or "ETHUSDC"))
+        execution_config = recheck_config or KanglongSymbolConfig()
         for group_index, group in enumerate(groups, start=1):
             group_id = group.get("group_id")
+            group_plan = _group_plan_from_payload(group)
+            result = simulate_group(
+                run_id=run_id,
+                group=group_plan,
+                rules=execution_rules,
+                close_price=close_price,
+                open_price=open_price,
+                fee_rate=fee_rate,
+                config=execution_config,
+            )
             if synthetic_accounts:
-                matched_qty = _matched_qty_from_group(group)
                 synthetic_issue = _synthetic_group_apply_issue(
                     synthetic_accounts,
                     group,
-                    matched_qty=matched_qty,
+                    matched_qty=result.matched_qty,
                 )
                 if synthetic_issue is not None:
                     report["synthetic_ledger_error"] = _payloadify(synthetic_issue)
@@ -766,7 +979,7 @@ class KanglongSimulationService:
                 synthetic_accounts = _apply_group_result_to_synthetic_accounts(
                     synthetic_accounts,
                     group,
-                    matched_qty=matched_qty,
+                    matched_qty=result.matched_qty,
                     close_price=close_price,
                     open_price=open_price,
                 )
@@ -781,6 +994,18 @@ class KanglongSimulationService:
                 "groups_completed": group_index,
                 "group_count": len(groups),
             }
+            trade_events = _kanglong_trade_events(
+                result,
+                group=group_plan,
+                plan_version=plan_version,
+            )
+            round_events = _round_process_events_from_result(
+                result,
+                plan_version=plan_version,
+                close_price=close_price,
+                open_price=open_price,
+                fee_rate=fee_rate,
+            )
             self._repository.update_kanglong_run_and_events(
                 run_id,
                 status=KanglongRunStatus.GROUP_COMPLETED.value,
@@ -788,6 +1013,8 @@ class KanglongSimulationService:
                 progress=progress,
                 report=report,
                 events=[
+                    *trade_events,
+                    *round_events,
                     {
                         "event_type": "kanglong_group_simulated",
                         "group_id": group_id,

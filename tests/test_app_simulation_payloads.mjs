@@ -726,7 +726,7 @@ this.renderSimulationAccount = renderSimulationAccount;
 }
 
 function loadKanglongAccountCardHelper() {
-  const start = appSource.indexOf("function kanglongAccountId");
+  const start = appSource.indexOf("function kanglongRawAccountId");
   const end = appSource.indexOf("\nfunction ensureKanglongMainAccount", start);
   assert.notEqual(start, -1, "kanglong account helpers should exist");
   assert.notEqual(end, -1, "kanglong account helpers should end before ensureKanglongMainAccount");
@@ -1036,6 +1036,16 @@ this.renderKanglongAccountRow = renderKanglongAccountRow;
   );
   assert.ok(!indexSource.includes('value="BTCUSDT"'), "static execution form defaults should not prefer non-whitelisted BTCUSDT");
   assert.ok(!indexSource.includes(">BTCUSDT<"), "static status/footer defaults should not display BTCUSDT");
+  assert.match(
+    indexSource,
+    /\.kanglong-account-section\s+\.kanglong-compact-list,\s*\.kanglong-selected-section\s+\.kanglong-compact-list\s*\{[^}]*padding:\s*12px\s+20px/s,
+    "kanglong account lists should keep account rows inset from every parent card edge",
+  );
+  assert.match(
+    indexSource,
+    /\.kanglong-account-section\s+\.kanglong-compact-list\s*>\s*\.empty-state,\s*\.kanglong-selected-section\s+\.kanglong-compact-list\s*>\s*\.empty-state\s*\{[^}]*margin-top:\s*0/s,
+    "kanglong selected empty state should sit inside the list inset instead of touching card edges",
+  );
 }
 
 {
@@ -1133,6 +1143,37 @@ this.renderKanglongAccountRow = renderKanglongAccountRow;
 
   assert.ok(heading, "main account status badge should live in the title heading row");
   assert.equal((text.match(/主账号/g) || []).length, 2, "main account card should show account name plus one inline role badge");
+}
+
+{
+  const { collectText, renderKanglongAccountRow } = loadKanglongAccountCardHelper();
+  const mainRow = renderKanglongAccountRow({
+    account_id: "tpl:tpl_eth_drop_001:main",
+    template_account_id: "test-main",
+    name: "Template Main",
+    role: "main",
+    collateral: "20000",
+    available_balance: "20000",
+    margin: "0",
+    positions: [],
+  }, { role: "main" });
+  const subRow = renderKanglongAccountRow({
+    account_id: "tpl:tpl_eth_drop_001:sub:sub-1",
+    template_account_id: "test-sub-1",
+    row_id: "sub-1",
+    name: "Template Sub",
+    role: "subaccount",
+    collateral: "7000",
+    positions: [],
+  }, { role: "selected" });
+  const mainText = collectText(mainRow);
+  const subText = collectText(subRow);
+
+  assert.match(mainText, /test-main/, "template main card should show the readable template account id");
+  assert.doesNotMatch(mainText, /tpl:tpl_eth_drop_001:main/, "template main card should hide the synthetic runtime id");
+  assert.match(mainText, /20000\.0000/, "template main card should show its collateral balance");
+  assert.match(subText, /test-sub-1/, "template subaccount card should show the readable template account id");
+  assert.doesNotMatch(subText, /tpl:tpl_eth_drop_001:sub:sub-1/, "template subaccount card should hide the synthetic runtime id");
 }
 
 {

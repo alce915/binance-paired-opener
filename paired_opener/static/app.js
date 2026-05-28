@@ -1314,14 +1314,26 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+function kanglongRawAccountId(account) {
+  if (typeof account === "string") return account.trim();
+  return String(account?.id || account?.account_id || "").trim();
+}
+
 function kanglongAccountId(account) {
-  if (typeof account === "string") return account.trim().toLowerCase();
-  return String(account?.id || account?.account_id || "").trim().toLowerCase();
+  return kanglongRawAccountId(account).toLowerCase();
+}
+
+function kanglongAccountDisplayId(account) {
+  const templateAccountId = String(account?.template_account_id || account?.templateAccountId || "").trim();
+  if (templateAccountId) return templateAccountId;
+  const accountId = kanglongRawAccountId(account);
+  if (!accountId || accountId.toLowerCase().startsWith("tpl:")) return "";
+  return accountId;
 }
 
 function kanglongAccountLabel(account) {
   if (!account) return DEFAULT_ACCOUNT_NAME;
-  return String(account.name || account.account_name || account.label || kanglongAccountId(account) || DEFAULT_ACCOUNT_NAME).trim() || DEFAULT_ACCOUNT_NAME;
+  return String(account.name || account.account_name || account.label || kanglongAccountDisplayId(account) || DEFAULT_ACCOUNT_NAME).trim() || DEFAULT_ACCOUNT_NAME;
 }
 
 function findKanglongAccount(accountId, accounts = availableAccounts) {
@@ -1426,6 +1438,49 @@ function renderKanglongPositionMetrics(account) {
   return metrics;
 }
 
+function kanglongMetricNumber(account, keys = []) {
+  for (const key of keys) {
+    const rawValue = account?.[key];
+    if (rawValue === null || rawValue === undefined) continue;
+    const text = String(rawValue).trim();
+    if (!text) continue;
+    const numeric = Number(text.replace(/,/g, ""));
+    if (Number.isFinite(numeric)) return numeric;
+  }
+  return null;
+}
+
+function appendKanglongMetricNode(container, label, value, tone = "") {
+  const item = document.createElement("span");
+  item.className = `kanglong-account-position-metric${tone ? ` ${tone}` : ""}`;
+  const labelNode = document.createElement("small");
+  labelNode.textContent = label;
+  const valueNode = document.createElement("strong");
+  valueNode.className = "mono";
+  valueNode.textContent = formatNumber(value, 4);
+  item.append(labelNode, valueNode);
+  container.appendChild(item);
+}
+
+function renderKanglongAccountBalanceMetrics(account) {
+  const collateral = kanglongMetricNumber(account, ["collateral", "wallet_balance", "walletBalance"]);
+  const available = kanglongMetricNumber(account, ["available_balance", "availableBalance"]);
+  const margin = kanglongMetricNumber(account, ["margin", "margin_used", "marginUsed"]);
+  if (collateral === null && available === null && margin === null) return null;
+  const metrics = document.createElement("div");
+  metrics.className = "kanglong-account-position-metrics kanglong-account-balance-metrics";
+  if (collateral !== null) {
+    appendKanglongMetricNode(metrics, copyOrDefault("console.kanglong.test_template.field.collateral", "保证金"), collateral);
+  }
+  if (available !== null && (collateral === null || Math.abs(available - collateral) > 0.00000001)) {
+    appendKanglongMetricNode(metrics, copyOrDefault("console.kanglong.card.available_balance", "可用"), available, available > 0 ? "positive" : "");
+  }
+  if (margin !== null && Math.abs(margin) > 0.00000001) {
+    appendKanglongMetricNode(metrics, copyOrDefault("console.kanglong.card.margin", "占用保证金"), margin);
+  }
+  return metrics.children.length ? metrics : null;
+}
+
 function renderKanglongAccountRow(account, opts = {}) {
   const accountId = kanglongAccountId(account);
   const role = opts.role || "pool";
@@ -1472,12 +1527,14 @@ function renderKanglongAccountRow(account, opts = {}) {
   const detail = document.createElement("div");
   detail.className = "kanglong-account-detail";
   detail.textContent = [
-    accountId || "--",
+    kanglongAccountDisplayId(account),
     selectedKanglongSymbol(),
     selectedKanglongSide() || copyOrDefault("console.kanglong.side_auto", "自动选择"),
-  ].join(" · ");
+  ].filter(Boolean).join(" · ");
+  const balanceMetrics = renderKanglongAccountBalanceMetrics(account);
   const positionMetrics = renderKanglongPositionMetrics(account);
   meta.append(heading, detail);
+  if (balanceMetrics) meta.appendChild(balanceMetrics);
   if (positionMetrics) meta.appendChild(positionMetrics);
   row.appendChild(meta);
 
@@ -1590,7 +1647,27 @@ function isKanglongTemplateSnapshotStale() {
 
 function kanglongAvailableActions(payload = kanglongState.plan) {
   const actions = payload?.available_actions || payload?.plan?.available_actions || payload?.report?.available_actions || [];
-  return Array.isArray(actions) ? actions.map((action) => String(action)) : [];
+  const normalizedActions = new Set(Array.isArray(actions) ? actions.map((action) => String(action)) : []);
+  const status = String(
+    payload?.status
+    ?? payload?.report?.status
+    ?? payload?.summary?.status
+    ?? payload?.report?.summary?.status
+    ?? "",
+  ).trim();
+  const planVersion = kanglongPlanVersion(payload);
+  if (status === "chain_ready" && planVersion) {
+    normalizedActions.add("confirm");
+    normalizedActions.add("refresh_plan");
+  } else if (status === "plan_confirmed" && planVersion) {
+    normalizedActions.add("execute");
+    normalizedActions.add("refresh_plan");
+  } else if (/^(blocked|paused|unsafe|needs_|aborted_)/.test(status)) {
+    normalizedActions.add("refresh_plan");
+  } else if (status === "completed") {
+    normalizedActions.add("view_report");
+  }
+  return Array.from(normalizedActions);
 }
 
 function kanglongRunId(payload = kanglongState.plan) {
@@ -1726,6 +1803,46 @@ function renderKanglongCapacityDetails(payload = {}) {
   return wrapper;
 }
 
+function kanglongChainConfig(payload = {}) {
+  return (
+    payload?.report?.chain_config
+    || payload?.report?.chainConfig
+    || payload?.chain_config
+    || payload?.chainConfig
+    || null
+  );
+}
+
+function renderKanglongChainConfig(payload = {}) {
+  const chainConfig = kanglongChainConfig(payload);
+  const items = Array.isArray(chainConfig?.items) ? chainConfig.items : [];
+  if (!items.length) return null;
+  const wrapper = document.createElement("div");
+  wrapper.className = "kanglong-chain-config";
+  const lines = [
+    copyOrDefault("console.kanglong.chain_config.title", "账号链式顺序配置"),
+    copyOrDefault("console.kanglong.chain_config.symbol", "交易对: {symbol}", {
+      symbol: chainConfig.symbol || selectedKanglongSymbol(),
+    }),
+    copyOrDefault("console.kanglong.chain_config.side", "方向: {side}", {
+      side: chainConfig.side ? String(chainConfig.side).toLowerCase() : (selectedKanglongSide() || copyOrDefault("console.kanglong.side_auto", "自动选择")),
+    }),
+    copyOrDefault("console.kanglong.chain_config.count", "共 {count} 条配置", {
+      count: chainConfig.count ?? items.length,
+    }),
+    "",
+    ...items.map((item, index) => {
+      const itemIndex = item.index ?? index + 1;
+      const fromLabel = item.from_account_label || item.fromAccountLabel || item.from_account_id || item.fromAccountId || "--";
+      const toLabel = item.to_account_label || item.toAccountLabel || item.to_account_id || item.toAccountId || "--";
+      const qty = item.display_qty || item.displayQty || item.signed_qty || item.signedQty || item.qty || "--";
+      return `${itemIndex}. ${fromLabel} -> ${toLabel}, 数量:${qty}`;
+    }),
+  ];
+  wrapper.textContent = lines.join("\n");
+  return wrapper;
+}
+
 function syncKanglongWorkflowButtons(payload = kanglongState.plan, options = {}) {
   const actions = kanglongAvailableActions(payload);
   if (kanglongConfirmPlanBtn) {
@@ -1761,7 +1878,49 @@ function renderKanglongPlanSummary(payload = {}) {
   summaryLine.className = "kanglong-plan-summary-line";
   summaryLine.textContent = segments.join(" | ");
   const capacityDetails = renderKanglongCapacityDetails(payload);
-  kanglongPlanSummary.replaceChildren(...[summaryLine, capacityDetails].filter(Boolean));
+  const chainConfig = renderKanglongChainConfig(payload);
+  kanglongPlanSummary.replaceChildren(...[summaryLine, capacityDetails, chainConfig].filter(Boolean));
+}
+
+function kanglongExecuteRecheckDetail(payload = {}) {
+  const report = payload?.report || {};
+  const executeRecheck = report.execute_recheck || report.executeRecheck || {};
+  const reasonCode = String(executeRecheck.reason_code || executeRecheck.reasonCode || "");
+  const status = String(payload.status || "");
+  if (reasonCode === "price_drift_exceeded") {
+    const pieces = [copyOrDefault(
+      "runtime.precheck_stale_price_drift",
+      "价格已明显偏离上次校验基线，需重新校验后才能继续执行。",
+    )];
+    if (executeRecheck.max_drift_bps !== undefined && executeRecheck.limit_bps !== undefined) {
+      pieces.push(`最大漂移 ${formatNumber(executeRecheck.max_drift_bps, 4)} bps，限制 ${formatNumber(executeRecheck.limit_bps, 4)} bps`);
+    }
+    return pieces.join(" ");
+  }
+  if (status === "blocked_plan_stale") {
+    return copyOrDefault("runtime.kanglong.plan_stale", "检测链路已过期，请重新检测账号状态。");
+  }
+  return "";
+}
+
+function appendKanglongActionResult(payload = {}) {
+  const status = String(payload?.status || "").trim();
+  if (!status) return;
+  const statusLabel = formatKanglongStatus(status);
+  const detail = kanglongExecuteRecheckDetail(payload);
+  if (!detail && !/(blocked|failed|needs_|conflict|not_found|stale|recover|unsafe)/.test(status)) {
+    return;
+  }
+  const fallbackMessage = detail ? `${statusLabel}：${detail}` : statusLabel;
+  appendKanglongExecutionEvent({
+    event_type: "kanglong_action_result",
+    status,
+    payload: {
+      status,
+      trustedMessage: true,
+      message: fallbackMessage,
+    },
+  });
 }
 
 function kanglongExecutionEventTags(event = {}, payload = {}) {
@@ -1946,6 +2105,7 @@ async function executeKanglongPlan() {
   });
   kanglongState.plan = payload;
   renderKanglongPlanSummary(payload);
+  appendKanglongActionResult(payload);
   syncKanglongWorkflowButtons(payload);
   await pollKanglongEvents();
   return payload;
@@ -3875,6 +4035,7 @@ async function applyAppPage(page) {
     maybeScheduleCurrentModePrecheck("page_switch");
   } else if (appPage === "kanglong" && typeof renderKanglongAccountPool === "function") {
     renderKanglongAccountPool(availableAccounts);
+    await restoreActiveKanglongRun();
     try {
       await refreshKanglongAccountSnapshots();
     } catch (error) {
@@ -3883,7 +4044,6 @@ async function applyAppPage(page) {
         messageParams: { error: userVisibleErrorMessage(error, error?.message) },
       });
     }
-    await restoreActiveKanglongRun();
   }
   return true;
 }
@@ -3917,7 +4077,36 @@ function buildKanglongTemplateBatchSubaccounts({
   });
 }
 
+function buildKanglongTemplateBatchGeneratorState({
+  count = 1,
+  collateral = "",
+  leverage = 75,
+  longEntryPrice = "",
+  shortEntryPrice = "",
+  qty = "",
+} = {}) {
+  const requestedCount = Math.max(1, Number.parseInt(String(count || 1), 10) || 1);
+  return {
+    count: Math.min(KANGLONG_TEMPLATE_MAX_BATCH_SUBACCOUNTS, requestedCount),
+    collateral: String(collateral ?? ""),
+    leverage: Number(leverage || 75),
+    longEntryPrice: String(longEntryPrice ?? ""),
+    shortEntryPrice: String(shortEntryPrice ?? ""),
+    qty: String(qty ?? ""),
+  };
+}
+
 function buildDefaultKanglongTemplateDraft() {
+  const defaultSubaccount = {
+    rowId: "sub-1",
+    accountId: "test-sub-1",
+    name: copyOrDefault("console.kanglong.test_template.default_sub_name", "测试子账号 1"),
+    collateral: "",
+    leverage: 75,
+    longEntryPrice: "",
+    shortEntryPrice: "",
+    qty: "",
+  };
   return {
     id: "",
     name: "",
@@ -3929,18 +4118,8 @@ function buildDefaultKanglongTemplateDraft() {
       collateral: "",
       leverage: 75,
     },
-    subaccounts: [
-      {
-        rowId: "sub-1",
-        accountId: "test-sub-1",
-        name: copyOrDefault("console.kanglong.test_template.default_sub_name", "测试子账号 1"),
-        collateral: "",
-        leverage: 75,
-        longEntryPrice: "",
-        shortEntryPrice: "",
-        qty: "",
-      },
-    ],
+    subaccounts: [defaultSubaccount],
+    batchGenerator: buildKanglongTemplateBatchGeneratorState(defaultSubaccount),
   };
 }
 
@@ -3972,6 +4151,20 @@ function importKanglongTemplateJsonText(rawText) {
 function kanglongTemplateToFormState(template = {}) {
   const subaccounts = Array.isArray(template.subaccounts) ? template.subaccounts : [];
   const draft = buildDefaultKanglongTemplateDraft();
+  const normalizedSubaccounts = subaccounts.length
+    ? subaccounts.map((item, index) => ({
+      rowId: String(item.row_id || item.rowId || nextKanglongTemplateRowId(index + 1)),
+      accountId: String(item.account_id || item.accountId || `test-sub-${index + 1}`),
+      name: String(item.name || copyOrDefault("console.kanglong.test_template.default_sub_name_index", "测试子账号 {index}", { index: index + 1 })),
+      collateral: String(item.collateral ?? ""),
+      leverage: Number(item.leverage || 75),
+      longEntryPrice: String(item.long_entry_price ?? item.longEntryPrice ?? ""),
+      shortEntryPrice: String(item.short_entry_price ?? item.shortEntryPrice ?? ""),
+      qty: String(item.qty ?? ""),
+    }))
+    : draft.subaccounts;
+  const firstRow = normalizedSubaccounts[0] || {};
+  const batchSource = template.batch_generator || template.batchGenerator || {};
   return {
     ...draft,
     id: String(template.id || ""),
@@ -3984,18 +4177,15 @@ function kanglongTemplateToFormState(template = {}) {
       collateral: String(template.main_account?.collateral ?? ""),
       leverage: Number(template.main_account?.leverage || 75),
     },
-    subaccounts: subaccounts.length
-      ? subaccounts.map((item, index) => ({
-        rowId: String(item.row_id || nextKanglongTemplateRowId(index + 1)),
-        accountId: String(item.account_id || `test-sub-${index + 1}`),
-        name: String(item.name || copyOrDefault("console.kanglong.test_template.default_sub_name_index", "测试子账号 {index}", { index: index + 1 })),
-        collateral: String(item.collateral ?? ""),
-        leverage: Number(item.leverage || 75),
-        longEntryPrice: String(item.long_entry_price ?? ""),
-        shortEntryPrice: String(item.short_entry_price ?? ""),
-        qty: String(item.qty ?? ""),
-      }))
-      : draft.subaccounts,
+    subaccounts: normalizedSubaccounts,
+    batchGenerator: buildKanglongTemplateBatchGeneratorState({
+      count: batchSource.count ?? normalizedSubaccounts.length,
+      collateral: batchSource.collateral ?? firstRow.collateral ?? "",
+      leverage: batchSource.leverage ?? firstRow.leverage ?? 75,
+      longEntryPrice: batchSource.long_entry_price ?? batchSource.longEntryPrice ?? firstRow.longEntryPrice ?? "",
+      shortEntryPrice: batchSource.short_entry_price ?? batchSource.shortEntryPrice ?? firstRow.shortEntryPrice ?? "",
+      qty: batchSource.qty ?? firstRow.qty ?? "",
+    }),
   };
 }
 
@@ -4197,8 +4387,8 @@ function selectedKanglongTemplate() {
   return kanglongState.testTemplates.find((template) => template.id === templateId) || kanglongState.testTemplates[0] || null;
 }
 
-function setKanglongTemplateDraft(template = null) {
-  const source = template || selectedKanglongTemplate();
+function setKanglongTemplateDraft(template = null, { forceDefault = false } = {}) {
+  const source = forceDefault ? null : (template || selectedKanglongTemplate());
   kanglongState.testTemplateDraft = source
     ? kanglongTemplateToFormState(source)
     : buildDefaultKanglongTemplateDraft();
@@ -4222,6 +4412,12 @@ function updateKanglongTemplateDraft(mutator) {
   const draft = ensureKanglongTemplateDraft();
   mutator(draft);
   markKanglongTemplateDraftChanged();
+}
+
+function updateKanglongTemplateBatchGenerator(mutator) {
+  const draft = ensureKanglongTemplateDraft();
+  draft.batchGenerator = buildKanglongTemplateBatchGeneratorState(draft.batchGenerator || {});
+  mutator(draft.batchGenerator);
 }
 
 function readKanglongTemplateEditorPayload() {
@@ -4250,6 +4446,15 @@ function renderKanglongTemplateLibrary() {
   title.textContent = copyOrDefault("console.kanglong.test_template.library_title", "模板库");
   kanglongTemplateLibrary.appendChild(title);
   const templates = Array.isArray(kanglongState.testTemplates) ? kanglongState.testTemplates : [];
+  const newButton = document.createElement("button");
+  newButton.type = "button";
+  newButton.className = kanglongState.activeTestTemplateId ? "inline-btn secondary" : "inline-btn success";
+  newButton.textContent = copyOrDefault("console.kanglong.test_template.actions.new_template", "新模板");
+  newButton.addEventListener("click", () => {
+    startNewKanglongTemplateDraft();
+    renderKanglongTestTemplateModal();
+  });
+  kanglongTemplateLibrary.appendChild(newButton);
   if (!templates.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -4270,6 +4475,22 @@ function renderKanglongTemplateLibrary() {
   });
 }
 
+function startNewKanglongTemplateDraft() {
+  if (!confirmDiscardKanglongTemplateDraft()) return false;
+  if (
+    kanglongState.accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE
+    && kanglongState.templatePreview?.template_id
+  ) {
+    exitKanglongTemplateMode();
+  }
+  kanglongState.activeTestTemplateId = null;
+  kanglongState.activeTemplateContentHash = null;
+  kanglongState.templatePreview = null;
+  kanglongState.templatePreviewWarningsConfirmedKey = "";
+  setKanglongTemplateDraft(null, { forceDefault: true });
+  return true;
+}
+
 function createKanglongTemplateSection(titleKey, fallback) {
   const section = document.createElement("section");
   section.className = "kanglong-template-section";
@@ -4287,10 +4508,14 @@ function createKanglongTemplateField({ labelKey, fallback, value, onInput, type 
   label.textContent = copyOrDefault(labelKey, fallback);
   const input = document.createElement("input");
   input.type = type;
-  input.value = value ?? "";
+  input.value = String(value ?? "");
   input.addEventListener("input", () => onInput(input.value));
   field.append(label, input);
   return field;
+}
+
+function kanglongTemplateFieldInput(field) {
+  return field?.querySelector?.("input, select") || field?.children?.[1] || null;
 }
 
 function createKanglongTemplateFieldGrid() {
@@ -4376,34 +4601,54 @@ function renderKanglongTemplateBasicFields(container, form) {
 function renderKanglongTemplateMainAccountFields(container, form) {
   const section = createKanglongTemplateSection("console.kanglong.test_template.editor.main_account", "主账号");
   const grid = createKanglongTemplateFieldGrid();
+  const nameField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.main_name",
+    fallback: "主账号名称",
+    value: form.mainAccount.name,
+    onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.name = value; }),
+  });
+  const collateralField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.collateral",
+    fallback: "保证金",
+    value: form.mainAccount.collateral,
+    onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.collateral = value; }),
+  });
+  const leverageField = createKanglongTemplateField({
+    labelKey: "console.kanglong.test_template.field.leverage",
+    fallback: "杠杆",
+    value: form.mainAccount.leverage,
+    type: "number",
+    onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.leverage = value; }),
+  });
   grid.append(
-    createKanglongTemplateField({
-      labelKey: "console.kanglong.test_template.field.main_name",
-      fallback: "主账号名称",
-      value: form.mainAccount.name,
-      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.name = value; }),
-    }),
-    createKanglongTemplateField({
-      labelKey: "console.kanglong.test_template.field.collateral",
-      fallback: "保证金",
-      value: form.mainAccount.collateral,
-      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.collateral = value; }),
-    }),
-    createKanglongTemplateField({
-      labelKey: "console.kanglong.test_template.field.leverage",
-      fallback: "杠杆",
-      value: form.mainAccount.leverage,
-      type: "number",
-      onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.mainAccount.leverage = value; }),
-    }),
+    nameField,
+    collateralField,
+    leverageField,
   );
-  section.appendChild(grid);
+  const generateButton = document.createElement("button");
+  generateButton.type = "button";
+  generateButton.className = "inline-btn success";
+  generateButton.textContent = copyOrDefault("console.kanglong.test_template.actions.generate_main", "生成测试主账号");
+  generateButton.addEventListener("click", () => {
+    updateKanglongTemplateDraft((draft) => {
+      draft.mainAccount = {
+        accountId: "test-main",
+        name: String(kanglongTemplateFieldInput(nameField)?.value || "").trim()
+          || copyOrDefault("console.kanglong.test_template.default_main_name", "测试主账号"),
+        collateral: String(kanglongTemplateFieldInput(collateralField)?.value ?? "").trim(),
+        leverage: Number(kanglongTemplateFieldInput(leverageField)?.value || 75),
+      };
+    });
+    renderKanglongTestTemplateModal();
+  });
+  section.append(grid, generateButton);
   container.appendChild(section);
 }
 
-function renderKanglongTemplateSubaccountRows(container, form) {
-  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.subaccounts", "子账号");
+function appendKanglongTemplateSubaccountRows(section, form) {
   const rows = Array.isArray(form.subaccounts) ? form.subaccounts : [];
+  const rowList = document.createElement("div");
+  rowList.className = "kanglong-template-sub-list";
   rows.forEach((row, index) => {
     const rowEl = document.createElement("div");
     rowEl.className = "kanglong-template-sub-row";
@@ -4446,52 +4691,52 @@ function renderKanglongTemplateSubaccountRows(container, form) {
         onInput: (value) => updateKanglongTemplateDraft((draft) => { draft.subaccounts[index].qty = value; }),
       }),
     );
-    section.appendChild(rowEl);
+    rowList.appendChild(rowEl);
   });
-  container.appendChild(section);
+  section.appendChild(rowList);
 }
 
-function renderKanglongTemplateBatchGenerator(container, form) {
-  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.batch_generator", "批量生成");
-  const firstRow = (Array.isArray(form.subaccounts) && form.subaccounts[0]) || {};
+function renderKanglongTemplateSubaccountGenerator(container, form) {
+  const section = createKanglongTemplateSection("console.kanglong.test_template.editor.subaccounts", "子账号");
+  const generator = form.batchGenerator || buildKanglongTemplateBatchGeneratorState((Array.isArray(form.subaccounts) && form.subaccounts[0]) || {});
   const grid = createKanglongTemplateFieldGrid();
   const countField = createKanglongTemplateField({
     labelKey: "console.kanglong.test_template.field.subaccount_count",
     fallback: "子账号数量",
-    value: Math.max(1, form.subaccounts?.length || 1),
+    value: generator.count || Math.max(1, form.subaccounts?.length || 1),
     type: "number",
-    onInput: () => {},
+    onInput: (value) => updateKanglongTemplateBatchGenerator((batch) => { batch.count = value; }),
   });
   const collateralField = createKanglongTemplateField({
     labelKey: "console.kanglong.test_template.field.collateral",
     fallback: "保证金",
-    value: firstRow.collateral || "",
-    onInput: () => {},
+    value: generator.collateral || "",
+    onInput: (value) => updateKanglongTemplateBatchGenerator((batch) => { batch.collateral = value; }),
   });
   const leverageField = createKanglongTemplateField({
     labelKey: "console.kanglong.test_template.field.leverage",
     fallback: "杠杆",
-    value: firstRow.leverage || 75,
+    value: generator.leverage || 75,
     type: "number",
-    onInput: () => {},
+    onInput: (value) => updateKanglongTemplateBatchGenerator((batch) => { batch.leverage = value; }),
   });
   const longField = createKanglongTemplateField({
     labelKey: "console.kanglong.test_template.field.long_entry_price",
     fallback: "LONG 开仓价",
-    value: firstRow.longEntryPrice || "",
-    onInput: () => {},
+    value: generator.longEntryPrice || "",
+    onInput: (value) => updateKanglongTemplateBatchGenerator((batch) => { batch.longEntryPrice = value; }),
   });
   const shortField = createKanglongTemplateField({
     labelKey: "console.kanglong.test_template.field.short_entry_price",
     fallback: "SHORT 开仓价",
-    value: firstRow.shortEntryPrice || "",
-    onInput: () => {},
+    value: generator.shortEntryPrice || "",
+    onInput: (value) => updateKanglongTemplateBatchGenerator((batch) => { batch.shortEntryPrice = value; }),
   });
   const qtyField = createKanglongTemplateField({
     labelKey: "console.kanglong.test_template.field.qty",
     fallback: "持仓数量",
-    value: firstRow.qty || "",
-    onInput: () => {},
+    value: generator.qty || "",
+    onInput: (value) => updateKanglongTemplateBatchGenerator((batch) => { batch.qty = value; }),
   });
   grid.append(countField, collateralField, leverageField, longField, shortField, qtyField);
   const generateButton = document.createElement("button");
@@ -4499,19 +4744,22 @@ function renderKanglongTemplateBatchGenerator(container, form) {
   generateButton.className = "inline-btn success";
   generateButton.textContent = copyOrDefault("console.kanglong.test_template.actions.generate", "生成配平子账号");
   generateButton.addEventListener("click", () => {
+    const nextBatch = buildKanglongTemplateBatchGeneratorState({
+      count: kanglongTemplateFieldInput(countField)?.value || 1,
+      collateral: kanglongTemplateFieldInput(collateralField)?.value || "",
+      leverage: kanglongTemplateFieldInput(leverageField)?.value || 75,
+      longEntryPrice: kanglongTemplateFieldInput(longField)?.value || "",
+      shortEntryPrice: kanglongTemplateFieldInput(shortField)?.value || "",
+      qty: kanglongTemplateFieldInput(qtyField)?.value || "",
+    });
     updateKanglongTemplateDraft((draft) => {
-      draft.subaccounts = buildKanglongTemplateBatchSubaccounts({
-        count: countField.querySelector?.("input")?.value || countField.children?.[1]?.value || 1,
-        collateral: collateralField.querySelector?.("input")?.value || collateralField.children?.[1]?.value || "",
-        leverage: leverageField.querySelector?.("input")?.value || leverageField.children?.[1]?.value || 75,
-        longEntryPrice: longField.querySelector?.("input")?.value || longField.children?.[1]?.value || "",
-        shortEntryPrice: shortField.querySelector?.("input")?.value || shortField.children?.[1]?.value || "",
-        qty: qtyField.querySelector?.("input")?.value || qtyField.children?.[1]?.value || "",
-      });
+      draft.batchGenerator = nextBatch;
+      draft.subaccounts = buildKanglongTemplateBatchSubaccounts(nextBatch);
     });
     renderKanglongTestTemplateModal();
   });
   section.append(grid, generateButton);
+  appendKanglongTemplateSubaccountRows(section, form);
   container.appendChild(section);
 }
 
@@ -4555,8 +4803,7 @@ function renderKanglongTemplateEditor() {
   renderKanglongTemplateStatusBar(kanglongTemplateEditor);
   renderKanglongTemplateBasicFields(kanglongTemplateEditor, form);
   renderKanglongTemplateMainAccountFields(kanglongTemplateEditor, form);
-  renderKanglongTemplateSubaccountRows(kanglongTemplateEditor, form);
-  renderKanglongTemplateBatchGenerator(kanglongTemplateEditor, form);
+  renderKanglongTemplateSubaccountGenerator(kanglongTemplateEditor, form);
   renderKanglongTemplateAdvancedJson(kanglongTemplateEditor, form);
 }
 
@@ -4747,8 +4994,25 @@ async function previewCurrentKanglongTemplate(savedTemplate) {
   return kanglongState.templatePreview;
 }
 
+function mergeSavedKanglongTemplateMetadata(savedTemplate = {}, submittedTemplate = {}) {
+  const saved = savedTemplate && typeof savedTemplate === "object" ? savedTemplate : {};
+  return {
+    ...submittedTemplate,
+    ...saved,
+    id: saved.id || submittedTemplate.id || "",
+    name: saved.name || submittedTemplate.name || "",
+    symbol: saved.symbol || submittedTemplate.symbol || DEFAULT_SYMBOL,
+    market_data_account_id: saved.market_data_account_id || submittedTemplate.market_data_account_id || "",
+    main_account: saved.main_account || submittedTemplate.main_account || {},
+    subaccounts: Array.isArray(saved.subaccounts) ? saved.subaccounts : (submittedTemplate.subaccounts || []),
+  };
+}
+
 async function saveCurrentKanglongTemplate({ applyPreview = false, refreshPreview = false } = {}) {
   const template = readKanglongTemplateEditorPayload();
+  const draftBatchGenerator = kanglongState.testTemplateDraft?.batchGenerator
+    ? { ...kanglongState.testTemplateDraft.batchGenerator }
+    : null;
   const validation = validateCurrentKanglongTemplateDraft();
   if (!validation.valid) {
     renderKanglongTestTemplateModal();
@@ -4757,23 +5021,30 @@ async function saveCurrentKanglongTemplate({ applyPreview = false, refreshPrevie
   const payload = await saveKanglongTestTemplate(template);
   const savedTemplate = payload?.template || payload;
   const savedTemplateId = savedTemplate?.id || template.id;
+  const mergedTemplate = mergeSavedKanglongTemplateMetadata(savedTemplate, {
+    ...template,
+    id: savedTemplateId || template.id || "",
+  });
   kanglongState.testTemplates = [
     ...kanglongState.testTemplates.filter((item) => item.id !== savedTemplateId),
-    savedTemplate,
+    mergedTemplate,
   ].filter(Boolean);
   kanglongState.activeTestTemplateId = savedTemplateId || null;
   kanglongState.activeTemplateContentHash = savedTemplate?.template_content_hash || null;
   if (kanglongState.testTemplateDraft) {
-    kanglongState.testTemplateDraft = kanglongTemplateToFormState(savedTemplate || template);
+    kanglongState.testTemplateDraft = kanglongTemplateToFormState(mergedTemplate);
+    if (draftBatchGenerator) {
+      kanglongState.testTemplateDraft.batchGenerator = buildKanglongTemplateBatchGeneratorState(draftBatchGenerator);
+    }
     kanglongState.testTemplateOriginalPayload = kanglongTemplateFormToPayload(kanglongState.testTemplateDraft);
     kanglongState.testTemplateDirty = false;
     kanglongState.marketDataAccountId = kanglongState.testTemplateDraft.marketDataAccountId || kanglongState.marketDataAccountId;
   }
   if ((applyPreview || refreshPreview) && savedTemplateId) {
-    const preview = await previewCurrentKanglongTemplate(savedTemplate);
+    const preview = await previewCurrentKanglongTemplate(mergedTemplate);
     if (refreshPreview && !applyPreview) {
       renderKanglongTestTemplateModal();
-      return savedTemplate;
+      return mergedTemplate;
     }
     if (!preview || templatePreviewBlocks(preview).length) {
       renderKanglongTestTemplateModal();
@@ -4793,7 +5064,7 @@ async function saveCurrentKanglongTemplate({ applyPreview = false, refreshPrevie
     applyKanglongTemplatePreview(preview);
   }
   renderKanglongTestTemplateModal();
-  return savedTemplate;
+  return mergedTemplate;
 }
 
 function buildSimulationRunPayload(mode = executionMode) {

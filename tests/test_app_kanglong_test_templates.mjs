@@ -333,6 +333,38 @@ function findNodeByText(node, text) {
   return null;
 }
 
+function findNode(node, predicate) {
+  if (!node) return null;
+  if (predicate(node)) return node;
+  if (!Array.isArray(node.children)) return null;
+  for (const child of node.children) {
+    const match = findNode(child, predicate);
+    if (match) return match;
+  }
+  return null;
+}
+
+function findTemplateSection(node, titleText) {
+  return findNode(node, (candidate) => (
+    candidate.className === "kanglong-template-section"
+    && collectNodeText(candidate).includes(titleText)
+  ));
+}
+
+function findFieldInput(node, labelText, occurrence = 0) {
+  let seen = 0;
+  const match = findNode(node, (candidate) => {
+    if (candidate.className !== "kanglong-template-field" || !Array.isArray(candidate.children)) return false;
+    if (candidate.children[0]?.textContent !== labelText) return false;
+    if (seen !== occurrence) {
+      seen += 1;
+      return false;
+    }
+    return true;
+  });
+  return match?.children?.[1] || null;
+}
+
 {
   const api = makeTemplateHarness();
   const draft = api.buildDefaultKanglongTemplateDraft();
@@ -489,6 +521,97 @@ function findNodeByText(node, text) {
   });
 
   assert.equal(rows.length, 50, "batch generation should cap generated subaccounts");
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDraft = api.kanglongTemplateToFormState({
+    id: "tpl_a",
+    name: "Template A",
+    symbol: "ETHUSDC",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [{
+      row_id: "sub-1",
+      account_id: "test-sub-1",
+      name: "Sub 1",
+      collateral: "500",
+      leverage: 75,
+      long_entry_price: "2400",
+      short_entry_price: "2600",
+      qty: "1",
+    }],
+  });
+  api.renderKanglongTestTemplateModal();
+
+  const subaccountSection = findTemplateSection(api.editor, "console.kanglong.test_template.editor.subaccounts");
+  const countInput = findFieldInput(subaccountSection, "console.kanglong.test_template.field.subaccount_count");
+  assert.ok(countInput, "subaccount generator should expose a count input inside the subaccount section");
+  countInput.value = "3";
+  findNodeByText(subaccountSection, "console.kanglong.test_template.actions.generate").onclick();
+
+  assert.equal(api.state.testTemplateDraft.subaccounts.length, 3, "batch generator should create the requested subaccount count");
+  assert.equal(api.state.testTemplateDraft.subaccounts[2].accountId, "test-sub-3");
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDraft = api.kanglongTemplateToFormState({
+    name: "Template A",
+    symbol: "ETHUSDC",
+    market_data_account_id: "market-main",
+    main_account: { account_id: "test-main", name: "Main", collateral: "1000", leverage: 75, positions: [] },
+    subaccounts: [{
+      row_id: "sub-1",
+      account_id: "test-sub-1",
+      name: "Sub 1",
+      collateral: "500",
+      leverage: 75,
+      long_entry_price: "2400",
+      short_entry_price: "2600",
+      qty: "1",
+    }],
+  });
+  api.renderKanglongTestTemplateModal();
+
+  const subaccountSection = findTemplateSection(api.editor, "console.kanglong.test_template.editor.subaccounts");
+  findFieldInput(subaccountSection, "console.kanglong.test_template.field.subaccount_count").value = "3";
+  findNodeByText(subaccountSection, "console.kanglong.test_template.actions.generate").onclick();
+  await api.saveCurrentKanglongTemplate();
+
+  api.renderKanglongTestTemplateModal();
+  const savedSubaccountSection = findTemplateSection(api.editor, "console.kanglong.test_template.editor.subaccounts");
+  assert.equal(api.state.activeTestTemplateId, "tpl_generated", "saving should keep the saved template selected");
+  assert.equal(api.state.testTemplateDraft.subaccounts.length, 3, "saving should preserve the generated subaccounts even when the API returns metadata only");
+  assert.equal(findFieldInput(savedSubaccountSection, "console.kanglong.test_template.field.subaccount_count").value, "3");
+
+  const newTemplateButton = findNodeByText(api.library, "console.kanglong.test_template.actions.new_template");
+  assert.ok(newTemplateButton, "template library should always expose a new-template tab");
+  newTemplateButton.onclick();
+
+  assert.equal(api.state.activeTestTemplateId, null);
+  assert.equal(api.state.testTemplateDraft.name, "");
+  assert.equal(api.state.testTemplateDraft.mainAccount.collateral, "");
+  assert.equal(api.state.testTemplateDraft.subaccounts.length, 1);
+  assert.equal(api.state.testTemplateDraft.subaccounts[0].qty, "");
+}
+
+{
+  const api = makeTemplateHarness();
+  api.state.testTemplateDraft = api.buildDefaultKanglongTemplateDraft();
+  api.state.testTemplateDraft.mainAccount.name = "";
+  api.state.testTemplateDraft.mainAccount.collateral = "20000";
+  api.renderKanglongTestTemplateModal();
+
+  const mainSection = findTemplateSection(api.editor, "console.kanglong.test_template.editor.main_account");
+  const generateMainButton = findNodeByText(mainSection, "console.kanglong.test_template.actions.generate_main");
+  assert.ok(generateMainButton, "main account section should expose a generate button");
+  generateMainButton.onclick();
+
+  assert.equal(api.state.testTemplateDraft.mainAccount.accountId, "test-main");
+  assert.equal(api.state.testTemplateDraft.mainAccount.name, "console.kanglong.test_template.default_main_name");
+  assert.equal(api.state.testTemplateDraft.mainAccount.collateral, "20000");
+  assert.equal(api.state.testTemplateDraft.mainAccount.leverage, 75);
 }
 
 {

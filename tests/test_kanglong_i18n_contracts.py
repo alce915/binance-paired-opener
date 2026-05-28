@@ -46,6 +46,8 @@ KANGLONG_TEMPLATE_MESSAGE_COPY = {
     "console.kanglong.test_template.preview.mark_price": "标记价格",
     "console.kanglong.test_template.preview.unrealized_pnl_label": "未实现盈亏",
     "console.kanglong.test_template.actions.new": "新建模板",
+    "console.kanglong.test_template.actions.new_template": "新模板",
+    "console.kanglong.test_template.actions.generate_main": "生成测试主账号",
     "console.kanglong.test_template.actions.apply": "应用",
     "console.kanglong.test_template.actions.clone": "复制",
     "console.kanglong.test_template.actions.delete": "删除",
@@ -133,6 +135,7 @@ def test_kanglong_i18n_messages_and_registries_exist() -> None:
         "reasons.kanglong.blocked_main_not_flat",
         "events.kanglong.synthetic_ledger_failed",
         "events.kanglong.round_completed",
+        "events.kanglong.trade_executed",
         "log.kanglong.abort_recovered",
         "precheck.labels.kanglong.main_flat",
         "precheck.kanglong.main_flat.fail",
@@ -142,6 +145,7 @@ def test_kanglong_i18n_messages_and_registries_exist() -> None:
     assert reason_registry()["kanglong.blocked_main_not_flat"]["key"] == "reasons.kanglong.blocked_main_not_flat"
     assert event_registry()["kanglong.synthetic_ledger_failed"]["key"] == "events.kanglong.synthetic_ledger_failed"
     assert event_registry()["kanglong.round_completed"]["key"] == "events.kanglong.round_completed"
+    assert event_registry()["kanglong.trade_executed"]["key"] == "events.kanglong.trade_executed"
     assert log_registry()["kanglong.abort_recovered"]["key"] == "log.kanglong.abort_recovered"
     assert precheck_registry()["kanglong.main_flat"]["fail_key"] == "precheck.kanglong.main_flat.fail"
 
@@ -163,6 +167,10 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
         "console.kanglong.plan.capacity.notional_capacity_qty",
         "console.kanglong.plan.capacity.margin_capacity_qty",
         "console.kanglong.plan.capacity.liquidation_buffer_qty",
+        "console.kanglong.chain_config.title",
+        "console.kanglong.chain_config.symbol",
+        "console.kanglong.chain_config.side",
+        "console.kanglong.chain_config.count",
         "console.kanglong.execution.log_title",
         "console.kanglong.actions.detect",
         "console.kanglong.actions.confirm",
@@ -194,6 +202,10 @@ def test_kanglong_workspace_i18n_keys_exist() -> None:
     assert catalog["console.kanglong.plan.capacity.notional_capacity_qty"] == "主账号临时名义价值上限"
     assert catalog["console.kanglong.plan.capacity.margin_capacity_qty"] == "可用保证金上限"
     assert catalog["console.kanglong.plan.capacity.liquidation_buffer_qty"] == "爆仓缓冲上限"
+    assert catalog["console.kanglong.chain_config.title"] == "账号链式顺序配置"
+    assert catalog["console.kanglong.chain_config.symbol"] == "交易对: {symbol}"
+    assert catalog["console.kanglong.chain_config.side"] == "方向: {side}"
+    assert catalog["console.kanglong.chain_config.count"] == "共 {count} 条配置"
     assert catalog["runtime.kanglong.idempotency_conflict"] == "重复请求的幂等键与原请求不一致，请刷新后重试。"
     assert catalog["runtime.kanglong.plan_stale"] == "检测链路已过期，请重新检测账号状态。"
     assert catalog["events.kanglong.group_simulated"] == "亢龙第 {group_id} 组模拟完成"

@@ -81,6 +81,16 @@ assert.equal(
   false,
   "account selection stage badge should not render in the Kanglong workspace shell",
 );
+{
+  const applyAppPageSource = appSlice("async function applyAppPage", "function nextKanglongTemplateRowId");
+  const kanglongBranchStart = applyAppPageSource.indexOf('appPage === "kanglong"');
+  assert.notEqual(kanglongBranchStart, -1, "applyAppPage should include a Kanglong branch");
+  const kanglongBranch = applyAppPageSource.slice(kanglongBranchStart);
+  assert.ok(
+    kanglongBranch.indexOf("await restoreActiveKanglongRun();") < kanglongBranch.indexOf("await refreshKanglongAccountSnapshots();"),
+    "Kanglong page should restore an active confirmable run before snapshot refresh can delay the confirm button",
+  );
+}
 assert.match(
   indexSource,
   /\.kanglong-template-modal\s*\{[\s\S]*width:\s*min\(1680px,\s*calc\(100vw - 24px\)\);[\s\S]*max-height:\s*min\(900px,\s*calc\(100vh - 24px\)\);[\s\S]*\}/,
@@ -116,6 +126,7 @@ for (const [key, expected] of Object.entries({
   "console.kanglong.plan.capacity.margin_capacity_qty": "可用保证金上限",
   "console.kanglong.plan.capacity.liquidation_buffer_qty": "爆仓缓冲上限",
   "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
+  "events.kanglong.trade_executed": "亢龙第 {group_id} 组第 {round_id} 轮{action_label}：{account_id} {symbol} {side} 成交 {filled_qty}，均价 {avg_price}，手续费 {fee}，状态 {status}",
   "runtime.kanglong.status.plan_confirmed": "链路已确认",
   "runtime.kanglong.status.blocked_plan_stale": "检测链路已过期",
   "runtime.kanglong.status.idempotency_conflict": "重复请求冲突",
@@ -206,6 +217,7 @@ function makeKanglongHarness(requestImpl) {
       "console.kanglong.logs.filter.cost": "成本事件",
       "console.kanglong.logs.filter.ledger": "账本事件",
       "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
+      "events.kanglong.trade_executed": "亢龙第 {group_id} 组第 {round_id} 轮{action_label}：{account_id} {symbol} {side} 成交 {filled_qty}，均价 {avg_price}，手续费 {fee}，状态 {status}",
       "runtime.kanglong.status.plan_confirmed": "链路已确认",
       "runtime.kanglong.status.chain_ready": "链路可确认",
       "runtime.kanglong.status.blocked_plan_stale": "检测链路已过期",
@@ -307,6 +319,7 @@ function makeKanglongHarness(requestImpl) {
         const rendered = copyOrDefault(messageCode, messageCode, messageParams);
         if (rendered !== messageCode) return rendered;
       }
+      if (source.trustedMessage === true && source.message) return String(source.message);
       return source.fallbackMessage || safeFallback;
     }
     function setEmptyState(container, className, text) {
@@ -314,6 +327,10 @@ function makeKanglongHarness(requestImpl) {
       empty.className = className;
       empty.textContent = text;
       container.replaceChildren(empty);
+    }
+    function formatNumber(value, digits = 8) {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric.toFixed(digits).replace(/\\.0+$/, "").replace(/(\\.\\d*?)0+$/, "$1") : "0";
     }
     function kanglongAccountId(account) {
       if (typeof account === "string") return account.trim().toLowerCase();
@@ -347,6 +364,7 @@ function makeKanglongHarness(requestImpl) {
       confirmButton: kanglongConfirmPlanBtn,
       createKanglongPlan,
       detectButton: kanglongDetectPlanBtn,
+      executeKanglongPlan,
       executeButton: kanglongExecutePlanBtn,
       executionLog: kanglongExecutionLog,
       logFilters: kanglongLogFilters,
@@ -378,6 +396,29 @@ function makeKanglongHarness(requestImpl) {
 }
 
 {
+  const calls = [];
+  const api = makeKanglongHarness(async (requestPath) => {
+    calls.push(requestPath);
+    assert.equal(requestPath, "/kanglong/simulation/plan");
+    return {
+      run_id: "ready-run",
+      status: "chain_ready",
+      plan_version: "ready-plan",
+      snapshot_bundle_id: "snap-ready",
+      report: { summary: { status: "chain_ready", group_count: 1, round_count: 2, planned_release_qty: "1" } },
+    };
+  });
+  api.confirmButton.disabled = true;
+  api.executeButton.disabled = true;
+
+  await api.runKanglongWorkflowAction(api.detectButton, api.createKanglongPlan);
+
+  assert.deepEqual(calls, ["/kanglong/simulation/plan"]);
+  assert.equal(api.confirmButton.disabled, false, "detecting a ready chain should enable confirm immediately even if actions are omitted");
+  assert.equal(api.executeButton.disabled, true, "detecting should not enable execute before confirm");
+}
+
+{
   const api = makeKanglongHarness(async () => ({}));
   api.renderKanglongPlanSummary({
     status: "plan_confirmed",
@@ -390,9 +431,139 @@ function makeKanglongHarness(requestImpl) {
 
 {
   const api = makeKanglongHarness(async () => ({}));
+  api.renderKanglongPlanSummary({
+    status: "chain_ready",
+    report: {
+      summary: { status: "chain_ready", group_count: 2, round_count: 4, planned_release_qty: "1.5" },
+      chain_config: {
+        symbol: "ETHUSDC",
+        side: "LONG",
+        count: 2,
+        items: [
+          { index: 1, from_account_label: "jiage4", to_account_label: "jiage-zhuhao", display_qty: "-1.00" },
+          { index: 2, from_account_label: "jiage-zhuhao", to_account_label: "jiage4", display_qty: "116.39" },
+        ],
+      },
+    },
+  });
+  const text = api.planSummary.textContent;
+  assert.ok(text.includes("账号链式顺序配置"), "plan summary should show the account chain configuration before execution");
+  assert.ok(text.includes("交易对: ETHUSDC"), "chain config should show the symbol");
+  assert.ok(text.includes("方向: long"), "chain config should show the selected side");
+  assert.ok(text.includes("共 2 条配置"), "chain config should show item count");
+  assert.ok(text.includes("1. jiage4 -> jiage-zhuhao, 数量:-1.00"), "chain config should render the first account pair");
+  assert.ok(text.includes("2. jiage-zhuhao -> jiage4, 数量:116.39"), "chain config should render main-account repair pairs");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
   api.renderKanglongPlanSummary({ status: "blocked_plan_stale" });
   assert.ok(api.planSummary.textContent.includes("状态：检测链路已过期"), "stale plan status should render through i18n");
   assert.equal(api.planSummary.textContent.includes("blocked_plan_stale"), false, "blocked status codes should stay out of user-visible summary text");
+}
+
+{
+  const calls = [];
+  const api = makeKanglongHarness(async (requestPath) => {
+    calls.push(requestPath);
+    if (requestPath === "/kanglong/simulation/plan/old-run/execute") {
+      return {
+        run_id: "old-run",
+        status: "blocked_plan_stale",
+        plan_version: "old-plan",
+        snapshot_bundle_id: "snap-stale",
+        available_actions: ["refresh_plan"],
+        report: {
+          execute_recheck: {
+            status: "blocked_plan_stale",
+            reason_code: "price_drift_exceeded",
+            max_drift_bps: "11.76",
+            limit_bps: 5,
+          },
+        },
+      };
+    }
+    assert.equal(requestPath, "/kanglong/simulation/run/old-run/events?after_event_id=0");
+    return {
+      run_id: "old-run",
+      events: [],
+      next_after_event_id: 0,
+      latest_event_id: 0,
+      has_more: false,
+    };
+  });
+  api.state.plan = {
+    run_id: "old-run",
+    status: "plan_confirmed",
+    plan_version: "old-plan",
+    available_actions: ["execute", "refresh_plan"],
+  };
+  api.state.confirmedPlanVersion = "old-plan";
+  api.state.latestEventId = 0;
+  api.state.seenEventIds.clear();
+
+  await api.runKanglongWorkflowAction(api.executeButton, api.executeKanglongPlan);
+
+  assert.deepEqual(calls, [
+    "/kanglong/simulation/plan/old-run/execute",
+    "/kanglong/simulation/run/old-run/events?after_event_id=0",
+  ]);
+  assert.equal(api.state.plan.status, "blocked_plan_stale", "execute stale response should become the current plan state");
+  assert.equal(api.executionLog.children.length, 1, "execute stale response should append a visible execution log row");
+  assert.ok(api.executionLog.textContent.includes("11.76"), `execute stale log should show the measured price drift: ${api.executionLog.textContent}`);
+  assert.ok(api.executionLog.textContent.includes("5"), "execute stale log should show the configured drift limit");
+}
+
+{
+  const calls = [];
+  const api = makeKanglongHarness(async (requestPath) => {
+    calls.push(requestPath);
+    if (requestPath === "/kanglong/simulation/plan/process-run/execute") {
+      return {
+        run_id: "process-run",
+        status: "completed",
+        plan_version: "process-plan",
+        snapshot_bundle_id: "snap-process",
+        available_actions: ["view_report"],
+        report: {},
+      };
+    }
+    assert.equal(requestPath, "/kanglong/simulation/run/process-run/events?after_event_id=0");
+    return {
+      run_id: "process-run",
+      events: [
+        {
+          event_id: 1,
+          event_type: "kanglong_round_completed",
+          group_id: "group-0001",
+          round_id: "group-0001-round-0001",
+          payload: { trustedMessage: true, message: "round 1 transferred 5" },
+        },
+      ],
+      next_after_event_id: 1,
+      latest_event_id: 1,
+      has_more: false,
+    };
+  });
+  api.state.plan = {
+    run_id: "process-run",
+    status: "plan_confirmed",
+    plan_version: "process-plan",
+    available_actions: ["execute", "refresh_plan"],
+  };
+  api.state.confirmedPlanVersion = "process-plan";
+  api.state.latestEventId = 0;
+  api.state.seenEventIds.clear();
+
+  await api.runKanglongWorkflowAction(api.executeButton, api.executeKanglongPlan);
+
+  assert.deepEqual(calls, [
+    "/kanglong/simulation/plan/process-run/execute",
+    "/kanglong/simulation/run/process-run/events?after_event_id=0",
+  ]);
+  assert.equal(api.executionLog.children.length, 1, "completed execute should show the transfer event stream without a leading completed-only row");
+  assert.ok(api.executionLog.textContent.includes("round 1 transferred 5"), "completed execute should surface transfer process events");
+  assert.equal(api.executionLog.textContent.includes("completed"), false, "completed execute should not prepend a raw completed action result before process logs");
 }
 
 {
@@ -510,6 +681,33 @@ for (const [status, label] of Object.entries(kanglongStatusLabels)) {
   api.appendKanglongExecutionEvent(event);
   assert.equal(api.executionLog.children.length, 1, "duplicate Kanglong event IDs should append once");
   assert.ok(api.executionLog.textContent.includes("亢龙第 A 组模拟完成"), "message_key should render through i18n");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.appendKanglongExecutionEvent({
+    event_id: 8,
+    event_type: "kanglong_trade_executed",
+    payload: {
+      message_key: "events.kanglong.trade_executed",
+      message_params: {
+        group_id: "group-0001",
+        round_id: "1",
+        action_label: "平仓",
+        account_id: "jiage4",
+        symbol: "ETHUSDC",
+        side: "LONG",
+        filled_qty: "1.00",
+        avg_price: "3100.00",
+        fee: "1.55",
+        status: "filled",
+      },
+    },
+  });
+  const renderedText = api.executionLog.textContent;
+  assert.ok(renderedText.includes("第 1 轮平仓"), "trade leg events should render the close/open action instead of a raw event type");
+  assert.ok(renderedText.includes("jiage4 ETHUSDC LONG 成交 1.00"), "trade leg events should expose the simulated account trade details");
+  assert.equal(renderedText.includes("kanglong_trade_executed"), false, "trade leg event type should not leak into the UI");
 }
 
 {

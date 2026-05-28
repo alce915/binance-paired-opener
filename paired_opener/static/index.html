@@ -123,6 +123,14 @@
         display: grid;
         gap: 8px;
       }
+      .kanglong-account-section .kanglong-compact-list,
+      .kanglong-selected-section .kanglong-compact-list {
+        padding: 12px 20px;
+      }
+      .kanglong-account-section .kanglong-compact-list > .empty-state,
+      .kanglong-selected-section .kanglong-compact-list > .empty-state {
+        margin-top: 0;
+      }
       .kanglong-account-row {
         min-height: 64px;
         padding: 8px 10px;
@@ -203,7 +211,8 @@
         padding: 8px 10px;
       }
       .kanglong-account-toolbar {
-        margin: 8px 0;
+        margin: 8px 0 10px;
+        padding: 0 20px;
         display: flex;
         justify-content: flex-end;
       }
@@ -247,6 +256,15 @@
         color: #7a6b58;
         font-size: 0.84rem;
         line-height: 1.45;
+      }
+      .kanglong-chain-config {
+        white-space: pre-wrap;
+        line-height: 1.55;
+        padding: 10px 12px;
+        border: 1px solid rgba(124, 95, 62, 0.22);
+        border-radius: 8px;
+        background: rgba(255, 252, 245, 0.72);
+        font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
       }
       .kanglong-log-filters {
         display: flex;
@@ -302,9 +320,11 @@
         font-size: 20px;
       }
       .modal-header button,
-      .modal-footer button,
-      .kanglong-template-library button {
+      .modal-footer button {
         width: auto;
+      }
+      .kanglong-template-library button {
+        width: 100%;
       }
       .icon-button {
         min-width: 38px;
@@ -376,6 +396,13 @@
         grid-template-columns: minmax(120px, 1.1fr) repeat(5, minmax(82px, 0.8fr));
         gap: 8px;
         align-items: end;
+      }
+      .kanglong-template-sub-list {
+        display: grid;
+        gap: 8px;
+      }
+      .kanglong-template-section > .inline-btn {
+        justify-self: start;
       }
       .kanglong-template-status-bar,
       .kanglong-template-actions {
@@ -1455,7 +1482,7 @@
       </section>
     </main>
 
-        <script src="/static/app.js?v=20260427-simulation-stats-log"></script>
+        <script src="/static/app.js?v=20260528-kanglong-workflow"></script>
   </body>
 </html>
 
