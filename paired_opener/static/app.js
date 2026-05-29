@@ -140,6 +140,8 @@ const kanglongState = {
   realAccountPoolSnapshot: null,
 };
 let kanglongActiveRunRestored = false;
+let activeKanglongExecutionPoller = null;
+let activeKanglongExecutionPollInFlight = false;
 let whitelistSymbols = [];
 let temporaryCustomSymbol = null;
 let latestReferencePrice = 0;
@@ -2089,6 +2091,57 @@ async function confirmKanglongPlan() {
   return payload;
 }
 
+function isKanglongExecutionLiveStatus(status) {
+  return [
+    "execution_starting",
+    "group_ready",
+    "round_simulated",
+    "group_completed",
+    "plan_adjusted",
+    "rebalance_ready",
+  ].includes(String(status || "").trim());
+}
+
+function stopKanglongExecutionPoller() {
+  if (activeKanglongExecutionPoller) {
+    clearInterval(activeKanglongExecutionPoller);
+    activeKanglongExecutionPoller = null;
+  }
+  activeKanglongExecutionPollInFlight = false;
+}
+
+async function refreshKanglongExecutionRun(runId) {
+  const payload = await request(`/kanglong/simulation/run/${encodeURIComponent(runId)}`);
+  if (kanglongRunId(payload) !== runId) return payload;
+  kanglongState.plan = payload;
+  renderKanglongPlanSummary(payload);
+  syncKanglongWorkflowButtons(payload);
+  if (!isKanglongExecutionLiveStatus(payload.status)) {
+    stopKanglongExecutionPoller();
+  }
+  return payload;
+}
+
+function startKanglongExecutionPoller(runId) {
+  if (!runId || typeof setInterval !== "function") return;
+  stopKanglongExecutionPoller();
+  activeKanglongExecutionPoller = setInterval(async () => {
+    if (activeKanglongExecutionPollInFlight) return;
+    activeKanglongExecutionPollInFlight = true;
+    try {
+      await pollKanglongEvents();
+      await refreshKanglongExecutionRun(runId);
+    } catch (error) {
+      appendLog("error", "", undefined, {
+        messageCode: "runtime.kanglong.request_failed",
+        messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+      });
+    } finally {
+      activeKanglongExecutionPollInFlight = false;
+    }
+  }, 1000);
+}
+
 async function executeKanglongPlan() {
   const runId = kanglongRunId();
   const planVersion = kanglongState.confirmedPlanVersion;
@@ -2108,6 +2161,11 @@ async function executeKanglongPlan() {
   appendKanglongActionResult(payload);
   syncKanglongWorkflowButtons(payload);
   await pollKanglongEvents();
+  if (isKanglongExecutionLiveStatus(payload.status)) {
+    startKanglongExecutionPoller(runId);
+  } else {
+    stopKanglongExecutionPoller();
+  }
   return payload;
 }
 

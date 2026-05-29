@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -37,6 +38,7 @@ class StubKanglongService:
     def __init__(self) -> None:
         self.plans: dict[str, dict] = {}
         self.list_events_calls: list[tuple[str, int | None, int]] = []
+        self.completed_executions: list[str] = []
 
     def create_plan(self, **kwargs) -> dict:
         payload = {
@@ -51,7 +53,7 @@ class StubKanglongService:
         return payload
 
     def confirm_plan(self, **kwargs) -> dict:
-        return {
+        payload = {
             "run_id": kwargs["run_id"],
             "status": "plan_confirmed",
             "plan_version": kwargs["plan_version"],
@@ -59,6 +61,31 @@ class StubKanglongService:
             "available_actions": ["execute", "refresh_plan"],
             "report": {},
         }
+        self.plans[kwargs["run_id"]] = {
+            **self.plans.get(kwargs["run_id"], {}),
+            **payload,
+            "request": {
+                "mode": "simulation",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1"],
+                "account_source": "runtime",
+            },
+            "plan": {"selected_side": "LONG"},
+        }
+        return payload
+
+    def start_execute_plan(self, **kwargs) -> dict:
+        payload = {
+            "run_id": kwargs["run_id"],
+            "status": "execution_starting",
+            "plan_version": kwargs["plan_version"],
+            "snapshot_bundle_id": "snap-1",
+            "available_actions": [],
+            "report": {},
+        }
+        self.plans[kwargs["run_id"]] = {**self.plans.get(kwargs["run_id"], {}), **payload}
+        return payload
 
     def execute_plan(self, **kwargs) -> dict:
         return {
@@ -69,6 +96,25 @@ class StubKanglongService:
             "available_actions": ["view_report"],
             "report": {},
         }
+
+    def complete_started_execution(self, **kwargs) -> dict:
+        self.completed_executions.append(kwargs["run_id"])
+        payload = self.execute_plan(**kwargs)
+        self.plans[kwargs["run_id"]] = {**self.plans.get(kwargs["run_id"], {}), **payload}
+        return payload
+
+    def mark_execution_failed(self, **kwargs) -> dict:
+        payload = {
+            "run_id": kwargs["run_id"],
+            "status": "needs_abort_recover",
+            "plan_version": kwargs["plan_version"],
+            "snapshot_bundle_id": "snap-1",
+            "available_actions": ["recover"],
+            "result_grade": "unsafe_unclosed",
+            "report": {"execution_error": {"message": str(kwargs["error"])}},
+        }
+        self.plans[kwargs["run_id"]] = {**self.plans.get(kwargs["run_id"], {}), **payload}
+        return payload
 
     def get_run(self, run_id: str) -> dict | None:
         return self.plans.get(run_id)
@@ -186,6 +232,13 @@ async def test_kanglong_split_api_plan_confirm_execute() -> None:
             "subaccount_ids": request.subaccount_ids,
             "selected_side": request.selected_side,
             "snapshot_bundle_id": "snap-1",
+            "close_price": Decimal("3100.00"),
+            "open_price": Decimal("3100.50"),
+            "fee_rate": Decimal("0.0005"),
+            "rules": SymbolRules("ETHUSDC", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("5"), 125),
+            "main_snapshot": snapshot("main", "0", "0", "0", "0"),
+            "subaccount_snapshots": [snapshot("sub1", "1", "1", "100", "0")],
+            "config": KanglongSymbolConfig(),
         }
 
     api_module._collect_kanglong_plan_inputs = fake_collector
@@ -208,8 +261,125 @@ async def test_kanglong_split_api_plan_confirm_execute() -> None:
 
     assert plan.status == "chain_ready"
     assert confirmed.status == "plan_confirmed"
-    assert executed.status == "completed"
+    assert executed.status == "execution_starting"
     assert events.latest_event_id == 0
+
+
+@pytest.mark.asyncio
+async def test_kanglong_background_worker_failure_is_marked_recoverable() -> None:
+    class FailingBackgroundService:
+        def __init__(self) -> None:
+            self.failed_kwargs: dict | None = None
+
+        def complete_started_execution(self, **kwargs) -> dict:
+            raise RuntimeError("worker exploded")
+
+        def mark_execution_failed(self, **kwargs) -> dict:
+            self.failed_kwargs = kwargs
+            return {"status": "needs_abort_recover"}
+
+    service = FailingBackgroundService()
+
+    await api_module._complete_kanglong_execution_in_background(
+        service,
+        {
+            "run_id": "run-worker-failure",
+            "plan_version": "plan-worker-failure",
+            "idempotency_key": "execute-worker-failure",
+            "close_price": Decimal("3100.00"),
+            "open_price": Decimal("3100.50"),
+            "fee_rate": Decimal("0.0005"),
+        },
+    )
+
+    assert service.failed_kwargs is not None
+    assert service.failed_kwargs["run_id"] == "run-worker-failure"
+    assert service.failed_kwargs["plan_version"] == "plan-worker-failure"
+    assert str(service.failed_kwargs["error"]) == "worker exploded"
+
+
+@pytest.mark.asyncio
+async def test_kanglong_execute_idempotent_starting_response_reschedules_worker() -> None:
+    class StartingIdempotencyService:
+        def __init__(self) -> None:
+            self.completed_kwargs: list[dict] = []
+
+        def execute_plan_idempotency_response(self, **kwargs):
+            return "hash", {
+                "run_id": kwargs["run_id"],
+                "status": "execution_starting",
+                "plan_version": kwargs["plan_version"],
+                "snapshot_bundle_id": "snap-1",
+                "available_actions": [],
+                "report": {},
+            }
+
+        def get_run(self, run_id: str) -> dict:
+            return {
+                "run_id": run_id,
+                "status": "execution_starting",
+                "plan_version": "plan-retry",
+                "snapshot_bundle_id": "snap-1",
+                "request": {
+                    "mode": "simulation",
+                    "symbol": "ETHUSDC",
+                    "main_account_id": "main",
+                    "subaccount_ids": ["sub1"],
+                    "account_source": "runtime",
+                },
+                "report": {
+                    "execution_context": {
+                        "price_snapshot": {
+                            "close_price": "3100.00",
+                            "open_price": "3100.50",
+                            "fee_rate": "0.0005",
+                        },
+                        "rules": {
+                            "symbol": "ETHUSDC",
+                            "tick_size": "0.01",
+                            "step_size": "0.001",
+                            "min_qty": "0.001",
+                            "min_notional": "5",
+                            "max_leverage": 125,
+                        },
+                    }
+                },
+            }
+
+        def start_execute_plan(self, **kwargs) -> dict:
+            raise AssertionError("idempotent execution_starting response should not start a new run")
+
+        def complete_started_execution(self, **kwargs) -> dict:
+            self.completed_kwargs.append(kwargs)
+            return {"run_id": kwargs["run_id"], "status": "completed"}
+
+        def mark_execution_failed(self, **kwargs) -> dict:
+            raise AssertionError(f"background completion should not fail: {kwargs}")
+
+    service = StartingIdempotencyService()
+    original_service = api_module.app.state._state.get("kanglong_service")
+    had_original_service = "kanglong_service" in api_module.app.state._state
+    api_module.app.state.kanglong_service = service
+
+    try:
+        response = await api_module.execute_kanglong_simulation_plan(
+            "run-retry",
+            KanglongActionRequest(plan_version="plan-retry", idempotency_key="execute-retry"),
+        )
+        for _ in range(20):
+            if service.completed_kwargs:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        if had_original_service:
+            api_module.app.state.kanglong_service = original_service
+        else:
+            api_module.app.state._state.pop("kanglong_service", None)
+
+    assert response.status == "execution_starting"
+    assert service.completed_kwargs
+    assert service.completed_kwargs[0]["close_price"] == Decimal("3100.00")
+    assert service.completed_kwargs[0]["rules"].min_notional == Decimal("5")
 
 
 @pytest.mark.asyncio

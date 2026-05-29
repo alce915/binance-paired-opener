@@ -51,6 +51,7 @@ _ACTIVE_KANGLONG_RUN_STATUSES = (
     "paused_plan_recheck_changed",
     "needs_abort_recover",
     "abort_recovering",
+    "unsafe_dust_residual",
 )
 
 

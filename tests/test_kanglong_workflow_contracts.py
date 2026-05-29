@@ -377,6 +377,151 @@ def test_service_execute_records_simulated_trade_legs_before_round_completion(tm
     assert first_open["payload"]["status"] == "filled"
 
 
+def test_service_start_execute_leaves_run_in_progress_before_worker_completion(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-start-execute")
+        service.confirm_plan(
+            run_id="run-start-execute",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-start-execute-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        started = service.start_execute_plan(
+            run_id="run-start-execute",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-start-execute-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            rules=_rules(),
+        )
+        stored = repository.get_kanglong_run("run-start-execute")
+        events = service.list_events("run-start-execute", after_event_id=0, limit=10)["events"]
+    finally:
+        repository.close()
+
+    assert started["status"] == "execution_starting"
+    assert started["available_actions"] == []
+    assert stored is not None
+    assert stored["status"] == "execution_starting"
+    assert events == []
+
+
+def test_service_marks_started_execution_failure_recoverable(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-worker-failed")
+        service.confirm_plan(
+            run_id="run-worker-failed",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-worker-failed-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        service.start_execute_plan(
+            run_id="run-worker-failed",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-worker-failed-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            rules=_rules(),
+        )
+        failed = service.mark_execution_failed(
+            run_id="run-worker-failed",
+            plan_version=plan["plan_version"],
+            error=RuntimeError("worker exploded"),
+        )
+        stored = repository.get_kanglong_run("run-worker-failed")
+        events = service.list_events("run-worker-failed", after_event_id=0, limit=10)["events"]
+    finally:
+        repository.close()
+
+    assert failed["status"] == "needs_abort_recover"
+    assert failed["available_actions"] == ["recover"]
+    assert failed["result_grade"] == "unsafe_unclosed"
+    assert stored is not None
+    assert stored["status"] == "needs_abort_recover"
+    assert stored["available_actions"] == ["recover"]
+    assert stored["report"]["execution_error"]["message"] == "worker exploded"
+    assert events[-1]["event_type"] == "kanglong_execution_failed"
+    assert events[-1]["payload"]["message_params"]["error"] == "worker exploded"
+
+
+def test_execute_plan_marks_rejected_or_residual_rounds_unsafe(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-unsafe-residual")
+        service.confirm_plan(
+            run_id="run-unsafe-residual",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-unsafe-residual-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        executed = service.execute_plan(
+            run_id="run-unsafe-residual",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-unsafe-residual-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            rules=SymbolRules("ETHUSDC", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("1000000"), 125),
+        )
+        stored = repository.get_kanglong_run("run-unsafe-residual")
+        events = service.list_events("run-unsafe-residual", after_event_id=0, limit=50)["events"]
+    finally:
+        repository.close()
+
+    assert executed["status"] == "unsafe_dust_residual"
+    assert executed["result_grade"] == "unsafe_unclosed"
+    assert executed["available_actions"] == ["recover"]
+    assert stored is not None
+    assert stored["status"] == "unsafe_dust_residual"
+    assert stored["result_grade"] == "unsafe_unclosed"
+    assert stored["report"]["residual_ledger"]
+    assert any(event["payload"].get("status") == "rejected" for event in events if event["event_type"] == "kanglong_trade_executed")
+
+
+def test_execute_plan_recomputes_report_costs_from_actual_execution_prices(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(service, run_id="run-actual-costs")
+        planned_fee_cost = plan["report"]["costs"]["transfer_fee_cost"]
+        service.confirm_plan(
+            run_id="run-actual-costs",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-actual-costs-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        executed = service.execute_plan(
+            run_id="run-actual-costs",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-actual-costs-0001",
+            close_price=Decimal("3101.00"),
+            open_price=Decimal("3101.50"),
+            fee_rate=Decimal("0.0005"),
+            rules=_rules(),
+        )
+        stored = repository.get_kanglong_run("run-actual-costs")
+    finally:
+        repository.close()
+
+    assert executed["status"] == "completed"
+    assert stored is not None
+    actual_costs = stored["report"]["costs"]
+    assert actual_costs["transfer_fee_cost"] != planned_fee_cost
+    assert stored["report"]["price_snapshot"]["close_price"] == "3101.00"
+    assert stored["report"]["price_snapshot"]["open_price"] == "3101.50"
+
+
 def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)

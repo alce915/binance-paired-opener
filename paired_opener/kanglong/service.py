@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -13,10 +13,14 @@ from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
 from paired_opener.kanglong.models import (
     KanglongAccountSnapshot,
+    KanglongEvent,
+    KanglongEventStatus,
     KanglongGroupPlan,
+    KanglongGroupResult,
     KanglongPrecheckResult,
     KanglongResultGrade,
     KanglongRunStatus,
+    ResidualLedgerEntry,
     decimal_text,
     payload_value,
 )
@@ -27,6 +31,15 @@ from paired_opener.kanglong.simulator import simulate_group
 from paired_opener.storage import SqliteRepository
 
 _DEFAULT_SYNTHETIC_LEVERAGE = 1
+
+
+@dataclass(slots=True)
+class _ExecutionStart:
+    request_hash: str
+    stored: dict[str, Any]
+    response: dict[str, Any]
+    rules: SymbolRules
+    config: KanglongSymbolConfig
 
 
 def _now_text() -> str:
@@ -469,6 +482,39 @@ def _synthetic_group_apply_issue(
     return None
 
 
+def _execution_report_with_actuals(
+    report: dict[str, Any],
+    *,
+    events: list[KanglongEvent],
+    residuals: list[ResidualLedgerEntry],
+    close_price: Decimal,
+    open_price: Decimal,
+    fee_rate: Decimal,
+    status: str | None = None,
+) -> dict[str, Any]:
+    report["costs"] = _payloadify(summarize_costs(events, residuals))
+    report["price_snapshot"] = _price_snapshot(close_price, open_price, fee_rate)
+    report["residual_ledger"] = _payloadify(residuals)
+    if status:
+        summary = dict(report.get("summary") or {})
+        summary["status"] = status
+        report["summary"] = summary
+    return report
+
+
+def _group_result_has_unsafe_residual(result: KanglongGroupResult, group: KanglongGroupPlan) -> bool:
+    if result.residual_ledger:
+        return True
+    if result.matched_qty < group.target_qty:
+        return True
+    return any(
+        event.status != KanglongEventStatus.FILLED
+        or event.filled_qty < event.submitted_qty
+        or event.matched_qty < event.submitted_qty
+        for event in result.events
+    )
+
+
 class KanglongSimulationService:
     def __init__(self, repository: SqliteRepository) -> None:
         self._repository = repository
@@ -848,7 +894,7 @@ class KanglongSimulationService:
             run_id=run_id,
         )
 
-    def execute_plan(
+    def _begin_execute_plan(
         self,
         *,
         run_id: str,
@@ -863,7 +909,8 @@ class KanglongSimulationService:
         recheck_selected_side: PositionSide | None = None,
         recheck_config: KanglongSymbolConfig | None = None,
         recheck_snapshot_bundle_id: str | None = None,
-    ) -> dict[str, Any]:
+        remember_start: bool,
+    ) -> _ExecutionStart | dict[str, Any]:
         request_hash, existing_response = self.execute_plan_idempotency_response(
             run_id=run_id,
             plan_version=plan_version,
@@ -896,34 +943,225 @@ class KanglongSimulationService:
         if recheck_response is not None:
             return recheck_response
 
+        execution_config = recheck_config or KanglongSymbolConfig()
         self._repository.heartbeat_kanglong_locks(
             run_id=run_id,
-            ttl_ms=(recheck_config or KanglongSymbolConfig()).run_lock_ttl_ms,
+            ttl_ms=execution_config.run_lock_ttl_ms,
         )
+        plan = stored.get("plan") or {}
+        request_payload = stored.get("request") or {}
+        execution_rules = rules or _default_execution_rules(str(plan.get("symbol") or request_payload.get("symbol") or "ETHUSDC"))
+        report = copy.deepcopy(stored.get("report") or {})
+        report["execution_context"] = {
+            "started_at": _now_text(),
+            "price_snapshot": _price_snapshot(close_price, open_price, fee_rate),
+            "rules": _payloadify(execution_rules),
+            "config": _payloadify(execution_config),
+            "recheck_snapshot_bundle_id": recheck_snapshot_bundle_id,
+        }
         self._repository.update_kanglong_run(
             run_id,
             status=KanglongRunStatus.EXECUTION_STARTING.value,
             available_actions=[],
+            report=report,
         )
+        response = _response_base(
+            run_id,
+            KanglongRunStatus.EXECUTION_STARTING.value,
+            plan_version=plan_version,
+            snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+            available_actions=[],
+            report=report,
+            result_grade=stored.get("result_grade"),
+            latest_event_id=self._repository.latest_kanglong_event_id(run_id),
+        )
+        if remember_start:
+            response = self._remember_idempotency(idempotency_key, request_hash, response)
+        return _ExecutionStart(
+            request_hash=request_hash,
+            stored=stored,
+            response=response,
+            rules=execution_rules,
+            config=execution_config,
+        )
+
+    def start_execute_plan(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        idempotency_key: str,
+        close_price: Decimal,
+        open_price: Decimal,
+        fee_rate: Decimal,
+        rules: SymbolRules | None = None,
+        recheck_main_snapshot: KanglongAccountSnapshot | None = None,
+        recheck_subaccount_snapshots: list[KanglongAccountSnapshot] | None = None,
+        recheck_selected_side: PositionSide | None = None,
+        recheck_config: KanglongSymbolConfig | None = None,
+        recheck_snapshot_bundle_id: str | None = None,
+    ) -> dict[str, Any]:
+        prepared = self._begin_execute_plan(
+            run_id=run_id,
+            plan_version=plan_version,
+            idempotency_key=idempotency_key,
+            close_price=close_price,
+            open_price=open_price,
+            fee_rate=fee_rate,
+            rules=rules,
+            recheck_main_snapshot=recheck_main_snapshot,
+            recheck_subaccount_snapshots=recheck_subaccount_snapshots,
+            recheck_selected_side=recheck_selected_side,
+            recheck_config=recheck_config,
+            recheck_snapshot_bundle_id=recheck_snapshot_bundle_id,
+            remember_start=True,
+        )
+        if isinstance(prepared, dict):
+            return prepared
+        return prepared.response
+
+    def execute_plan(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        idempotency_key: str,
+        close_price: Decimal,
+        open_price: Decimal,
+        fee_rate: Decimal,
+        rules: SymbolRules | None = None,
+        recheck_main_snapshot: KanglongAccountSnapshot | None = None,
+        recheck_subaccount_snapshots: list[KanglongAccountSnapshot] | None = None,
+        recheck_selected_side: PositionSide | None = None,
+        recheck_config: KanglongSymbolConfig | None = None,
+        recheck_snapshot_bundle_id: str | None = None,
+    ) -> dict[str, Any]:
+        prepared = self._begin_execute_plan(
+            run_id=run_id,
+            plan_version=plan_version,
+            idempotency_key=idempotency_key,
+            close_price=close_price,
+            open_price=open_price,
+            fee_rate=fee_rate,
+            rules=rules,
+            recheck_main_snapshot=recheck_main_snapshot,
+            recheck_subaccount_snapshots=recheck_subaccount_snapshots,
+            recheck_selected_side=recheck_selected_side,
+            recheck_config=recheck_config,
+            recheck_snapshot_bundle_id=recheck_snapshot_bundle_id,
+            remember_start=False,
+        )
+        if isinstance(prepared, dict):
+            return prepared
+        return self._complete_execute_plan_groups(
+            run_id=run_id,
+            plan_version=plan_version,
+            idempotency_key=idempotency_key,
+            request_hash=prepared.request_hash,
+            stored=prepared.stored,
+            close_price=close_price,
+            open_price=open_price,
+            fee_rate=fee_rate,
+            rules=prepared.rules,
+            config=prepared.config,
+            remember_idempotency=True,
+        )
+
+    def complete_started_execution(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        idempotency_key: str,
+        close_price: Decimal,
+        open_price: Decimal,
+        fee_rate: Decimal,
+        rules: SymbolRules | None = None,
+        recheck_main_snapshot: KanglongAccountSnapshot | None = None,
+        recheck_subaccount_snapshots: list[KanglongAccountSnapshot] | None = None,
+        recheck_selected_side: PositionSide | None = None,
+        recheck_config: KanglongSymbolConfig | None = None,
+        recheck_snapshot_bundle_id: str | None = None,
+    ) -> dict[str, Any]:
+        _ = (
+            recheck_main_snapshot,
+            recheck_subaccount_snapshots,
+            recheck_selected_side,
+            recheck_snapshot_bundle_id,
+        )
+        request_hash = _request_hash(
+            {
+                "action": "execute",
+                "run_id": run_id,
+                "plan_version": plan_version,
+            }
+        )
+        stored = self._repository.get_kanglong_run(run_id)
+        if stored is None:
+            return self._not_found(run_id, plan_version)
+        if stored.get("plan_version") != plan_version:
+            return self._blocked_plan_stale(run_id, plan_version, stored)
+        if stored.get("status") != KanglongRunStatus.EXECUTION_STARTING.value:
+            return self._blocked_plan_recheck_failed(run_id, plan_version, stored)
+
+        execution_config = recheck_config or KanglongSymbolConfig()
+        self._repository.heartbeat_kanglong_locks(
+            run_id=run_id,
+            ttl_ms=execution_config.run_lock_ttl_ms,
+        )
+        plan = stored.get("plan") or {}
+        request_payload = stored.get("request") or {}
+        execution_rules = rules or _default_execution_rules(str(plan.get("symbol") or request_payload.get("symbol") or "ETHUSDC"))
+        return self._complete_execute_plan_groups(
+            run_id=run_id,
+            plan_version=plan_version,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            stored=stored,
+            close_price=close_price,
+            open_price=open_price,
+            fee_rate=fee_rate,
+            rules=execution_rules,
+            config=execution_config,
+            remember_idempotency=False,
+        )
+
+    def _complete_execute_plan_groups(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        idempotency_key: str,
+        request_hash: str,
+        stored: dict[str, Any],
+        close_price: Decimal,
+        open_price: Decimal,
+        fee_rate: Decimal,
+        rules: SymbolRules,
+        config: KanglongSymbolConfig,
+        remember_idempotency: bool,
+    ) -> dict[str, Any]:
         plan = stored.get("plan") or {}
         report = copy.deepcopy(stored.get("report") or {})
         request_payload = stored.get("request") or {}
         synthetic_accounts = _synthetic_account_baseline(report) if request_payload.get("account_source") == "test_template" else []
         groups = list(plan.get("groups") or [])
-        execution_rules = rules or _default_execution_rules(str(plan.get("symbol") or request_payload.get("symbol") or "ETHUSDC"))
-        execution_config = recheck_config or KanglongSymbolConfig()
+        execution_events: list[KanglongEvent] = []
+        execution_residuals: list[ResidualLedgerEntry] = []
         for group_index, group in enumerate(groups, start=1):
             group_id = group.get("group_id")
             group_plan = _group_plan_from_payload(group)
             result = simulate_group(
                 run_id=run_id,
                 group=group_plan,
-                rules=execution_rules,
+                rules=rules,
                 close_price=close_price,
                 open_price=open_price,
                 fee_rate=fee_rate,
-                config=execution_config,
+                config=config,
             )
+            execution_events.extend(result.events)
+            execution_residuals.extend(result.residual_ledger)
             if synthetic_accounts:
                 synthetic_issue = _synthetic_group_apply_issue(
                     synthetic_accounts,
@@ -931,6 +1169,15 @@ class KanglongSimulationService:
                     matched_qty=result.matched_qty,
                 )
                 if synthetic_issue is not None:
+                    _execution_report_with_actuals(
+                        report,
+                        events=execution_events,
+                        residuals=execution_residuals,
+                        close_price=close_price,
+                        open_price=open_price,
+                        fee_rate=fee_rate,
+                        status=KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+                    )
                     report["synthetic_ledger_error"] = _payloadify(synthetic_issue)
                     blocks = list(report.get("blocks") or [])
                     if "synthetic_ledger_inconsistent" not in blocks:
@@ -975,7 +1222,9 @@ class KanglongSimulationService:
                         result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
                         latest_event_id=self._repository.latest_kanglong_event_id(run_id),
                     )
-                    return self._remember_idempotency(idempotency_key, request_hash, response)
+                    if remember_idempotency:
+                        return self._remember_idempotency(idempotency_key, request_hash, response)
+                    return response
                 synthetic_accounts = _apply_group_result_to_synthetic_accounts(
                     synthetic_accounts,
                     group,
@@ -1030,8 +1279,53 @@ class KanglongSimulationService:
                     }
                 ],
             )
+            if _group_result_has_unsafe_residual(result, group_plan):
+                _execution_report_with_actuals(
+                    report,
+                    events=execution_events,
+                    residuals=execution_residuals,
+                    close_price=close_price,
+                    open_price=open_price,
+                    fee_rate=fee_rate,
+                    status=KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value,
+                )
+                blocks = list(report.get("blocks") or [])
+                if KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value not in blocks:
+                    blocks.append(KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value)
+                report["blocks"] = blocks
+                available_actions = ["recover"]
+                self._repository.update_kanglong_run(
+                    run_id,
+                    status=KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value,
+                    result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+                    available_actions=available_actions,
+                    progress=progress,
+                    report=report,
+                )
+                response = _response_base(
+                    run_id,
+                    KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value,
+                    plan_version=plan_version,
+                    snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+                    available_actions=available_actions,
+                    report=report,
+                    result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+                    latest_event_id=self._repository.latest_kanglong_event_id(run_id),
+                )
+                if remember_idempotency:
+                    return self._remember_idempotency(idempotency_key, request_hash, response)
+                return response
 
         available_actions = ["view_report"]
+        _execution_report_with_actuals(
+            report,
+            events=execution_events,
+            residuals=execution_residuals,
+            close_price=close_price,
+            open_price=open_price,
+            fee_rate=fee_rate,
+            status=KanglongRunStatus.COMPLETED.value,
+        )
         self._repository.update_kanglong_run(
             run_id,
             status=KanglongRunStatus.COMPLETED.value,
@@ -1050,7 +1344,81 @@ class KanglongSimulationService:
             result_grade=KanglongResultGrade.SAFE_CLOSED.value,
             latest_event_id=self._repository.latest_kanglong_event_id(run_id),
         )
-        return self._remember_idempotency(idempotency_key, request_hash, response)
+        if remember_idempotency:
+            return self._remember_idempotency(idempotency_key, request_hash, response)
+        return response
+
+    def mark_execution_failed(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        error: BaseException | str,
+    ) -> dict[str, Any]:
+        stored = self._repository.get_kanglong_run(run_id)
+        if stored is None:
+            return self._not_found(run_id, plan_version)
+        if stored.get("plan_version") != plan_version:
+            return self._blocked_plan_stale(run_id, plan_version, stored)
+        if stored.get("status") in {
+            KanglongRunStatus.COMPLETED.value,
+            KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+            KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value,
+            KanglongRunStatus.ABORT_RECOVERING.value,
+            KanglongRunStatus.ABORTED_RECOVERED.value,
+        }:
+            return _response_base(
+                run_id,
+                stored.get("status") or "",
+                plan_version=stored.get("plan_version") or plan_version,
+                snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+                available_actions=stored.get("available_actions") or [],
+                report=stored.get("report") or {},
+                result_grade=stored.get("result_grade"),
+                latest_event_id=self._repository.latest_kanglong_event_id(run_id),
+            )
+
+        failed_at = _now_text()
+        message = str(error) or error.__class__.__name__
+        error_type = error.__class__.__name__ if isinstance(error, BaseException) else "ExecutionError"
+        report = copy.deepcopy(stored.get("report") or {})
+        report["execution_error"] = {
+            "message": message,
+            "error_type": error_type,
+            "failed_at": failed_at,
+        }
+        blocks = list(report.get("blocks") or [])
+        if "kanglong_execution_failed" not in blocks:
+            blocks.append("kanglong_execution_failed")
+        report["blocks"] = blocks
+        available_actions = ["recover"]
+        event_payload = {
+            "message_key": "events.kanglong.execution_failed",
+            "message_params": {"error": message},
+            "error": message,
+            "error_type": error_type,
+            "failed_at": failed_at,
+            "plan_version": plan_version,
+        }
+        self._repository.update_kanglong_run_and_events(
+            run_id,
+            status=KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+            result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+            available_actions=available_actions,
+            progress=stored.get("progress") or {},
+            report=report,
+            events=[{"event_type": "kanglong_execution_failed", "payload": event_payload}],
+        )
+        return _response_base(
+            run_id,
+            KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+            plan_version=stored.get("plan_version") or plan_version,
+            snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+            available_actions=available_actions,
+            report=report,
+            result_grade=KanglongResultGrade.UNSAFE_UNCLOSED.value,
+            latest_event_id=self._repository.latest_kanglong_event_id(run_id),
+        )
 
     def recover_run_idempotency_response(
         self,
@@ -1097,6 +1465,7 @@ class KanglongSimulationService:
         if stored.get("status") not in {
             KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
             KanglongRunStatus.ABORT_RECOVERING.value,
+            KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value,
         }:
             return self._blocked_plan_recheck_failed(run_id, stored.get("plan_version") or "", stored)
 

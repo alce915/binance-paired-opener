@@ -74,6 +74,7 @@
   "single_close_session_completed": { "key": "events.single_close_session_completed", "level": "success" },
   "single_close_session_failed": { "key": "events.single_close_session_failed", "level": "error" },
   "kanglong.group_simulated": { "key": "events.kanglong.group_simulated", "level": "info" },
+  "kanglong.execution_failed": { "key": "events.kanglong.execution_failed", "level": "error" },
   "kanglong.synthetic_ledger_failed": { "key": "events.kanglong.synthetic_ledger_failed", "level": "error" },
   "kanglong.trade_executed": { "key": "events.kanglong.trade_executed", "level": "success" },
   "kanglong.round_completed": { "key": "events.kanglong.round_completed", "level": "success" },

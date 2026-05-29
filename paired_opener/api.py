@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from dataclasses import fields
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from app_i18n.runtime import DEFAULT_LOCALE, DEFAULT_TIMEZONE, format_copy, frontend_bootstrap_payload, make_api_detail
 from paired_opener.account_runtime import AccountRuntimeManager
 from paired_opener.config import DEFAULT_LEVERAGE, DEFAULT_TRADING_SYMBOL, Settings, settings
-from paired_opener.domain import ExchangeStateError, PositionSide, SessionConflictError
+from paired_opener.domain import ExchangeStateError, PositionSide, SessionConflictError, SymbolRules
 from paired_opener.errors import TradingError, ensure_trading_error, http_status_for_error, invalid_parameter_error
-from paired_opener.kanglong.config import load_kanglong_symbol_config
+from paired_opener.kanglong.config import KanglongSymbolConfig, load_kanglong_symbol_config
 from paired_opener.kanglong.service import KanglongSimulationService
 from paired_opener.kanglong.snapshots import build_snapshot_bundle
 from paired_opener.kanglong.test_templates import (
@@ -186,10 +187,110 @@ def _validate_template_run_not_stale(stored: dict[str, Any]) -> None:
         )
 
 
+async def _complete_kanglong_execution_in_background(service: Any, execute_kwargs: dict[str, Any]) -> None:
+    complete_execution = getattr(service, "complete_started_execution", None)
+    if not callable(complete_execution):
+        return
+    try:
+        await asyncio.to_thread(complete_execution, **execute_kwargs)
+    except Exception as exc:
+        mark_failed = getattr(service, "mark_execution_failed", None)
+        if callable(mark_failed):
+            try:
+                await asyncio.to_thread(
+                    mark_failed,
+                    run_id=execute_kwargs["run_id"],
+                    plan_version=execute_kwargs["plan_version"],
+                    error=exc,
+                )
+            except Exception as mark_exc:
+                print(f"Kanglong background failure marker failed: {mark_exc}", flush=True)
+        print(f"Kanglong background execution failed: {exc}", flush=True)
+
+
+_active_kanglong_background_runs: set[str] = set()
+
+
+def _schedule_kanglong_execution(service: Any, execute_kwargs: dict[str, Any]) -> None:
+    run_id = str(execute_kwargs.get("run_id") or "")
+    if not run_id or run_id in _active_kanglong_background_runs:
+        return
+    _active_kanglong_background_runs.add(run_id)
+    task = asyncio.create_task(_complete_kanglong_execution_in_background(service, dict(execute_kwargs)))
+    task.add_done_callback(lambda _task: _active_kanglong_background_runs.discard(run_id))
+
+
 def _api_text(value: object) -> str:
     if isinstance(value, Decimal):
         return str(value)
     return str(value or "")
+
+
+def _decimal_from_payload(value: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value if value is not None else default))
+    except Exception:
+        return Decimal(default)
+
+
+def _symbol_rules_from_payload(payload: Any, *, fallback_symbol: str) -> SymbolRules | None:
+    if not isinstance(payload, dict):
+        return None
+    return SymbolRules(
+        str(payload.get("symbol") or fallback_symbol or "ETHUSDC").strip().upper(),
+        _decimal_from_payload(payload.get("tick_size"), "0.01"),
+        _decimal_from_payload(payload.get("step_size"), "0.001"),
+        _decimal_from_payload(payload.get("min_qty"), "0.001"),
+        _decimal_from_payload(payload.get("min_notional"), "5"),
+        int(payload.get("max_leverage") or 125),
+    )
+
+
+def _kanglong_config_from_payload(payload: Any) -> KanglongSymbolConfig | None:
+    if not isinstance(payload, dict):
+        return None
+    values: dict[str, Any] = {}
+    for field in fields(KanglongSymbolConfig):
+        if field.name not in payload:
+            continue
+        raw_value = payload[field.name]
+        if isinstance(field.default, Decimal):
+            values[field.name] = _decimal_from_payload(raw_value, str(field.default))
+        else:
+            values[field.name] = int(raw_value)
+    return KanglongSymbolConfig(**values)
+
+
+def _started_kanglong_execution_kwargs(
+    *,
+    run_id: str,
+    request: KanglongActionRequest,
+    stored: dict[str, Any],
+) -> dict[str, Any] | None:
+    report = stored.get("report") or {}
+    context = report.get("execution_context") if isinstance(report, dict) else None
+    if not isinstance(context, dict):
+        return None
+    price_snapshot = context.get("price_snapshot") or {}
+    if not isinstance(price_snapshot, dict):
+        return None
+    stored_request = stored.get("request") or {}
+    symbol = str(stored_request.get("symbol") or stored.get("symbol") or "ETHUSDC").strip().upper()
+    execute_kwargs: dict[str, Any] = {
+        "run_id": run_id,
+        "plan_version": request.plan_version,
+        "idempotency_key": request.idempotency_key,
+        "close_price": _decimal_from_payload(price_snapshot.get("close_price")),
+        "open_price": _decimal_from_payload(price_snapshot.get("open_price")),
+        "fee_rate": _decimal_from_payload(price_snapshot.get("fee_rate")),
+    }
+    rules = _symbol_rules_from_payload(context.get("rules"), fallback_symbol=symbol)
+    config = _kanglong_config_from_payload(context.get("config"))
+    if rules is not None:
+        execute_kwargs["rules"] = rules
+    if config is not None:
+        execute_kwargs["recheck_config"] = config
+    return execute_kwargs
 
 
 def _position_side_from_payload(position: dict, qty: Decimal) -> str:
@@ -1065,6 +1166,7 @@ async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionR
 @app.post("/kanglong/simulation/plan/{run_id}/execute", response_model=KanglongPlanResponse)
 async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionRequest) -> KanglongPlanResponse:
     service = app.state.kanglong_service
+    stored = service.get_run(run_id)
     idempotency_lookup = getattr(service, "execute_plan_idempotency_response", None)
     if callable(idempotency_lookup):
         _, idempotency_response = idempotency_lookup(
@@ -1073,8 +1175,19 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
             idempotency_key=request.idempotency_key,
         )
         if idempotency_response is not None:
+            if (
+                idempotency_response.get("status") == "execution_starting"
+                and stored is not None
+                and stored.get("status") == "execution_starting"
+            ):
+                execute_kwargs = _started_kanglong_execution_kwargs(
+                    run_id=run_id,
+                    request=request,
+                    stored=stored,
+                )
+                if execute_kwargs is not None and callable(getattr(service, "complete_started_execution", None)):
+                    _schedule_kanglong_execution(service, execute_kwargs)
             return KanglongPlanResponse.model_validate(idempotency_response)
-    stored = service.get_run(run_id)
     if stored is not None:
         _validate_template_run_not_stale(stored)
     execute_kwargs = {
@@ -1144,7 +1257,14 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
                         "recheck_snapshot_bundle_id": inputs["snapshot_bundle_id"],
                     }
                 )
-    payload = service.execute_plan(**execute_kwargs)
+    start_execute = getattr(service, "start_execute_plan", None)
+    complete_execute = getattr(service, "complete_started_execution", None)
+    if callable(start_execute) and callable(complete_execute):
+        payload = start_execute(**execute_kwargs)
+        if payload.get("status") == "execution_starting":
+            _schedule_kanglong_execution(service, execute_kwargs)
+    else:
+        payload = service.execute_plan(**execute_kwargs)
     return KanglongPlanResponse.model_validate(payload)
 
 

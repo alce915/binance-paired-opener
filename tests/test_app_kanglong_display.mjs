@@ -174,8 +174,10 @@ function appSlice(start, end) {
 function makeKanglongHarness(requestImpl) {
   const kanglongHelpers = appSlice("function invalidateKanglongPlan()", "function renderKanglongSelectedSubaccounts");
   const actionHelper = appSlice("async function runKanglongWorkflowAction", "kanglongAddSelectedBtn?.addEventListener");
+  const intervalCallbacks = [];
   const sandbox = {
     __request: requestImpl,
+    __intervalCallbacks: intervalCallbacks,
     console,
     Date,
     Error,
@@ -185,6 +187,13 @@ function makeKanglongHarness(requestImpl) {
     Set,
     String,
     encodeURIComponent,
+    setInterval(handler) {
+      intervalCallbacks.push(handler);
+      return intervalCallbacks.length;
+    },
+    clearInterval(id) {
+      intervalCallbacks[Number(id) - 1] = null;
+    },
   };
   const script = `
     const DEFAULT_SYMBOL = "ETHUSDC";
@@ -257,6 +266,8 @@ function makeKanglongHarness(requestImpl) {
       realAccountPoolSnapshot: null,
     };
     let kanglongActiveRunRestored = false;
+    let activeKanglongExecutionPoller = null;
+    let activeKanglongExecutionPollInFlight = false;
     const kanglongConfirmPlanBtn = { disabled: false };
     const kanglongExecutePlanBtn = { disabled: false };
     const kanglongDetectPlanBtn = { disabled: false };
@@ -374,6 +385,11 @@ function makeKanglongHarness(requestImpl) {
       renderKanglongLogFilters,
       restoreActiveKanglongRun,
       runKanglongWorkflowAction,
+      runKanglongTimers: async () => {
+        for (const handler of globalThis.__intervalCallbacks.filter(Boolean)) {
+          await handler();
+        }
+      },
       setKanglongLogFilter,
       state: kanglongState,
       logs: appendLogEntries,
@@ -564,6 +580,78 @@ function makeKanglongHarness(requestImpl) {
   assert.equal(api.executionLog.children.length, 1, "completed execute should show the transfer event stream without a leading completed-only row");
   assert.ok(api.executionLog.textContent.includes("round 1 transferred 5"), "completed execute should surface transfer process events");
   assert.equal(api.executionLog.textContent.includes("completed"), false, "completed execute should not prepend a raw completed action result before process logs");
+}
+
+{
+  const calls = [];
+  const api = makeKanglongHarness(async (requestPath) => {
+    calls.push(requestPath);
+    if (requestPath === "/kanglong/simulation/plan/progress-run/execute") {
+      return {
+        run_id: "progress-run",
+        status: "execution_starting",
+        plan_version: "progress-plan",
+        snapshot_bundle_id: "snap-progress",
+        available_actions: [],
+        report: {},
+      };
+    }
+    if (requestPath === "/kanglong/simulation/run/progress-run/events?after_event_id=0") {
+      return {
+        run_id: "progress-run",
+        events: [
+          {
+            event_id: 1,
+            event_type: "kanglong_round_completed",
+            group_id: "group-0001",
+            round_id: "group-0001-round-0001",
+            payload: { trustedMessage: true, message: "round 1 transferred live" },
+          },
+        ],
+        next_after_event_id: 1,
+        latest_event_id: 1,
+        has_more: false,
+      };
+    }
+    if (requestPath === "/kanglong/simulation/run/progress-run/events?after_event_id=1") {
+      return {
+        run_id: "progress-run",
+        events: [],
+        next_after_event_id: 1,
+        latest_event_id: 1,
+        has_more: false,
+      };
+    }
+    assert.equal(requestPath, "/kanglong/simulation/run/progress-run");
+    return {
+      run_id: "progress-run",
+      status: "completed",
+      plan_version: "progress-plan",
+      available_actions: ["view_report"],
+      report: {},
+    };
+  });
+  api.state.plan = {
+    run_id: "progress-run",
+    status: "plan_confirmed",
+    plan_version: "progress-plan",
+    available_actions: ["execute", "refresh_plan"],
+  };
+  api.state.confirmedPlanVersion = "progress-plan";
+  api.state.latestEventId = 0;
+  api.state.seenEventIds.clear();
+
+  await api.runKanglongWorkflowAction(api.executeButton, api.executeKanglongPlan);
+  await api.runKanglongTimers();
+
+  assert.deepEqual(calls, [
+    "/kanglong/simulation/plan/progress-run/execute",
+    "/kanglong/simulation/run/progress-run/events?after_event_id=0",
+    "/kanglong/simulation/run/progress-run/events?after_event_id=1",
+    "/kanglong/simulation/run/progress-run",
+  ]);
+  assert.equal(api.state.plan.status, "completed", "execution poller should refresh the run after background completion");
+  assert.ok(api.executionLog.textContent.includes("round 1 transferred live"), "execution poller should keep surfacing process events");
 }
 
 {

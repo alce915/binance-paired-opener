@@ -528,6 +528,7 @@
   "reasons.kanglong.test_template.invalid_template": "测试模板内容无效，请检查账号、保证金、杠杆和仓位配置。",
   "reasons.kanglong.test_template.too_many_subaccounts": "测试模板子账号数量不能超过 50 个。",
   "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
+  "events.kanglong.execution_failed": "亢龙后台执行失败，已暂停等待人工恢复：{error}",
   "events.kanglong.synthetic_ledger_failed": "亢龙第 {group_id} 组账本校验失败，已暂停等待人工恢复：{reason}",
   "events.kanglong.trade_executed": "亢龙第 {group_id} 组第 {round_id} 轮{action_label}：{account_id} {symbol} {side} 成交 {filled_qty}，均价 {avg_price}，手续费 {fee}，状态 {status}",
   "events.kanglong.round_completed": "亢龙第 {group_id} 组第 {round_id} 轮完成，配对数量 {matched_qty}",

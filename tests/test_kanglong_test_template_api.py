@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 import pytest
@@ -13,6 +14,17 @@ from paired_opener.kanglong.service import KanglongSimulationService
 from paired_opener.kanglong.test_templates import KanglongTemplateStore
 from paired_opener.schemas import KanglongPlanRequest
 from paired_opener.storage import SqliteRepository
+
+
+def wait_for_kanglong_status(repository: SqliteRepository, run_id: str, statuses: set[str], timeout_s: float = 2.0) -> dict | None:
+    deadline = time.monotonic() + timeout_s
+    stored = repository.get_kanglong_run(run_id)
+    while time.monotonic() < deadline:
+        if stored is not None and stored.get("status") in statuses:
+            return stored
+        time.sleep(0.02)
+        stored = repository.get_kanglong_run(run_id)
+    return stored
 
 
 def template_payload(template_id: str = "tpl_eth_drop_001") -> dict:
@@ -432,15 +444,16 @@ def test_kanglong_template_execute_uses_market_data_without_rebuilding_template_
             f"/kanglong/simulation/plan/{created['run_id']}/execute",
             json={"plan_version": created["plan_version"], "idempotency_key": "execute-template-market-0001"},
         )
-        stored = repository.get_kanglong_run(created["run_id"])
+        stored = wait_for_kanglong_status(repository, created["run_id"], {"completed"})
     finally:
         repository.close()
 
     assert confirmed.status_code == 200
     assert response.status_code == 200
-    assert response.json()["status"] == "completed"
+    assert response.json()["status"] == "execution_starting"
     assert runtime_manager.build_calls == ["market-main", "market-main"]
     assert stored is not None
+    assert stored["status"] == "completed"
     synthetic_state = stored["report"]["synthetic_account_state"]
     assert [account["account_id"] for account in synthetic_state["accounts"]] == [
         "tpl:tpl_eth_drop_001:main",

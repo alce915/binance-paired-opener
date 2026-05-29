@@ -133,6 +133,7 @@ def test_kanglong_i18n_messages_and_registries_exist() -> None:
         "runtime.kanglong.request_failed",
         "runtime.kanglong.status.blocked_main_not_flat",
         "reasons.kanglong.blocked_main_not_flat",
+        "events.kanglong.execution_failed",
         "events.kanglong.synthetic_ledger_failed",
         "events.kanglong.round_completed",
         "events.kanglong.trade_executed",
@@ -143,6 +144,7 @@ def test_kanglong_i18n_messages_and_registries_exist() -> None:
 
     assert required_message_keys.issubset(catalog)
     assert reason_registry()["kanglong.blocked_main_not_flat"]["key"] == "reasons.kanglong.blocked_main_not_flat"
+    assert event_registry()["kanglong.execution_failed"]["key"] == "events.kanglong.execution_failed"
     assert event_registry()["kanglong.synthetic_ledger_failed"]["key"] == "events.kanglong.synthetic_ledger_failed"
     assert event_registry()["kanglong.round_completed"]["key"] == "events.kanglong.round_completed"
     assert event_registry()["kanglong.trade_executed"]["key"] == "events.kanglong.trade_executed"
