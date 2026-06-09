@@ -498,24 +498,25 @@ Use these error codes exactly:
 
 ### Task 9.1: Run Python verification
 
-- [ ] Run `python -m pytest tests/test_simulation_matching.py tests/test_simulation_service.py tests/test_simulation_api.py -q`.
-- [ ] Run `pytest tests/test_kanglong_ledger.py tests/test_kanglong_storage.py tests/test_kanglong_executor.py tests/test_kanglong_workflow_contracts.py -q`.
-- [ ] Run `python -m compileall paired_opener`.
+- [x] Run `python -m pytest tests/test_simulation_matching.py tests/test_simulation_service.py tests/test_simulation_api.py -q`.
+- [x] Run `python -m pytest tests/test_kanglong_ledger.py tests/test_kanglong_storage_workflow.py tests/test_kanglong_executor.py tests/test_kanglong_workflow_contracts.py -q`.
+- [x] Run `python -m compileall paired_opener`.
 
 ### Task 9.2: Run frontend verification
 
-- [ ] Run `node tests/test_app_kanglong_display.mjs`.
-- [ ] Run `node tests/test_app_simulation_payloads.mjs`.
-- [ ] Run `node tests/test_app_kanglong_test_templates.mjs`.
+- [x] Run `node tests/test_app_kanglong_display.mjs`.
+- [x] Run `node tests/test_app_simulation_payloads.mjs`.
+- [x] Run `node tests/test_app_kanglong_test_templates.mjs`.
 
 ### Task 9.3: Browser smoke
 
-- [ ] Start the local server using the repository's existing launch command.
-- [ ] Open `http://127.0.0.1:8000/`.
-- [ ] Select `ETHUSDC`.
-- [ ] Select migration direction `空`.
-- [ ] Confirm transfer settings show symbol `ETHUSDC`, mode `移仓`, side matching `空`, leverage `75X`, and read-only per-round quantity.
-- [ ] Enter transfer percent, round count, and interval.
+- [x] Start the local server using the repository's existing launch command.
+- [x] Open `http://127.0.0.1:8010/`.
+- [x] Select `ETHUSDC`.
+- [x] Select migration direction `空`.
+- [x] Confirm transfer settings show symbol `ETHUSDC`, mode `移仓`, side matching `空`, leverage `75X`, and read-only per-round quantity.
+- [x] Enter transfer percent, round count, and interval.
+- [ ] Local full-chain smoke is blocked because `/kanglong/simulation/accounts?symbol=ETHUSDC` only returns `default` with `snapshot_failed` / `Binance API 凭证未配置。`.
 - [ ] Run account status check.
 - [ ] Confirm the link button enables without reload.
 - [ ] Confirm link.
@@ -528,10 +529,10 @@ Use these error codes exactly:
 
 ### Task 9.4: Regression checks
 
-- [ ] Run `rg -n "tpl:|sub:|main:" paired_opener/static i18n tests` and inspect visible UI strings only.
-- [ ] Run `rg -n "simulate_group|GROUP_COMPLETED|ROUND_SIMULATED" paired_opener tests` and ensure remaining hits are legacy read-only compatibility or migration comments.
-- [ ] Run `rg -n "TO[D]O|TB[D]|implement [l]ater|fill in [d]etails|appropriate error [h]andling" docs/superpowers/plans/2026-06-09-kanglong-transfer-simulation-redesign-implementation.md paired_opener tests` and remove any vague implementation markers introduced by this work.
-- [ ] Run `git diff --check`.
+- [x] Run `rg -n "tpl:|sub:|main:" paired_opener/static i18n tests` and inspect visible UI strings only.
+- [x] Run `rg -n "simulate_group|GROUP_COMPLETED|ROUND_SIMULATED" paired_opener tests` and ensure remaining hits are legacy read-only compatibility or migration comments.
+- [x] Run `rg -n "TO[D]O|TB[D]|implement [l]ater|fill in [d]etails|appropriate error [h]andling" docs/superpowers/plans/2026-06-09-kanglong-transfer-simulation-redesign-implementation.md paired_opener tests` and remove any vague implementation markers introduced by this work.
+- [x] Run `git diff --check`.
 
 ---
 
