@@ -1,0 +1,58 @@
+[
+  {
+    "name": "full-close",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T12:00:00+00:00",
+    "bids": [["1000", "1.500"]],
+    "asks": [["1001", "1.500"]]
+  },
+  {
+    "name": "full-open",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T12:00:01+00:00",
+    "bids": [["1001", "1.500"]],
+    "asks": [["1002", "1.500"]]
+  },
+  {
+    "name": "partial-close",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T12:00:02+00:00",
+    "bids": [["1000", "1.000"]],
+    "asks": [["1001", "1.000"]]
+  },
+  {
+    "name": "partial-open",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T12:00:03+00:00",
+    "bids": [["1001", "0.400"]],
+    "asks": [["1002", "0.400"]]
+  },
+  {
+    "name": "supplemental-close",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T12:00:04+00:00",
+    "bids": [["1000", "0.500"]],
+    "asks": [["1001", "0.500"]]
+  },
+  {
+    "name": "supplemental-open",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T12:00:05+00:00",
+    "bids": [["1001", "0.500"]],
+    "asks": [["1002", "0.500"]]
+  },
+  {
+    "name": "zero-close",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T12:00:06+00:00",
+    "bids": [],
+    "asks": [["1001", "1.000"]]
+  },
+  {
+    "name": "stale-close",
+    "symbol": "ETHUSDC",
+    "event_time": "2026-06-09T11:59:00+00:00",
+    "bids": [["1000", "1.000"]],
+    "asks": [["1001", "1.000"]]
+  }
+]

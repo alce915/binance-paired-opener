@@ -318,48 +318,50 @@ Use these error codes exactly:
 
 ### Task 5.1: Add deterministic market fixture
 
-- [ ] Create `tests/fixtures/kanglong_market/ethusdc_rounds.json`.
-- [ ] Include at least six orderbook snapshots for `ETHUSDC`.
-- [ ] Include one fully filled round.
-- [ ] Include one passive-limit zero-fill round.
-- [ ] Include one partial-fill round that needs supplemental execution.
-- [ ] Include one stale timestamp snapshot.
+- [x] Create `tests/fixtures/kanglong_market/ethusdc_rounds.json`.
+- [x] Include at least six orderbook snapshots for `ETHUSDC`.
+- [x] Include one fully filled round.
+- [x] Include one passive-limit zero-fill round.
+- [x] Include one partial-fill round that needs supplemental execution.
+- [x] Include one stale timestamp snapshot.
 
 ### Task 5.2: Add executor tests
 
-- [ ] Create `tests/test_kanglong_executor.py`.
-- [ ] Add `test_transfer_round_closes_source_and_opens_target_with_same_filled_qty`.
-- [ ] Add `test_partial_second_leg_records_residual_and_supplemental_round`.
-- [ ] Add `test_zero_fill_round_waits_for_interval_and_keeps_state_running`.
-- [ ] Add `test_max_consecutive_unfilled_pauses_market_unstable`.
-- [ ] Add `test_max_events_per_run_pauses_with_final_warning_report`.
-- [ ] Add `test_operation_retry_is_idempotent_for_same_payload_hash`.
-- [ ] Add `test_operation_retry_with_changed_payload_enters_needs_abort_recover`.
-- [ ] Add `test_pause_request_stops_after_current_round_checkpoint`.
-- [ ] Add `test_stop_request_records_stopped_by_user_without_new_market_orders`.
-- [ ] Run `pytest tests/test_kanglong_executor.py -q` and verify these tests fail.
+- [x] Create `tests/test_kanglong_executor.py`.
+- [x] Add `test_transfer_round_closes_source_and_opens_target_with_same_filled_qty`.
+- [x] Add `test_partial_second_leg_records_residual_and_supplemental_round`.
+- [x] Add `test_supplemental_round_completes_previous_residual`.
+- [x] Add `test_zero_fill_round_waits_for_interval_and_keeps_state_running`.
+- [x] Add `test_stale_market_data_pauses_market_unstable`.
+- [x] Add `test_max_consecutive_unfilled_pauses_market_unstable`.
+- [x] Add `test_max_events_per_run_pauses_with_final_warning_report`.
+- [x] Add `test_operation_retry_is_idempotent_for_same_payload_hash`.
+- [x] Add `test_operation_retry_with_changed_payload_enters_needs_abort_recover`.
+- [x] Add `test_pause_request_stops_after_current_round_checkpoint`.
+- [x] Add `test_stop_request_records_stopped_by_user_without_new_market_orders`.
+- [x] Run `pytest tests/test_kanglong_executor.py -q` and verify these tests fail.
 
 ### Task 5.3: Create executor class
 
-- [ ] Create `paired_opener/kanglong/executor.py`.
-- [ ] Add `KanglongTransferExecutor`.
-- [ ] Constructor dependencies: storage, market data provider, orderbook matcher, clock, fee policy snapshot, execution config.
-- [ ] Use `operation_id = run_id + group_id + round_id + round_attempt`.
-- [ ] Store `operation_payload_hash` before mutating ledger state.
-- [ ] Read the newest orderbook snapshot for the source close leg.
-- [ ] Read a fresh orderbook snapshot for the target open leg.
-- [ ] Match source close and target open through the shared matcher.
-- [ ] Use the smaller filled quantity as the aligned transfer quantity when one leg partially fills.
-- [ ] Persist residual quantities for supplemental rounds.
-- [ ] Persist fee and price-wear entries per leg.
+- [x] Create `paired_opener/kanglong/executor.py`.
+- [x] Add `KanglongTransferExecutor`.
+- [x] Constructor dependencies: storage, market data provider, orderbook matcher, clock, fee policy snapshot, execution config.
+- [x] Use `operation_id = run_id + group_id + round_id + round_attempt`.
+- [x] Store `operation_payload_hash` before mutating ledger state.
+- [x] Read the newest orderbook snapshot for the source close leg.
+- [x] Read a fresh orderbook snapshot for the target open leg.
+- [x] Match source close and target open through the shared matcher.
+- [x] Use the smaller filled quantity as the aligned transfer quantity when one leg partially fills.
+- [x] Persist residual quantities for supplemental rounds.
+- [x] Persist fee and price-wear entries per leg.
 
 ### Task 5.4: Reuse simulation supplemental mechanism
 
-- [ ] Map configured `round_count` to the per-round transfer cap only.
-- [ ] Allow supplemental attempts after a configured round when residual remains.
+- [x] Map configured `round_count` to the per-round transfer cap only.
+- [x] Allow supplemental attempts after a configured round when residual remains.
 - [ ] Enforce defaults: per group `max_supplemental_rounds_per_group=50`, per run `max_supplemental_rounds_per_run=300`, consecutive unfilled `5`, max duration `21600`, max events `20000`.
 - [ ] On supplemental limit, transition to `paused_market_unstable` with `recover` action available.
-- [ ] On event limit, write a warning event, checkpoint it, generate report summary, and transition to `paused_market_unstable`.
+- [x] On event limit, write a warning event, checkpoint it, generate report summary, and transition to `paused_market_unstable`.
 
 ### Task 5.5: Replace static group completion
 
