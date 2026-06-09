@@ -418,6 +418,45 @@ async def test_kanglong_background_worker_failure_is_marked_recoverable() -> Non
 
 
 @pytest.mark.asyncio
+async def test_kanglong_background_worker_prefers_market_executor() -> None:
+    class MarketExecutionService:
+        def __init__(self) -> None:
+            self.market_calls: list[dict] = []
+            self.static_completion_called = False
+
+        async def run_market_execution(self, **kwargs) -> dict:
+            self.market_calls.append(kwargs)
+            return {"run_id": kwargs["run_id"], "status": "running"}
+
+        def complete_started_execution(self, **kwargs) -> dict:
+            self.static_completion_called = True
+            raise AssertionError("market executor should replace static completion")
+
+        def mark_execution_failed(self, **kwargs) -> dict:
+            raise AssertionError(f"market execution should not fail: {kwargs}")
+
+    marker_market_data = object()
+    service = MarketExecutionService()
+
+    await api_module._complete_kanglong_execution_in_background(
+        service,
+        {
+            "run_id": "run-market-worker",
+            "plan_version": "plan-market-worker",
+            "idempotency_key": "execute-market-worker",
+            "close_price": Decimal("3100.00"),
+            "open_price": Decimal("3100.50"),
+            "fee_rate": Decimal("0.0005"),
+            "market_data": marker_market_data,
+        },
+    )
+
+    assert service.market_calls
+    assert service.market_calls[0]["market_data"] is marker_market_data
+    assert service.static_completion_called is False
+
+
+@pytest.mark.asyncio
 async def test_kanglong_execute_idempotent_starting_response_reschedules_worker() -> None:
     class StartingIdempotencyService:
         def __init__(self) -> None:

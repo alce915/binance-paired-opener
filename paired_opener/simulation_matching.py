@@ -101,6 +101,41 @@ class DeterministicMarketDataProvider:
         return snapshot
 
 
+class GatewayMarketDataProvider:
+    def __init__(
+        self,
+        gateway: Any,
+        *,
+        now: Callable[[], datetime] | None = None,
+        max_age_seconds: int = ORDERBOOK_MAX_AGE_SECONDS,
+        limit: int = 20,
+    ) -> None:
+        self._gateway = gateway
+        self._now = now or (lambda: datetime.now(UTC))
+        self._max_age_seconds = max_age_seconds
+        self._limit = max(int(limit), 5)
+
+    async def get_orderbook(self, symbol: str) -> OrderbookSnapshot:
+        snapshot = await self._load_fresh_orderbook(symbol, refresh=False)
+        if snapshot is not None:
+            return snapshot
+        snapshot = await self._load_fresh_orderbook(symbol, refresh=True)
+        if snapshot is not None:
+            return snapshot
+        raise MarketDataStaleError(f"stale orderbook for {symbol}")
+
+    async def _load_fresh_orderbook(self, symbol: str, *, refresh: bool) -> OrderbookSnapshot | None:
+        raw_snapshot = (
+            await self._gateway.refresh_order_book(symbol, limit=self._limit)
+            if refresh
+            else await self._gateway.get_order_book(symbol, limit=self._limit)
+        )
+        snapshot = OrderbookSnapshot.from_mapping(raw_snapshot, source="gateway")
+        if not orderbook_is_fresh(snapshot.event_time, now=self._now(), max_age_seconds=self._max_age_seconds):
+            return None
+        return snapshot
+
+
 class OrderbookMatcher:
     def __init__(
         self,

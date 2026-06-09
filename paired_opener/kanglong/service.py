@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
+from paired_opener.kanglong.executor import KanglongTransferExecutor, KanglongTransferExecutorConfig
 from paired_opener.kanglong.models import (
     KanglongAccountSnapshot,
     KanglongEvent,
@@ -30,6 +32,7 @@ from paired_opener.kanglong.precheck import run_static_precheck
 from paired_opener.kanglong.reporter import summarize_costs
 from paired_opener.kanglong.simulator import simulate_group
 from paired_opener.rounding import normalize_qty
+from paired_opener.simulation_matching import MarketDataProvider, OrderbookMatcher
 from paired_opener.storage import SqliteRepository
 
 _DEFAULT_SYNTHETIC_LEVERAGE = 1
@@ -42,6 +45,25 @@ class _ExecutionStart:
     response: dict[str, Any]
     rules: SymbolRules
     config: KanglongSymbolConfig
+
+
+_MARKET_EXECUTION_ACTIVE_STATUSES = {
+    KanglongRunStatus.EXECUTION_STARTING.value,
+    "running",
+    "pause_pending",
+    "stop_pending",
+}
+
+_MARKET_EXECUTION_TERMINAL_STATUSES = {
+    KanglongRunStatus.COMPLETED.value,
+    "paused_by_user",
+    "paused_market_unstable",
+    "stopped_by_user",
+    KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+    KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value,
+    KanglongRunStatus.BLOCKED_PLAN_STALE.value,
+    KanglongRunStatus.BLOCKED_PLAN_RECHECK_FAILED.value,
+}
 
 
 def _now_text() -> str:
@@ -362,6 +384,21 @@ def _default_execution_rules(symbol: str) -> SymbolRules:
         Decimal("5"),
         125,
     )
+
+
+def _market_execution_interval_seconds(stored: dict[str, Any], config: KanglongSymbolConfig) -> int:
+    _ = config
+    request_payload = stored.get("request") or {}
+    transfer_settings = request_payload.get("transfer_settings")
+    if not isinstance(transfer_settings, dict):
+        report = stored.get("report") or {}
+        transfer_settings = report.get("transfer_settings") if isinstance(report, dict) else None
+    if isinstance(transfer_settings, dict):
+        try:
+            return max(int(transfer_settings.get("round_interval_seconds", 3)), 0)
+        except Exception:
+            return 3
+    return 3
 
 
 def _group_plan_from_payload(group: dict[str, Any]) -> KanglongGroupPlan:
@@ -1513,6 +1550,145 @@ class KanglongSimulationService:
         if remember_idempotency:
             return self._remember_idempotency(idempotency_key, request_hash, response)
         return response
+
+    async def run_market_execution(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        idempotency_key: str,
+        market_data: MarketDataProvider,
+        rules: SymbolRules | None = None,
+        fee_rate: Decimal | None = None,
+        recheck_config: KanglongSymbolConfig | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        max_steps: int | None = None,
+        worker_id: str = "kanglong-market-executor",
+        **_: Any,
+    ) -> dict[str, Any]:
+        _ = idempotency_key
+        stored = self._repository.get_kanglong_run(run_id)
+        if stored is None:
+            return self._not_found(run_id, plan_version)
+        if stored.get("plan_version") != plan_version:
+            return self._blocked_plan_stale(run_id, plan_version, stored)
+        if stored.get("status") in _MARKET_EXECUTION_TERMINAL_STATUSES:
+            return self._response_for_stored_run(stored, requested_plan_version=plan_version)
+        if stored.get("status") not in _MARKET_EXECUTION_ACTIVE_STATUSES:
+            return self._blocked_plan_recheck_failed(run_id, plan_version, stored)
+
+        execution_config = recheck_config or KanglongSymbolConfig()
+        interval_seconds = _market_execution_interval_seconds(stored, execution_config)
+        lease_ttl_seconds = max(
+            30,
+            int(execution_config.run_lock_ttl_ms / 1000),
+            interval_seconds * 3 + 10,
+        )
+        lease = self._repository.acquire_kanglong_run_lease(
+            run_id=run_id,
+            worker_id=worker_id,
+            ttl_seconds=lease_ttl_seconds,
+        )
+        if lease.get("conflict"):
+            latest = self._repository.get_kanglong_run(run_id) or stored
+            return self._response_for_stored_run(latest, requested_plan_version=plan_version)
+
+        sleep_fn = sleep or asyncio.sleep
+        symbol = str((stored.get("plan") or {}).get("symbol") or stored.get("symbol") or "ETHUSDC")
+        execution_rules = rules or _default_execution_rules(symbol)
+        frozen_fee_rate = Decimal(str(fee_rate if fee_rate is not None else execution_config.fee_rate))
+        matcher = OrderbookMatcher(maker_fee_rate=frozen_fee_rate, taker_fee_rate=frozen_fee_rate)
+        executor = KanglongTransferExecutor(
+            repository=self._repository,
+            market_data=market_data,
+            matcher=matcher,
+            rules=execution_rules,
+            config=KanglongTransferExecutorConfig(round_interval_seconds=interval_seconds),
+            fee_policy_snapshot={
+                "fee_rate": decimal_text(frozen_fee_rate),
+                "settlement": "unified_account_direct_deduction",
+            },
+        )
+        steps = 0
+        response: dict[str, Any] = self._response_for_stored_run(stored, requested_plan_version=plan_version)
+        try:
+            while True:
+                latest = self._repository.get_kanglong_run(run_id)
+                if latest is None:
+                    return self._not_found(run_id, plan_version)
+                if latest.get("plan_version") != plan_version:
+                    return self._blocked_plan_stale(run_id, plan_version, latest)
+                status = str(latest.get("status") or "")
+                if status in _MARKET_EXECUTION_TERMINAL_STATUSES:
+                    response = self._response_for_stored_run(latest, requested_plan_version=plan_version)
+                    break
+                if status not in _MARKET_EXECUTION_ACTIVE_STATUSES:
+                    response = self._blocked_plan_recheck_failed(run_id, plan_version, latest)
+                    break
+
+                self._repository.heartbeat_kanglong_locks(
+                    run_id=run_id,
+                    ttl_ms=execution_config.run_lock_ttl_ms,
+                )
+                renewed = self._repository.renew_kanglong_run_lease(
+                    run_id=run_id,
+                    lease_token=str(lease["lease_token"]),
+                    fencing_token=str(lease["fencing_token"]),
+                    ttl_seconds=lease_ttl_seconds,
+                )
+                if renewed is None:
+                    latest = self._repository.get_kanglong_run(run_id) or latest
+                    response = self._response_for_stored_run(latest, requested_plan_version=plan_version)
+                    break
+
+                await executor.run_next(run_id)
+                steps += 1
+                latest = self._repository.get_kanglong_run(run_id)
+                if latest is None:
+                    return self._not_found(run_id, plan_version)
+                response = self._response_for_stored_run(latest, requested_plan_version=plan_version)
+                latest_status = str(latest.get("status") or "")
+                if latest_status in _MARKET_EXECUTION_TERMINAL_STATUSES:
+                    break
+                if max_steps is not None and steps >= max_steps:
+                    break
+                if interval_seconds > 0:
+                    await sleep_fn(float(interval_seconds))
+        finally:
+            self._repository.release_kanglong_run_lease(
+                run_id=run_id,
+                lease_token=str(lease["lease_token"]),
+                fencing_token=str(lease["fencing_token"]),
+            )
+
+        final_status = str((self._repository.get_kanglong_run(run_id) or {}).get("status") or response.get("status") or "")
+        if final_status in {
+            KanglongRunStatus.COMPLETED.value,
+            "stopped_by_user",
+            KanglongRunStatus.NEEDS_ABORT_RECOVER.value,
+            KanglongRunStatus.UNSAFE_DUST_RESIDUAL.value,
+        }:
+            self._repository.release_kanglong_locks(run_id)
+        return response
+
+    def _response_for_stored_run(
+        self,
+        stored: dict[str, Any],
+        *,
+        requested_plan_version: str | None = None,
+    ) -> dict[str, Any]:
+        run_id = str(stored.get("run_id") or "")
+        return _response_base(
+            run_id,
+            str(stored.get("status") or ""),
+            plan_version=stored.get("plan_version") or requested_plan_version,
+            snapshot_bundle_id=stored.get("snapshot_bundle_id"),
+            available_actions=stored.get("available_actions") or [],
+            report=stored.get("report") or {},
+            result_grade=stored.get("result_grade"),
+            requested_plan_version=requested_plan_version,
+            latest_event_id=self._repository.latest_kanglong_event_id(run_id) if run_id else 0,
+        )
 
     def mark_execution_failed(
         self,

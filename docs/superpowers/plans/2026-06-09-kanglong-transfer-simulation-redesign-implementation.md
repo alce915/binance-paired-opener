@@ -367,9 +367,9 @@ Use these error codes exactly:
 
 - [ ] In `paired_opener/kanglong/simulator.py`, remove static instant group completion for engine version 2.
 - [ ] Keep a compatibility function that reads old engine version 1 data and returns a read-only report.
-- [ ] Route engine version 2 execute/resume calls to `KanglongTransferExecutor`.
-- [ ] Ensure execution logs show round-level entries over time instead of all groups completing in one timestamp.
-- [ ] Run `pytest tests/test_kanglong_executor.py tests/test_kanglong_workflow_contracts.py -q`.
+- [x] Route engine version 2 execute/resume calls to `KanglongTransferExecutor`.
+- [x] Ensure execution logs show round-level entries over time instead of all groups completing in one timestamp.
+- [x] Run `pytest tests/test_kanglong_executor.py tests/test_kanglong_workflow_contracts.py -q`.
 
 ---
 

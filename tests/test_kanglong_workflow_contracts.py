@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -15,6 +16,11 @@ from paired_opener.schemas import (
     KanglongEventsResponse,
     KanglongPlanRequest,
     KanglongPlanResponse,
+)
+from paired_opener.simulation_matching import (
+    DeterministicMarketDataProvider,
+    OrderbookLevel,
+    OrderbookSnapshot,
 )
 from paired_opener.storage import SqliteRepository
 from tests.test_kanglong_precheck import snapshot
@@ -598,6 +604,87 @@ def test_service_start_execute_leaves_run_in_progress_before_worker_completion(t
     assert stored is not None
     assert stored["status"] == "execution_starting"
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_service_market_execution_advances_one_round_without_static_completion(tmp_path) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    market_data = DeterministicMarketDataProvider(
+        [
+            OrderbookSnapshot(
+                symbol="ETHUSDC",
+                bids=[OrderbookLevel(price=Decimal("3100.00"), qty=Decimal("10"))],
+                asks=[OrderbookLevel(price=Decimal("3100.50"), qty=Decimal("10"))],
+                event_time=now,
+                source="close",
+            ),
+            OrderbookSnapshot(
+                symbol="ETHUSDC",
+                bids=[OrderbookLevel(price=Decimal("3100.00"), qty=Decimal("10"))],
+                asks=[OrderbookLevel(price=Decimal("3100.50"), qty=Decimal("10"))],
+                event_time=now,
+                source="open",
+            ),
+        ],
+        now=lambda: now,
+    )
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(
+            service,
+            run_id="run-market-executor",
+            transfer_settings={
+                "transfer_percent": Decimal("50"),
+                "round_count": 4,
+                "round_interval_seconds": 3,
+            },
+        )
+        service.confirm_plan(
+            run_id="run-market-executor",
+            plan_version=plan["plan_version"],
+            idempotency_key="confirm-market-executor-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        service.start_execute_plan(
+            run_id="run-market-executor",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-market-executor-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+            rules=_rules(),
+        )
+        advanced = await service.run_market_execution(
+            run_id="run-market-executor",
+            plan_version=plan["plan_version"],
+            idempotency_key="execute-market-executor-0001",
+            market_data=market_data,
+            rules=_rules(),
+            fee_rate=Decimal("0.0005"),
+            recheck_config=KanglongSymbolConfig(),
+            max_steps=1,
+            sleep=no_sleep,
+        )
+        stored = repository.get_kanglong_run("run-market-executor")
+        events = service.list_events("run-market-executor", after_event_id=0, limit=20)["events"]
+        checkpoint_count = repository._connection.execute(
+            "SELECT COUNT(*) AS count FROM kanglong_run_checkpoints WHERE run_id = ?",
+            ("run-market-executor",),
+        ).fetchone()["count"]
+    finally:
+        repository.close()
+
+    assert advanced["status"] == "running"
+    assert stored is not None
+    assert stored["status"] == "running"
+    assert checkpoint_count == 1
+    assert any(event["event_type"] == "kanglong_round_completed" for event in events)
+    assert not any(event["event_type"] == "kanglong_group_simulated" for event in events)
 
 
 def test_service_marks_started_execution_failure_recoverable(tmp_path) -> None:

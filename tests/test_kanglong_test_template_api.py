@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -183,11 +184,13 @@ class FakeTemplateMarketGateway:
         self.calls.append(("quote", symbol))
         return Quote(symbol, Decimal("2443.20"), Decimal("2443.22"))
 
-    async def get_order_book(self, symbol):
+    async def get_order_book(self, symbol, limit: int = 10):
         self.calls.append(("orderbook", symbol))
         return {
+            "symbol": symbol,
             "bids": [{"price": Decimal("2443.19"), "qty": Decimal("12")}],
             "asks": [{"price": Decimal("2443.23"), "qty": Decimal("13")}],
+            "event_time": datetime.now(UTC).isoformat(),
         }
 
     async def close(self):
@@ -444,21 +447,19 @@ def test_kanglong_template_execute_uses_market_data_without_rebuilding_template_
             f"/kanglong/simulation/plan/{created['run_id']}/execute",
             json={"plan_version": created["plan_version"], "idempotency_key": "execute-template-market-0001"},
         )
-        stored = wait_for_kanglong_status(repository, created["run_id"], {"completed"})
+        stored = wait_for_kanglong_status(repository, created["run_id"], {"running", "completed"})
+        events = repository.list_kanglong_events(created["run_id"], after_event_id=0, limit=20)["events"]
     finally:
         repository.close()
 
     assert confirmed.status_code == 200
     assert response.status_code == 200
     assert response.json()["status"] == "execution_starting"
-    assert runtime_manager.build_calls == ["market-main", "market-main"]
+    assert runtime_manager.build_calls == ["market-main", "market-main", "market-main"]
     assert stored is not None
-    assert stored["status"] == "completed"
-    synthetic_state = stored["report"]["synthetic_account_state"]
-    assert [account["account_id"] for account in synthetic_state["accounts"]] == [
-        "tpl:tpl_eth_drop_001:main",
-        "tpl:tpl_eth_drop_001:sub:sub-1",
-    ]
+    assert stored["status"] in {"running", "completed"}
+    assert any(event["event_type"] == "kanglong_round_completed" for event in events)
+    assert not any(event["event_type"] == "kanglong_group_simulated" for event in events)
 
 
 def test_kanglong_template_execution_snapshots_restore_non_default_leverage(monkeypatch, tmp_path) -> None:

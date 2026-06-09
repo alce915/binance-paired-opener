@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import inspect
 import json
 from contextlib import asynccontextmanager
 from dataclasses import fields
@@ -70,6 +71,7 @@ from paired_opener.schemas import (
 )
 from paired_opener.service import SessionPrecheckFailed
 from paired_opener.simulation import SimulationError
+from paired_opener.simulation_matching import GatewayMarketDataProvider
 from paired_opener.storage import SqliteRepository
 
 STATIC_DIR = Path(__file__).with_name('static')
@@ -187,11 +189,49 @@ def _validate_template_run_not_stale(stored: dict[str, Any]) -> None:
         )
 
 
-async def _complete_kanglong_execution_in_background(service: Any, execute_kwargs: dict[str, Any]) -> None:
-    complete_execution = getattr(service, "complete_started_execution", None)
-    if not callable(complete_execution):
+def _kanglong_execution_market_data_account_id(stored: dict[str, Any] | None, execute_kwargs: dict[str, Any]) -> str:
+    explicit = str(execute_kwargs.get("market_data_account_id") or "").strip()
+    if explicit:
+        return explicit
+    request_payload = (stored or {}).get("request") or {}
+    if request_payload.get("account_source") == "test_template":
+        return str(request_payload.get("market_data_account_id") or "").strip()
+    return str(request_payload.get("main_account_id") or (stored or {}).get("main_account_id") or "").strip()
+
+
+async def _run_kanglong_market_execution_in_background(service: Any, execute_kwargs: dict[str, Any]) -> None:
+    run_market_execution = getattr(service, "run_market_execution", None)
+    if not callable(run_market_execution):
         return
+    runner_kwargs = dict(execute_kwargs)
+    gateway = None
     try:
+        if runner_kwargs.get("market_data") is None:
+            get_run = getattr(service, "get_run", None)
+            stored = get_run(str(runner_kwargs.get("run_id") or "")) if callable(get_run) else None
+            market_data_account_id = _kanglong_execution_market_data_account_id(stored, runner_kwargs)
+            runtime_manager: AccountRuntimeManager | None = getattr(app.state, "runtime_manager", None)
+            if runtime_manager is None or not market_data_account_id:
+                raise RuntimeError("kanglong_market_data_account_unavailable")
+            gateway = runtime_manager.build_temporary_gateway(market_data_account_id)
+            runner_kwargs["market_data"] = GatewayMarketDataProvider(gateway)
+        result = run_market_execution(**runner_kwargs)
+        if inspect.isawaitable(result):
+            await result
+    finally:
+        if gateway is not None:
+            await gateway.close()
+
+
+async def _complete_kanglong_execution_in_background(service: Any, execute_kwargs: dict[str, Any]) -> None:
+    try:
+        run_market_execution = getattr(service, "run_market_execution", None)
+        if callable(run_market_execution):
+            await _run_kanglong_market_execution_in_background(service, execute_kwargs)
+            return
+        complete_execution = getattr(service, "complete_started_execution", None)
+        if not callable(complete_execution):
+            return
         await asyncio.to_thread(complete_execution, **execute_kwargs)
     except Exception as exc:
         mark_failed = getattr(service, "mark_execution_failed", None)
