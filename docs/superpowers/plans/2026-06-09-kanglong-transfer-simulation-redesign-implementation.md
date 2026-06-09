@@ -416,28 +416,28 @@ Use these error codes exactly:
 
 ### Task 7.1: Add report tests
 
-- [ ] In `tests/test_kanglong_workflow_contracts.py` or a new `tests/test_kanglong_reporter.py`, add `test_report_summary_records_fee_total_by_asset`.
-- [ ] Add `test_report_summary_records_price_wear_by_group_and_total`.
-- [ ] Add `test_report_summary_records_source_checkpoint_hashes`.
-- [ ] Add `test_report_generation_rejects_ledger_hash_mismatch`.
-- [ ] Run the report tests and verify they fail.
+- [x] In `tests/test_kanglong_workflow_contracts.py` or a new `tests/test_kanglong_reporter.py`, add `test_report_summary_records_fee_total_by_asset`.
+- [x] Add `test_report_summary_records_price_wear_by_group_and_total`.
+- [x] Add `test_report_summary_records_source_checkpoint_hashes`.
+- [x] Add `test_report_generation_rejects_ledger_hash_mismatch`.
+- [x] Run the report tests and verify they fail.
 
 ### Task 7.2: Update reporter contract
 
-- [ ] In `paired_opener/kanglong/reporter.py`, compute total fee from committed `fee` ledger entries.
-- [ ] Compute price wear from committed `price_wear` ledger entries.
-- [ ] Keep fee values in the actual fee asset deducted by the unified account.
-- [ ] Convert reporting display values only when an exchange-rate snapshot is present.
-- [ ] If conversion is unavailable, return raw asset totals and warning code `kanglong_conversion_unavailable`.
-- [ ] Add `report_version`, `generated_from_checkpoint_id`, `source_ledger_hash`, `source_ledger_state_hash`, `generated_at`, and `summary_status`.
+- [x] In `paired_opener/kanglong/reporter.py`, compute total fee from committed `fee` ledger entries.
+- [x] Compute price wear from committed `price_wear` ledger entries.
+- [x] Keep fee values in the actual fee asset deducted by the unified account.
+- [x] Convert reporting display values only when an exchange-rate snapshot is present.
+- [x] If conversion is unavailable, return raw asset totals and warning code `kanglong_conversion_unavailable`.
+- [x] Add `report_version`, `generated_from_checkpoint_id`, `source_ledger_hash`, `source_ledger_state_hash`, `generated_at`, and `summary_status`.
 
 ### Task 7.3: Freeze report source at checkpoint
 
-- [ ] Generate report summary from the latest safe checkpoint.
-- [ ] Store `report_summary_json` on `kanglong_runs`.
+- [x] Generate report summary from the latest safe checkpoint.
+- [x] Store `report_summary_json` on `kanglong_runs`.
 - [ ] Add a ledger `report` entry linking the summary to checkpoint id and hashes.
-- [ ] Reject report regeneration if stored checkpoint hash differs from recalculated hash.
-- [ ] Run `pytest tests/test_kanglong_ledger.py tests/test_kanglong_workflow_contracts.py -q`.
+- [x] Reject report regeneration if stored checkpoint hash differs from recalculated hash.
+- [x] Run `pytest tests/test_kanglong_ledger.py tests/test_kanglong_workflow_contracts.py -q`.
 
 ---
 

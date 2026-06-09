@@ -30,7 +30,7 @@ from paired_opener.kanglong.models import (
 )
 from paired_opener.kanglong.planner import KanglongGroupRoundLimitExceeded, build_kanglong_plan, build_planning_accounts
 from paired_opener.kanglong.precheck import run_static_precheck
-from paired_opener.kanglong.reporter import summarize_costs
+from paired_opener.kanglong.reporter import build_ledger_report, summarize_costs
 from paired_opener.kanglong.simulator import simulate_group
 from paired_opener.rounding import normalize_qty
 from paired_opener.simulation_matching import MarketDataProvider, OrderbookMatcher
@@ -1647,6 +1647,10 @@ class KanglongSimulationService:
                 latest = self._repository.get_kanglong_run(run_id)
                 if latest is None:
                     return self._not_found(run_id, plan_version)
+                self._refresh_market_execution_report(run_id, status=str(latest.get("status") or ""))
+                latest = self._repository.get_kanglong_run(run_id)
+                if latest is None:
+                    return self._not_found(run_id, plan_version)
                 response = self._response_for_stored_run(latest, requested_plan_version=plan_version)
                 latest_status = str(latest.get("status") or "")
                 if latest_status in _MARKET_EXECUTION_TERMINAL_STATUSES:
@@ -1671,6 +1675,36 @@ class KanglongSimulationService:
         }:
             self._repository.release_kanglong_locks(run_id)
         return response
+
+    def _refresh_market_execution_report(self, run_id: str, *, status: str) -> None:
+        stored = self._repository.get_kanglong_run(run_id)
+        if stored is None:
+            return
+        entries = self._repository.list_kanglong_ledger_entries(run_id)
+        baselines = self._repository.list_kanglong_ledger_baselines(run_id)
+        latest_checkpoint = self._repository.latest_kanglong_checkpoint(run_id)
+        symbol = str((stored.get("plan") or {}).get("symbol") or stored.get("symbol") or "ETHUSDC")
+        ledger_report = build_ledger_report(
+            entries,
+            baselines=baselines,
+            latest_checkpoint=latest_checkpoint,
+            summary_status=status,
+            symbol=symbol,
+        )
+        costs = ledger_report["costs"]
+        report = copy.deepcopy(stored.get("report") or {})
+        report["costs"] = _payloadify(costs)
+        report["ledger_report"] = _payloadify(ledger_report["ledger_report"])
+        report_summary = dict(stored.get("report_summary") or {})
+        report_summary.update(_payloadify(ledger_report["report_summary"]))
+        self._repository.update_kanglong_run(
+            run_id,
+            status=status,
+            available_actions=stored.get("available_actions") or available_actions_for_status(status),
+            progress=stored.get("progress") or {},
+            report=report,
+            report_summary=report_summary,
+        )
 
     def _response_for_stored_run(
         self,

@@ -797,6 +797,13 @@ async def test_service_market_execution_advances_one_round_without_static_comple
     assert checkpoint_count == 1
     assert any(event["event_type"] == "kanglong_round_completed" for event in events)
     assert not any(event["event_type"] == "kanglong_group_simulated" for event in events)
+    assert Decimal(stored["report"]["costs"]["total_fee_cost"]) > Decimal("0")
+    assert Decimal(stored["report"]["costs"]["total_price_diff_loss"]) > Decimal("0")
+    assert stored["report"]["costs"]["fee_by_asset"]["USDC"] == stored["report"]["costs"]["total_fee_cost"]
+    assert stored["report"]["ledger_report"]["source_checkpoint_id"] == 1
+    assert stored["report_summary"]["report_version"] == "kanglong_transfer_report_v1"
+    assert stored["report_summary"]["generated_from_checkpoint_id"] == 1
+    assert stored["report_summary"]["source_ledger_hash"] == stored["report"]["ledger_report"]["source_ledger_hash"]
 
 
 def test_service_marks_started_execution_failure_recoverable(tmp_path) -> None:
