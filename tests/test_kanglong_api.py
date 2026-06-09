@@ -801,6 +801,62 @@ def test_missing_kanglong_run_events_returns_404_without_listing_events() -> Non
     assert service.list_events_calls == []
 
 
+def test_kanglong_control_routes_pass_cas_request_to_service() -> None:
+    class ControlRouteService:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def control_run(self, **kwargs) -> dict:
+            self.calls.append(kwargs)
+            return {
+                "run_id": kwargs["run_id"],
+                "status": "pause_pending" if kwargs["action"] == "pause" else "running",
+                "plan_version": kwargs["plan_version"],
+                "snapshot_bundle_id": "snap-control",
+                "available_actions": ["view_report"],
+                "report": {},
+            }
+
+    service = ControlRouteService()
+    original_service = getattr(api_module.app.state, "kanglong_service", None)
+    api_module.app.state.kanglong_service = service
+    client = TestClient(api_module.app)
+    try:
+        pause = client.post(
+            "/kanglong/simulation/run/run-control/pause",
+            json={
+                "plan_version": "plan-control",
+                "expected_action_version": 7,
+                "idempotency_key": "pause-route-0001",
+            },
+        )
+        resume = client.post(
+            "/kanglong/simulation/run/run-control/resume",
+            json={
+                "plan_version": "plan-control",
+                "expected_action_version": 8,
+                "idempotency_key": "resume-route-0001",
+            },
+        )
+        stop = client.post(
+            "/kanglong/simulation/run/run-control/stop",
+            json={
+                "plan_version": "plan-control",
+                "expected_action_version": 9,
+                "idempotency_key": "stop-route-0001",
+            },
+        )
+    finally:
+        if original_service is not None:
+            api_module.app.state.kanglong_service = original_service
+
+    assert pause.status_code == 200
+    assert resume.status_code == 200
+    assert stop.status_code == 200
+    assert [call["action"] for call in service.calls] == ["pause", "resume", "stop"]
+    assert [call["expected_action_version"] for call in service.calls] == [7, 8, 9]
+
+
 def test_kanglong_service_report_contains_plan_events_and_costs(tmp_path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     service = KanglongSimulationService(repository)

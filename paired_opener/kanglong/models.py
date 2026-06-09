@@ -73,6 +73,31 @@ class KanglongEventStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+def available_actions_for_status(status: str | KanglongRunStatus) -> list[str]:
+    normalized = status.value if isinstance(status, KanglongRunStatus) else str(status or "")
+    matrix = {
+        KanglongRunStatus.DRAFT_PLAN.value: ["refresh_plan"],
+        KanglongRunStatus.CHAIN_READY.value: ["confirm", "refresh_plan"],
+        KanglongRunStatus.PLAN_CONFIRMED.value: ["execute", "refresh_plan"],
+        KanglongRunStatus.EXECUTION_STARTING.value: ["view_report"],
+        "running": ["pause", "stop", "view_report"],
+        "pause_pending": ["stop", "view_report"],
+        "stop_pending": ["view_report"],
+        "paused_by_user": ["resume", "stop", "view_report"],
+        "paused_market_unstable": ["resume", "stop", "recover", "view_report"],
+        "paused_plan_stale": ["refresh_plan", "recover", "view_report"],
+        "stopped_by_user": ["view_report", "refresh_plan"],
+        KanglongRunStatus.COMPLETED.value: ["view_report"],
+        "completed_with_dust_residual": ["view_report"],
+        KanglongRunStatus.NEEDS_ABORT_RECOVER.value: ["recover", "view_report"],
+        KanglongRunStatus.ABORTED_RECOVERED.value: ["refresh_plan", "view_report"],
+        "legacy_readonly": ["refresh_plan", "view_report"],
+    }
+    if normalized.startswith("blocked_"):
+        return ["refresh_plan"]
+    return list(matrix.get(normalized, []))
+
+
 def _position_side(value: PositionSide | str) -> PositionSide:
     if isinstance(value, PositionSide):
         return value

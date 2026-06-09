@@ -182,6 +182,13 @@ class KanglongActionRequest(BaseModel):
     confirmed_warning_codes: list[str] = Field(default_factory=list)
 
 
+class KanglongControlRequest(BaseModel):
+    plan_version: str
+    expected_action_version: int = Field(..., ge=0)
+    idempotency_key: str = Field(..., min_length=8, max_length=128)
+    operator: str = Field(default="manual")
+
+
 class KanglongRecoverRequest(BaseModel):
     idempotency_key: str = Field(..., min_length=8, max_length=128)
     operator: str = Field(default="manual")

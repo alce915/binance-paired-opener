@@ -379,34 +379,34 @@ Use these error codes exactly:
 
 - [ ] In `tests/test_kanglong_workflow_contracts.py`, add `test_actions_refresh_immediately_after_account_status_passes`.
 - [ ] Add `test_actions_refresh_immediately_after_confirm_link`.
-- [ ] Add `test_pause_stop_priority_uses_stop_over_pause`.
-- [ ] Add `test_stop_pending_cannot_be_downgraded_to_pause_pending`.
+- [x] Add `test_pause_stop_priority_uses_stop_over_pause`.
+- [x] Add `test_stop_pending_cannot_be_downgraded_to_pause_pending`.
 - [ ] Add `test_legacy_run_execute_returns_legacy_readonly_error`.
 - [ ] Run `pytest tests/test_kanglong_workflow_contracts.py -q`.
 
 ### Task 6.2: Implement action matrix helper
 
-- [ ] Add a single `available_actions_for_status(status)` helper in `paired_opener/kanglong/models.py` or `service.py`.
+- [x] Add a single `available_actions_for_status(status)` helper in `paired_opener/kanglong/models.py` or `service.py`.
 - [ ] Replace duplicated action generation in service responses.
 - [ ] Persist `available_actions_json` after detect, confirm, execute start, pause, resume, stop, recover, completion, and blocked states.
 - [ ] Ensure old status values map cleanly to either engine version 1 read-only display or engine version 2 phases.
 
 ### Task 6.3: Implement control request CAS
 
-- [ ] Add `request_control_action(run_id, action, expected_action_version)` in `paired_opener/storage.py`.
-- [ ] Increment `action_version` only when the current version equals `expected_action_version`.
-- [ ] Reject stale versions with `kanglong_stale_action_version`.
-- [ ] Apply priority `stop > pause`.
-- [ ] Keep `stop_pending` once stored until the executor consumes it.
+- [x] Add `request_control_action(run_id, action, expected_action_version)` in `paired_opener/storage.py`.
+- [x] Increment `action_version` only when the current version equals `expected_action_version`.
+- [x] Reject stale versions with `kanglong_stale_action_version`.
+- [x] Apply priority `stop > pause`.
+- [x] Keep `stop_pending` once stored until the executor consumes it.
 
 ### Task 6.4: Wire API endpoints
 
-- [ ] In `paired_opener/app.py`, validate transfer settings on detect-link.
-- [ ] Include `plan_input_hash` in detect-link response.
-- [ ] Require `plan_input_hash` on confirm.
-- [ ] Include `confirmed_plan_hash` in confirm response.
+- [x] In `paired_opener/app.py`, validate transfer settings on detect-link.
+- [x] Include `plan_input_hash` in detect-link response.
+- [x] Require `plan_input_hash` on confirm.
+- [x] Include `confirmed_plan_hash` in confirm response.
 - [ ] Require `confirmed_plan_hash` on execute.
-- [ ] Expose pause, resume, stop, recover using the CAS control request path.
+- [x] Expose pause, resume, stop, recover using the CAS control request path.
 - [ ] Return the fixed error codes from the spec.
 - [ ] Run `pytest tests/test_kanglong_workflow_contracts.py tests/test_kanglong_executor.py -q`.
 

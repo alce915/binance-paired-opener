@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from paired_opener.domain import OrderSide, PositionSide, SymbolRules
 from paired_opener.kanglong.ledger import KanglongLedgerEntry, hash_operation_payload
+from paired_opener.kanglong.models import available_actions_for_status
 from paired_opener.rounding import normalize_qty
 from paired_opener.simulation_matching import MarketDataProvider, MarketDataStaleError, MatchResult, OrderbookMatcher
 
@@ -68,7 +69,7 @@ class KanglongTransferExecutor:
             self._repository.update_kanglong_run(
                 run_id,
                 status="completed",
-                available_actions=["view_report"],
+                available_actions=available_actions_for_status("completed"),
                 progress=progress,
                 report_summary={"summary_status": "completed"},
             )
@@ -90,7 +91,7 @@ class KanglongTransferExecutor:
                 self._repository.update_kanglong_run(
                     run_id,
                     status="completed" if group_index + 1 >= len(groups) else "running",
-                    available_actions=["view_report"] if group_index + 1 >= len(groups) else ["pause", "stop", "view_report"],
+                    available_actions=available_actions_for_status("completed" if group_index + 1 >= len(groups) else "running"),
                     progress=next_progress,
                     report_summary={"summary_status": "completed" if group_index + 1 >= len(groups) else "running"},
                 )
@@ -130,7 +131,7 @@ class KanglongTransferExecutor:
             self._repository.update_kanglong_run_and_events(
                 run_id,
                 status="needs_abort_recover",
-                available_actions=["recover", "view_report"],
+                available_actions=available_actions_for_status("needs_abort_recover"),
                 progress=progress,
                 events=[
                     {
@@ -222,7 +223,7 @@ class KanglongTransferExecutor:
             residual_qty=residual_after,
             pause_after_round=pause_after_round,
         )
-        available_actions = _actions_for_status(final_status)
+        available_actions = available_actions_for_status(final_status)
         entries = self._ledger_entries(
             run_id=run_id,
             checkpoint_id=next_checkpoint_id,
@@ -342,7 +343,7 @@ class KanglongTransferExecutor:
                 }
             ],
             status=final_status,
-            available_actions=_actions_for_status(final_status),
+            available_actions=available_actions_for_status(final_status),
             progress=next_progress,
             report_summary={"summary_status": final_status},
         )
@@ -390,7 +391,7 @@ class KanglongTransferExecutor:
                 }
             ],
             status="stopped_by_user",
-            available_actions=_actions_for_status("stopped_by_user"),
+            available_actions=available_actions_for_status("stopped_by_user"),
             progress=progress,
             report_summary={"summary_status": "stopped_by_user"},
         )
@@ -439,7 +440,7 @@ class KanglongTransferExecutor:
                 }
             ],
             status="paused_market_unstable",
-            available_actions=_actions_for_status("paused_market_unstable"),
+            available_actions=available_actions_for_status("paused_market_unstable"),
             progress=next_progress,
             report_summary={"summary_status": "paused_market_unstable", "warning_code": warning_code},
         )
@@ -637,20 +638,6 @@ def _price_wear(side: PositionSide, close_price: Decimal, open_price: Decimal, q
     if side == PositionSide.LONG:
         return max(open_price - close_price, Decimal("0")) * qty
     return max(close_price - open_price, Decimal("0")) * qty
-
-
-def _actions_for_status(status: str) -> list[str]:
-    if status == "completed":
-        return ["view_report"]
-    if status == "paused_by_user":
-        return ["resume", "stop", "view_report"]
-    if status == "paused_market_unstable":
-        return ["resume", "stop", "recover", "view_report"]
-    if status == "stopped_by_user":
-        return ["view_report", "refresh_plan"]
-    if status == "needs_abort_recover":
-        return ["recover", "view_report"]
-    return ["pause", "stop", "view_report"]
 
 
 def _decimal_text(value: Decimal) -> str:

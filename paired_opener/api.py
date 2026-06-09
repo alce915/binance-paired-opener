@@ -42,6 +42,7 @@ from paired_opener.schemas import (
     AccountSummary,
     CloseSessionRequest,
     KanglongActionRequest,
+    KanglongControlRequest,
     KanglongEventsResponse,
     KanglongPlanRequest,
     KanglongPlanResponse,
@@ -1356,6 +1357,68 @@ async def get_kanglong_simulation_events(
         raise HTTPException(status_code=404, detail={"code": "kanglong_run_not_found", "run_id": run_id})
     payload = app.state.kanglong_service.list_events(run_id, after_event_id=after_event_id, limit=limit)
     return KanglongEventsResponse.model_validate(payload)
+
+
+def _schedule_kanglong_execution_from_stored(
+    service: Any,
+    *,
+    run_id: str,
+    plan_version: str,
+    idempotency_key: str,
+) -> None:
+    get_run = getattr(service, "get_run", None)
+    if not callable(get_run) or not callable(getattr(service, "run_market_execution", None)):
+        return
+    stored = get_run(run_id)
+    if stored is None:
+        return
+    execute_kwargs = _started_kanglong_execution_kwargs(
+        run_id=run_id,
+        request=KanglongActionRequest(plan_version=plan_version, idempotency_key=idempotency_key),
+        stored=stored,
+    )
+    if execute_kwargs is not None:
+        _schedule_kanglong_execution(service, execute_kwargs)
+
+
+async def _control_kanglong_simulation_run(
+    run_id: str,
+    request: KanglongControlRequest,
+    *,
+    action: str,
+) -> KanglongPlanResponse:
+    service = app.state.kanglong_service
+    payload = service.control_run(
+        run_id=run_id,
+        plan_version=request.plan_version,
+        action=action,
+        expected_action_version=request.expected_action_version,
+        idempotency_key=request.idempotency_key,
+        operator=request.operator,
+    )
+    if action in {"resume", "stop"} and payload.get("status") in {"running", "stop_pending"}:
+        _schedule_kanglong_execution_from_stored(
+            service,
+            run_id=run_id,
+            plan_version=request.plan_version,
+            idempotency_key=request.idempotency_key,
+        )
+    return KanglongPlanResponse.model_validate(payload)
+
+
+@app.post("/kanglong/simulation/run/{run_id}/pause", response_model=KanglongPlanResponse)
+async def pause_kanglong_simulation_run(run_id: str, request: KanglongControlRequest) -> KanglongPlanResponse:
+    return await _control_kanglong_simulation_run(run_id, request, action="pause")
+
+
+@app.post("/kanglong/simulation/run/{run_id}/resume", response_model=KanglongPlanResponse)
+async def resume_kanglong_simulation_run(run_id: str, request: KanglongControlRequest) -> KanglongPlanResponse:
+    return await _control_kanglong_simulation_run(run_id, request, action="resume")
+
+
+@app.post("/kanglong/simulation/run/{run_id}/stop", response_model=KanglongPlanResponse)
+async def stop_kanglong_simulation_run(run_id: str, request: KanglongControlRequest) -> KanglongPlanResponse:
+    return await _control_kanglong_simulation_run(run_id, request, action="stop")
 
 
 @app.post("/kanglong/simulation/run/{run_id}/recover", response_model=KanglongPlanResponse)

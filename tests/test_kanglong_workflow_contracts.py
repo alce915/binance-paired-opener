@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from paired_opener import api as api_module
 from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
-from paired_opener.kanglong.models import KanglongRunStatus, TransferExecutionSettings
+from paired_opener.kanglong.models import KanglongRunStatus, TransferExecutionSettings, available_actions_for_status
 from paired_opener.kanglong.service import KanglongSimulationService, _apply_group_result_to_synthetic_accounts
 from paired_opener.schemas import (
     KanglongActionRequest,
@@ -72,6 +72,16 @@ def test_events_response_has_incremental_cursor_fields() -> None:
     assert response.next_after_event_id == 10
     assert response.latest_event_id == 10
     assert response.has_more is False
+
+
+def test_available_actions_for_status_uses_control_matrix() -> None:
+    assert available_actions_for_status("chain_ready") == ["confirm", "refresh_plan"]
+    assert available_actions_for_status("plan_confirmed") == ["execute", "refresh_plan"]
+    assert available_actions_for_status("running") == ["pause", "stop", "view_report"]
+    assert available_actions_for_status("pause_pending") == ["stop", "view_report"]
+    assert available_actions_for_status("stop_pending") == ["view_report"]
+    assert available_actions_for_status("paused_market_unstable") == ["resume", "stop", "recover", "view_report"]
+    assert available_actions_for_status("blocked_main_not_flat") == ["refresh_plan"]
 
 
 def test_transfer_execution_settings_lock_mode_side_and_leverage() -> None:
@@ -604,6 +614,108 @@ def test_service_start_execute_leaves_run_in_progress_before_worker_completion(t
     assert stored is not None
     assert stored["status"] == "execution_starting"
     assert events == []
+
+
+def test_service_control_pause_stop_uses_cas_and_action_matrix(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        repository.create_kanglong_run(
+            {
+                "run_id": "run-control-service",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1"],
+                "status": "running",
+                "plan_version": "plan-control",
+                "snapshot_bundle_id": "snap-control",
+                "available_actions": ["pause", "stop", "view_report"],
+                "progress": {"action_version": 0},
+            }
+        )
+        paused = service.control_run(
+            run_id="run-control-service",
+            plan_version="plan-control",
+            action="pause",
+            expected_action_version=0,
+            idempotency_key="pause-control-0001",
+            operator="tester",
+        )
+        stale_stop = service.control_run(
+            run_id="run-control-service",
+            plan_version="plan-control",
+            action="stop",
+            expected_action_version=0,
+            idempotency_key="stop-stale-control-0001",
+            operator="tester",
+        )
+        stopped = service.control_run(
+            run_id="run-control-service",
+            plan_version="plan-control",
+            action="stop",
+            expected_action_version=1,
+            idempotency_key="stop-control-0001",
+            operator="tester",
+        )
+        not_downgraded = service.control_run(
+            run_id="run-control-service",
+            plan_version="plan-control",
+            action="pause",
+            expected_action_version=2,
+            idempotency_key="pause-after-stop-0001",
+            operator="tester",
+        )
+        stored = repository.get_kanglong_run("run-control-service")
+        events = service.list_events("run-control-service", after_event_id=0, limit=10)["events"]
+    finally:
+        repository.close()
+
+    assert paused["status"] == "pause_pending"
+    assert paused["available_actions"] == ["stop", "view_report"]
+    assert stale_stop["error_code"] == "kanglong_stale_action_version"
+    assert stopped["status"] == "stop_pending"
+    assert stopped["available_actions"] == ["view_report"]
+    assert not_downgraded["status"] == "stop_pending"
+    assert not_downgraded["available_actions"] == ["view_report"]
+    assert stored is not None
+    assert stored["progress"]["control_request"]["action"] == "stop"
+    assert [event["payload"]["action"] for event in events] == ["pause", "stop", "pause"]
+
+
+def test_service_control_resume_paused_run_returns_running_actions(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        repository.create_kanglong_run(
+            {
+                "run_id": "run-resume-service",
+                "symbol": "ETHUSDC",
+                "main_account_id": "main",
+                "subaccount_ids": ["sub1"],
+                "status": "paused_by_user",
+                "plan_version": "plan-resume",
+                "snapshot_bundle_id": "snap-resume",
+                "available_actions": ["resume", "stop", "view_report"],
+                "progress": {"action_version": 3},
+            }
+        )
+        resumed = service.control_run(
+            run_id="run-resume-service",
+            plan_version="plan-resume",
+            action="resume",
+            expected_action_version=3,
+            idempotency_key="resume-control-0001",
+            operator="tester",
+        )
+        stored = repository.get_kanglong_run("run-resume-service")
+    finally:
+        repository.close()
+
+    assert resumed["status"] == "running"
+    assert resumed["available_actions"] == ["pause", "stop", "view_report"]
+    assert stored is not None
+    assert stored["progress"]["action_version"] == 4
+    assert stored["progress"]["control_request"]["action"] == "resume"
 
 
 @pytest.mark.asyncio

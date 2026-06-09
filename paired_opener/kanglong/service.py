@@ -24,6 +24,7 @@ from paired_opener.kanglong.models import (
     KanglongRunStatus,
     ResidualLedgerEntry,
     TransferExecutionSettings,
+    available_actions_for_status,
     decimal_text,
     payload_value,
 )
@@ -1689,6 +1690,172 @@ class KanglongSimulationService:
             requested_plan_version=requested_plan_version,
             latest_event_id=self._repository.latest_kanglong_event_id(run_id) if run_id else 0,
         )
+
+    def control_run_idempotency_response(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        action: str,
+        expected_action_version: int,
+        idempotency_key: str,
+        operator: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        request_hash = _request_hash(
+            {
+                "action": "control",
+                "run_id": run_id,
+                "plan_version": plan_version,
+                "control_action": action,
+                "expected_action_version": expected_action_version,
+                "operator": operator,
+            }
+        )
+        return request_hash, self._idempotency_response(
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            run_id=run_id,
+        )
+
+    def control_run(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        action: str,
+        expected_action_version: int,
+        idempotency_key: str,
+        operator: str = "manual",
+    ) -> dict[str, Any]:
+        normalized_action = action.strip().lower()
+        request_hash, existing_response = self.control_run_idempotency_response(
+            run_id=run_id,
+            plan_version=plan_version,
+            action=normalized_action,
+            expected_action_version=expected_action_version,
+            idempotency_key=idempotency_key,
+            operator=operator,
+        )
+        if existing_response is not None:
+            return existing_response
+        stored = self._repository.get_kanglong_run(run_id)
+        if stored is None:
+            return self._not_found(run_id, plan_version)
+        if stored.get("plan_version") != plan_version:
+            return self._blocked_plan_stale(run_id, plan_version, stored)
+        if normalized_action == "resume":
+            response = self._resume_control_run(
+                run_id=run_id,
+                plan_version=plan_version,
+                expected_action_version=expected_action_version,
+                operator=operator,
+                stored=stored,
+            )
+            return self._remember_idempotency(idempotency_key, request_hash, response)
+        if normalized_action not in {"pause", "stop"}:
+            response = self._response_for_stored_run(stored, requested_plan_version=plan_version)
+            response["error_code"] = "kanglong_invalid_control_action"
+            return response
+        if normalized_action == "pause" and stored.get("status") not in {"running", "stop_pending"}:
+            return self._control_not_allowed(stored, plan_version, normalized_action)
+        if normalized_action == "stop" and stored.get("status") not in {
+            "running",
+            "pause_pending",
+            "stop_pending",
+            "paused_by_user",
+            "paused_market_unstable",
+        }:
+            return self._control_not_allowed(stored, plan_version, normalized_action)
+        try:
+            control = self._repository.request_kanglong_control_action(
+                run_id=run_id,
+                action=normalized_action,
+                expected_action_version=expected_action_version,
+            )
+        except ValueError as exc:
+            response = self._response_for_stored_run(stored, requested_plan_version=plan_version)
+            response["error_code"] = str(exc)
+            return response
+        status = str(control["status"])
+        progress = control["progress"]
+        available_actions = available_actions_for_status(status)
+        self._repository.update_kanglong_run_and_events(
+            run_id,
+            status=status,
+            available_actions=available_actions,
+            progress=progress,
+            events=[
+                {
+                    "event_type": "kanglong_control_requested",
+                    "payload": {
+                        "message_key": "events.kanglong.control_requested",
+                        "action": normalized_action,
+                        "operator": operator,
+                        "action_version": progress.get("action_version"),
+                    },
+                }
+            ],
+        )
+        response = self._response_for_stored_run(
+            self._repository.get_kanglong_run(run_id) or stored,
+            requested_plan_version=plan_version,
+        )
+        return self._remember_idempotency(idempotency_key, request_hash, response)
+
+    def _resume_control_run(
+        self,
+        *,
+        run_id: str,
+        plan_version: str,
+        expected_action_version: int,
+        operator: str,
+        stored: dict[str, Any],
+    ) -> dict[str, Any]:
+        if stored.get("status") not in {"paused_by_user", "paused_market_unstable"}:
+            return self._control_not_allowed(stored, plan_version, "resume")
+        progress = dict(stored.get("progress") or {})
+        current_version = int(progress.get("action_version", 0))
+        if current_version != int(expected_action_version):
+            response = self._response_for_stored_run(stored, requested_plan_version=plan_version)
+            response["error_code"] = "kanglong_stale_action_version"
+            return response
+        next_version = current_version + 1
+        next_progress = {
+            **progress,
+            "action_version": next_version,
+            "control_request": {
+                "action": "resume",
+                "requested_at": _now_text(),
+                "action_version": next_version,
+            },
+        }
+        self._repository.update_kanglong_run_and_events(
+            run_id,
+            status="running",
+            available_actions=available_actions_for_status("running"),
+            progress=next_progress,
+            events=[
+                {
+                    "event_type": "kanglong_control_requested",
+                    "payload": {
+                        "message_key": "events.kanglong.control_requested",
+                        "action": "resume",
+                        "operator": operator,
+                        "action_version": next_version,
+                    },
+                }
+            ],
+        )
+        return self._response_for_stored_run(
+            self._repository.get_kanglong_run(run_id) or stored,
+            requested_plan_version=plan_version,
+        )
+
+    def _control_not_allowed(self, stored: dict[str, Any], plan_version: str, action: str) -> dict[str, Any]:
+        response = self._response_for_stored_run(stored, requested_plan_version=plan_version)
+        response["error_code"] = "kanglong_control_action_not_allowed"
+        response["requested_action"] = action
+        return response
 
     def mark_execution_failed(
         self,
