@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME, redact_debug_text
 from paired_opener.domain import OpenSession, RecoveryStatus, RoundExecution, SessionStatus, SessionStopReason
@@ -44,6 +45,12 @@ _ACTIVE_KANGLONG_RUN_STATUSES = (
     "chain_ready",
     "plan_confirmed",
     "execution_starting",
+    "running",
+    "pause_pending",
+    "stop_pending",
+    "paused_by_user",
+    "paused_market_unstable",
+    "paused_plan_stale",
     "group_ready",
     "group_completed",
     "paused_group_round_limit_exceeded",
@@ -157,6 +164,7 @@ class SqliteRepository:
                 );
                 CREATE TABLE IF NOT EXISTS kanglong_runs (
                     run_id TEXT PRIMARY KEY,
+                    engine_version INTEGER NOT NULL DEFAULT 1,
                     symbol TEXT NOT NULL,
                     main_account_id TEXT NOT NULL,
                     subaccount_ids_json TEXT NOT NULL,
@@ -177,6 +185,7 @@ class SqliteRepository:
                 CREATE TABLE IF NOT EXISTS kanglong_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT NOT NULL,
+                    checkpoint_id INTEGER,
                     group_id TEXT,
                     round_id TEXT,
                     event_type TEXT NOT NULL,
@@ -187,6 +196,10 @@ class SqliteRepository:
                     lock_scope TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    worker_id TEXT,
+                    lease_token TEXT,
+                    fencing_token TEXT,
+                    worker_epoch INTEGER NOT NULL DEFAULT 0,
                     heartbeat_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
@@ -196,6 +209,63 @@ class SqliteRepository:
                     response_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS kanglong_ledger_baselines (
+                    run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    wallet_balance TEXT NOT NULL DEFAULT '0',
+                    available_balance TEXT NOT NULL DEFAULT '0',
+                    equity TEXT NOT NULL DEFAULT '0',
+                    margin TEXT NOT NULL DEFAULT '0',
+                    margin_deficit TEXT NOT NULL DEFAULT '0',
+                    total_unrealized_pnl TEXT NOT NULL DEFAULT '0',
+                    long_qty TEXT NOT NULL DEFAULT '0',
+                    long_entry_price TEXT NOT NULL DEFAULT '0',
+                    long_mark_price TEXT NOT NULL DEFAULT '0',
+                    long_leverage INTEGER NOT NULL DEFAULT 1,
+                    short_qty TEXT NOT NULL DEFAULT '0',
+                    short_entry_price TEXT NOT NULL DEFAULT '0',
+                    short_mark_price TEXT NOT NULL DEFAULT '0',
+                    short_leverage INTEGER NOT NULL DEFAULT 1,
+                    baseline_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, account_id)
+                );
+                CREATE TABLE IF NOT EXISTS kanglong_run_checkpoints (
+                    run_id TEXT NOT NULL,
+                    checkpoint_id INTEGER NOT NULL,
+                    previous_ledger_hash TEXT NOT NULL,
+                    ledger_hash TEXT NOT NULL,
+                    ledger_state_hash TEXT NOT NULL,
+                    ledger_entry_count INTEGER NOT NULL DEFAULT 0,
+                    events_high_watermark INTEGER NOT NULL DEFAULT 0,
+                    is_safe INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, checkpoint_id)
+                );
+                CREATE TABLE IF NOT EXISTS kanglong_ledger_entries (
+                    entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    checkpoint_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    account_id TEXT,
+                    entry_type TEXT NOT NULL,
+                    asset TEXT,
+                    amount TEXT NOT NULL DEFAULT '0',
+                    qty_delta TEXT NOT NULL DEFAULT '0',
+                    margin_delta TEXT NOT NULL DEFAULT '0',
+                    available_delta TEXT NOT NULL DEFAULT '0',
+                    equity_delta TEXT NOT NULL DEFAULT '0',
+                    realized_pnl_delta TEXT NOT NULL DEFAULT '0',
+                    price_wear TEXT NOT NULL DEFAULT '0',
+                    fee_amount TEXT NOT NULL DEFAULT '0',
+                    fee_asset TEXT,
+                    operation_payload_hash TEXT,
+                    payload_json TEXT NOT NULL DEFAULT '{{}}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE (run_id, checkpoint_id, sequence),
+                    UNIQUE (run_id, operation_id, sequence)
                 );
                 """
             )
@@ -240,11 +310,17 @@ class SqliteRepository:
             self._ensure_column("sessions", "recovery_checked_at", "TEXT")
             self._ensure_column("sessions", "recovery_details_json", "TEXT")
             self._ensure_column("kanglong_runs", "plan_version", "TEXT")
+            self._ensure_column("kanglong_runs", "engine_version", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column("kanglong_runs", "snapshot_bundle_id", "TEXT")
             self._ensure_column("kanglong_runs", "confirmed_at", "TEXT")
             self._ensure_column("kanglong_runs", "available_actions_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column("kanglong_runs", "progress_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("kanglong_runs", "report_summary_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("kanglong_events", "checkpoint_id", "INTEGER")
+            self._ensure_column("kanglong_locks", "worker_id", "TEXT")
+            self._ensure_column("kanglong_locks", "lease_token", "TEXT")
+            self._ensure_column("kanglong_locks", "fencing_token", "TEXT")
+            self._ensure_column("kanglong_locks", "worker_epoch", "INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -272,14 +348,15 @@ class SqliteRepository:
             self._connection.execute(
                 """
                 INSERT INTO kanglong_runs (
-                    run_id, symbol, main_account_id, subaccount_ids_json, status,
+                    run_id, engine_version, symbol, main_account_id, subaccount_ids_json, status,
                     result_grade, request_json, plan_json, report_json, plan_version,
                     snapshot_bundle_id, confirmed_at, available_actions_json, progress_json,
                     report_summary_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["run_id"],
+                    int(payload.get("engine_version", 2)),
                     payload["symbol"],
                     payload["main_account_id"],
                     _json_dumps(payload["subaccount_ids"]),
@@ -314,6 +391,7 @@ class SqliteRepository:
             f"""
             SELECT * FROM kanglong_runs
             WHERE status IN ({placeholders})
+              AND engine_version >= 2
             ORDER BY updated_at DESC
             LIMIT 1
             """,
@@ -470,11 +548,12 @@ class SqliteRepository:
             for event in events:
                 cursor = self._connection.execute(
                     """
-                    INSERT INTO kanglong_events (run_id, group_id, round_id, event_type, payload_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO kanglong_events (run_id, checkpoint_id, group_id, round_id, event_type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
+                        event.get("checkpoint_id"),
                         event.get("group_id"),
                         event.get("round_id"),
                         event["event_type"],
@@ -491,17 +570,19 @@ class SqliteRepository:
         event_type: str,
         payload: dict[str, Any],
         *,
+        checkpoint_id: int | None = None,
         group_id: str | None = None,
         round_id: str | None = None,
     ) -> int:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 """
-                INSERT INTO kanglong_events (run_id, group_id, round_id, event_type, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO kanglong_events (run_id, checkpoint_id, group_id, round_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
+                    checkpoint_id,
                     group_id,
                     round_id,
                     event_type,
@@ -544,6 +625,247 @@ class SqliteRepository:
         ).fetchone()
         return int(row["latest_event_id"] or 0) if row is not None else 0
 
+    def save_kanglong_ledger_baselines(self, run_id: str, baselines: list[dict[str, Any]]) -> None:
+        now = datetime.now(UTC).isoformat()
+        fields = [
+            "wallet_balance",
+            "available_balance",
+            "equity",
+            "margin",
+            "margin_deficit",
+            "total_unrealized_pnl",
+            "long_qty",
+            "long_entry_price",
+            "long_mark_price",
+            "short_qty",
+            "short_entry_price",
+            "short_mark_price",
+        ]
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM kanglong_ledger_baselines WHERE run_id = ?",
+                (run_id,),
+            )
+            for baseline in baselines:
+                self._connection.execute(
+                    """
+                    INSERT INTO kanglong_ledger_baselines (
+                        run_id, account_id, wallet_balance, available_balance, equity,
+                        margin, margin_deficit, total_unrealized_pnl,
+                        long_qty, long_entry_price, long_mark_price, long_leverage,
+                        short_qty, short_entry_price, short_mark_price, short_leverage,
+                        baseline_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        str(baseline["account_id"]),
+                        *(str(baseline.get(field, "0")) for field in fields[:9]),
+                        int(baseline.get("long_leverage", 1)),
+                        *(str(baseline.get(field, "0")) for field in fields[9:]),
+                        int(baseline.get("short_leverage", 1)),
+                        str(baseline["baseline_hash"]),
+                        now,
+                    ),
+                )
+
+    def list_kanglong_ledger_baselines(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            "SELECT * FROM kanglong_ledger_baselines WHERE run_id = ? ORDER BY account_id ASC",
+            (run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_kanglong_checkpoint(self, run_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM kanglong_run_checkpoints
+            WHERE run_id = ?
+            ORDER BY checkpoint_id DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_kanglong_ledger_entries(self, run_id: str, checkpoint_id: int | None = None) -> list[dict[str, Any]]:
+        if checkpoint_id is None:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM kanglong_ledger_entries
+                WHERE run_id = ?
+                ORDER BY checkpoint_id ASC, sequence ASC, entry_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM kanglong_ledger_entries
+                WHERE run_id = ? AND checkpoint_id = ?
+                ORDER BY sequence ASC, entry_id ASC
+                """,
+                (run_id, int(checkpoint_id)),
+            ).fetchall()
+        entries = []
+        for row in rows:
+            payload = dict(row)
+            payload["payload"] = _json_load(payload.pop("payload_json", "{}"), {})
+            entries.append(payload)
+        return entries
+
+    def commit_kanglong_checkpoint(
+        self,
+        *,
+        run_id: str,
+        checkpoint_id: int,
+        expected_previous_checkpoint_id: int,
+        expected_previous_ledger_hash: str,
+        previous_ledger_hash: str,
+        ledger_hash: str,
+        ledger_state_hash: str,
+        ledger_entries: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        status: str | None = None,
+        available_actions: list[str] | None = None,
+        progress: dict[str, Any] | None = None,
+        report_summary: dict[str, Any] | None = None,
+        is_safe: bool = True,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connection:
+            latest = self._connection.execute(
+                """
+                SELECT * FROM kanglong_run_checkpoints
+                WHERE run_id = ?
+                ORDER BY checkpoint_id DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            latest_checkpoint_id = int(latest["checkpoint_id"]) if latest is not None else 0
+            latest_ledger_hash = str(latest["ledger_hash"]) if latest is not None else str(expected_previous_ledger_hash)
+            if latest_checkpoint_id != int(expected_previous_checkpoint_id):
+                raise ValueError("kanglong_stale_checkpoint")
+            if latest is not None and latest_ledger_hash != expected_previous_ledger_hash:
+                raise ValueError("kanglong_ledger_hash_mismatch")
+            if previous_ledger_hash != expected_previous_ledger_hash:
+                raise ValueError("kanglong_ledger_hash_mismatch")
+            if int(checkpoint_id) != latest_checkpoint_id + 1:
+                raise ValueError("kanglong_stale_checkpoint")
+
+            for index, entry in enumerate(ledger_entries, start=1):
+                sequence = int(entry.get("sequence", index))
+                self._connection.execute(
+                    """
+                    INSERT INTO kanglong_ledger_entries (
+                        run_id, checkpoint_id, sequence, operation_id, account_id,
+                        entry_type, asset, amount, qty_delta, margin_delta,
+                        available_delta, equity_delta, realized_pnl_delta, price_wear,
+                        fee_amount, fee_asset, operation_payload_hash, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        int(checkpoint_id),
+                        sequence,
+                        str(entry.get("operation_id") or f"{run_id}:checkpoint:{checkpoint_id}"),
+                        entry.get("account_id"),
+                        str(entry["entry_type"]),
+                        entry.get("asset"),
+                        str(entry.get("amount", "0")),
+                        str(entry.get("qty_delta", "0")),
+                        str(entry.get("margin_delta", "0")),
+                        str(entry.get("available_delta", "0")),
+                        str(entry.get("equity_delta", "0")),
+                        str(entry.get("realized_pnl_delta", "0")),
+                        str(entry.get("price_wear", "0")),
+                        str(entry.get("fee_amount", "0")),
+                        entry.get("fee_asset"),
+                        entry.get("operation_payload_hash"),
+                        _json_dumps(entry.get("payload") or {}),
+                        now,
+                    ),
+                )
+
+            event_ids: list[int] = []
+            for event in events:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO kanglong_events (run_id, checkpoint_id, group_id, round_id, event_type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        int(checkpoint_id),
+                        event.get("group_id"),
+                        event.get("round_id"),
+                        str(event["event_type"]),
+                        _json_dumps(event.get("payload") or {}),
+                        now,
+                    ),
+                )
+                event_ids.append(int(cursor.lastrowid))
+            events_high_watermark = event_ids[-1] if event_ids else self.latest_kanglong_event_id(run_id)
+
+            self._connection.execute(
+                """
+                INSERT INTO kanglong_run_checkpoints (
+                    run_id, checkpoint_id, previous_ledger_hash, ledger_hash,
+                    ledger_state_hash, ledger_entry_count, events_high_watermark,
+                    is_safe, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    int(checkpoint_id),
+                    previous_ledger_hash,
+                    ledger_hash,
+                    ledger_state_hash,
+                    len(ledger_entries),
+                    int(events_high_watermark),
+                    1 if is_safe else 0,
+                    now,
+                ),
+            )
+
+            if status is not None or available_actions is not None or progress is not None or report_summary is not None:
+                current = self._connection.execute(
+                    """
+                    SELECT status, available_actions_json, progress_json, report_summary_json
+                    FROM kanglong_runs
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if current is not None:
+                    self._connection.execute(
+                        """
+                        UPDATE kanglong_runs
+                        SET status = ?,
+                            available_actions_json = ?,
+                            progress_json = ?,
+                            report_summary_json = ?,
+                            updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            status if status is not None else current["status"],
+                            _json_dumps(available_actions) if available_actions is not None else current["available_actions_json"],
+                            _json_dumps(progress) if progress is not None else current["progress_json"],
+                            _json_dumps(report_summary) if report_summary is not None else current["report_summary_json"],
+                            now,
+                            run_id,
+                        ),
+                    )
+        return {
+            "run_id": run_id,
+            "checkpoint_id": int(checkpoint_id),
+            "ledger_hash": ledger_hash,
+            "ledger_state_hash": ledger_state_hash,
+            "event_ids": event_ids,
+        }
+
     def acquire_kanglong_locks(
         self,
         *,
@@ -559,7 +881,11 @@ class SqliteRepository:
         expires_at = (now + timedelta(milliseconds=max(int(ttl_ms), 1000))).isoformat()
         with self._lock, self._connection:
             self._connection.execute(
-                "DELETE FROM kanglong_locks WHERE expires_at <= ?",
+                """
+                DELETE FROM kanglong_locks
+                WHERE expires_at <= ?
+                  AND (lease_token IS NULL OR lease_token = '')
+                """,
                 (now_text,),
             )
             for scope in scopes:
@@ -601,9 +927,187 @@ class SqliteRepository:
     def release_kanglong_locks(self, run_id: str) -> None:
         with self._lock, self._connection:
             self._connection.execute(
-                "DELETE FROM kanglong_locks WHERE run_id = ?",
+                """
+                DELETE FROM kanglong_locks
+                WHERE run_id = ?
+                  AND (lease_token IS NULL OR lease_token = '')
+                """,
                 (run_id,),
             )
+
+    def acquire_kanglong_run_lease(self, *, run_id: str, worker_id: str, ttl_seconds: int) -> dict[str, Any]:
+        lock_scope = f"kanglong:run:{run_id}:lease"
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        expires_at = (now + timedelta(seconds=max(int(ttl_seconds), 1))).isoformat()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM kanglong_locks WHERE lock_scope = ?",
+                (lock_scope,),
+            ).fetchone()
+            if row is not None and row["status"] == "active" and str(row["expires_at"]) > now_text:
+                payload = dict(row)
+                payload["conflict"] = True
+                payload["lock_expires_at"] = payload.get("expires_at")
+                return payload
+            worker_epoch = (int(row["worker_epoch"] or 0) + 1) if row is not None else 1
+            lease_token = f"lease-{uuid4().hex}"
+            fencing_token = f"fence-{run_id}-{worker_epoch}-{uuid4().hex}"
+            self._connection.execute(
+                """
+                INSERT INTO kanglong_locks (
+                    lock_scope, run_id, status, worker_id, lease_token,
+                    fencing_token, worker_epoch, heartbeat_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(lock_scope) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    status = excluded.status,
+                    worker_id = excluded.worker_id,
+                    lease_token = excluded.lease_token,
+                    fencing_token = excluded.fencing_token,
+                    worker_epoch = excluded.worker_epoch,
+                    heartbeat_at = excluded.heartbeat_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    lock_scope,
+                    run_id,
+                    "active",
+                    worker_id,
+                    lease_token,
+                    fencing_token,
+                    worker_epoch,
+                    now_text,
+                    expires_at,
+                ),
+            )
+        return {
+            "conflict": False,
+            "run_id": run_id,
+            "worker_id": worker_id,
+            "lease_token": lease_token,
+            "fencing_token": fencing_token,
+            "worker_epoch": worker_epoch,
+            "lock_expires_at": expires_at,
+        }
+
+    def renew_kanglong_run_lease(
+        self,
+        *,
+        run_id: str,
+        lease_token: str,
+        fencing_token: str,
+        ttl_seconds: int,
+    ) -> dict[str, Any] | None:
+        lock_scope = f"kanglong:run:{run_id}:lease"
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        expires_at = (now + timedelta(seconds=max(int(ttl_seconds), 1))).isoformat()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT * FROM kanglong_locks
+                WHERE lock_scope = ?
+                  AND run_id = ?
+                  AND lease_token = ?
+                  AND fencing_token = ?
+                  AND status = 'active'
+                  AND expires_at > ?
+                """,
+                (lock_scope, run_id, lease_token, fencing_token, now_text),
+            ).fetchone()
+            if row is None:
+                return None
+            self._connection.execute(
+                """
+                UPDATE kanglong_locks
+                SET heartbeat_at = ?, expires_at = ?
+                WHERE lock_scope = ?
+                """,
+                (now_text, expires_at, lock_scope),
+            )
+            payload = dict(row)
+            payload["heartbeat_at"] = now_text
+            payload["expires_at"] = expires_at
+            payload["lock_expires_at"] = expires_at
+            return payload
+
+    def release_kanglong_run_lease(self, *, run_id: str, lease_token: str, fencing_token: str) -> bool:
+        lock_scope = f"kanglong:run:{run_id}:lease"
+        now_text = datetime.now(UTC).isoformat()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE kanglong_locks
+                SET status = 'released',
+                    heartbeat_at = ?,
+                    expires_at = ?
+                WHERE lock_scope = ?
+                  AND run_id = ?
+                  AND lease_token = ?
+                  AND fencing_token = ?
+                  AND status = 'active'
+                """,
+                (now_text, now_text, lock_scope, run_id, lease_token, fencing_token),
+            )
+            return cursor.rowcount > 0
+
+    def request_kanglong_control_action(
+        self,
+        *,
+        run_id: str,
+        action: str,
+        expected_action_version: int,
+    ) -> dict[str, Any]:
+        normalized_action = action.strip().lower()
+        if normalized_action not in {"pause", "stop"}:
+            raise ValueError("kanglong_invalid_control_action")
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM kanglong_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("kanglong_run_not_found")
+            progress = _json_load(row["progress_json"], {})
+            current_version = int(progress.get("action_version", 0))
+            if current_version != int(expected_action_version):
+                raise ValueError("kanglong_stale_action_version")
+            current_action = (progress.get("control_request") or {}).get("action")
+            if current_action == "stop" and normalized_action == "pause":
+                return {
+                    "run_id": run_id,
+                    "status": row["status"],
+                    "progress": progress,
+                    "available_actions": _json_load(row["available_actions_json"], []),
+                }
+            next_version = current_version + 1
+            next_status = "stop_pending" if normalized_action == "stop" else "pause_pending"
+            next_progress = {
+                **progress,
+                "action_version": next_version,
+                "control_request": {
+                    "action": normalized_action,
+                    "requested_at": datetime.now(UTC).isoformat(),
+                    "action_version": next_version,
+                },
+            }
+            self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET status = ?,
+                    progress_json = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (next_status, _json_dumps(next_progress), datetime.now(UTC).isoformat(), run_id),
+            )
+        return {
+            "run_id": run_id,
+            "status": next_status,
+            "progress": next_progress,
+            "available_actions": _json_load(row["available_actions_json"], []),
+        }
 
     def remember_kanglong_idempotency(
         self,
@@ -1155,6 +1659,9 @@ class SqliteRepository:
         if not report_summary:
             report_summary = _kanglong_report_summary({}, payload["report"])
         payload["report_summary"] = report_summary
+        if int(payload.get("engine_version") or 1) < 2:
+            payload["status"] = "legacy_readonly"
+            payload["available_actions"] = ["refresh_plan", "view_report"]
         return payload
 
     def _deserialize_session_row(self, row: sqlite3.Row) -> dict[str, Any]:

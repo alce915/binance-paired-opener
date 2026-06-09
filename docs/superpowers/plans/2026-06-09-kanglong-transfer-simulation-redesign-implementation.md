@@ -221,48 +221,50 @@ Use these error codes exactly:
 
 ### Task 3.1: Add storage schema tests
 
-- [ ] In `tests/test_kanglong_storage.py`, add `test_schema_creates_engine_version_and_ledger_tables`.
-- [ ] Add `test_commit_checkpoint_inserts_events_entries_and_checkpoint_atomically`.
-- [ ] Add `test_checkpoint_hash_chain_rejects_previous_hash_mismatch`.
-- [ ] Add `test_lock_lease_uses_fencing_token_and_expires`.
-- [ ] Add `test_control_request_uses_action_version_compare_and_swap`.
-- [ ] Run `pytest tests/test_kanglong_storage.py -q` and verify the new tests fail.
+- [x] In `tests/test_kanglong_storage_workflow.py`, add `test_schema_creates_engine_version_and_ledger_tables`.
+- [x] Add `test_legacy_kanglong_run_reads_as_readonly_and_does_not_block_active_run`.
+- [x] Add `test_commit_checkpoint_inserts_events_entries_and_checkpoint_atomically`.
+- [x] Add `test_checkpoint_hash_chain_rejects_previous_hash_mismatch`.
+- [x] Add `test_lock_lease_uses_fencing_token_and_expires`.
+- [x] Add `test_account_lock_release_does_not_drop_run_lease`.
+- [x] Add `test_control_request_uses_action_version_compare_and_swap`.
+- [x] Run `pytest tests/test_kanglong_storage_workflow.py -q` and verify the new tests fail.
 
 ### Task 3.2: Extend `kanglong_runs`
 
-- [ ] In `paired_opener/storage.py`, add `engine_version INTEGER NOT NULL DEFAULT 1` to `kanglong_runs`.
-- [ ] Add compatibility migration for existing rows so missing values read as `1`.
-- [ ] Ensure new redesign runs insert `engine_version=2`.
-- [ ] Ensure old rows without version map to `legacy_readonly` unless refreshed.
+- [x] In `paired_opener/storage.py`, add `engine_version INTEGER NOT NULL DEFAULT 1` to `kanglong_runs`.
+- [x] Add compatibility migration for existing rows so missing values read as `1`.
+- [x] Ensure new redesign runs insert `engine_version=2`.
+- [x] Ensure old rows without version map to `legacy_readonly` unless refreshed.
 
 ### Task 3.3: Add append-only ledger tables
 
-- [ ] Add `kanglong_ledger_baselines` with `run_id`, `account_id`, wallet, available, equity, margin, margin deficit, unrealized PnL, position qty, entry price, mark price, leverage, and `baseline_hash`.
-- [ ] Add `kanglong_run_checkpoints` with `checkpoint_id`, `previous_ledger_hash`, `ledger_hash`, `ledger_state_hash`, `events_high_watermark`, and `is_safe`.
-- [ ] Add `kanglong_ledger_entries` with unique indexes on `run_id + checkpoint_id + sequence` and `run_id + operation_id + sequence`.
-- [ ] Include fee, margin, available, equity, realized PnL, price-wear, and account position deltas in ledger entry columns.
-- [ ] Add `checkpoint_id` to `kanglong_events` and keep it nullable for legacy events.
+- [x] Add `kanglong_ledger_baselines` with `run_id`, `account_id`, wallet, available, equity, margin, margin deficit, unrealized PnL, position qty, entry price, mark price, leverage, and `baseline_hash`.
+- [x] Add `kanglong_run_checkpoints` with `checkpoint_id`, `previous_ledger_hash`, `ledger_hash`, `ledger_state_hash`, `events_high_watermark`, and `is_safe`.
+- [x] Add `kanglong_ledger_entries` with unique indexes on `run_id + checkpoint_id + sequence` and `run_id + operation_id + sequence`.
+- [x] Include fee, margin, available, equity, realized PnL, price-wear, and account position deltas in ledger entry columns.
+- [x] Add `checkpoint_id` to `kanglong_events` and keep it nullable for legacy events.
 
 ### Task 3.4: Add lock and scheduler fields
 
-- [ ] Extend `progress_json` contract with `next_wake_at`, `scheduled_reason`, `worker_epoch`, `lease_token`, `lock_expires_at`, `action_version`, and `control_request`.
-- [ ] Update `kanglong_locks` to include `lease_token`, `fencing_token`, `worker_epoch`, and `expires_at`.
-- [ ] Add `acquire_kanglong_run_lease(run_id, worker_id, ttl_seconds)`.
-- [ ] Add `renew_kanglong_run_lease(run_id, lease_token, fencing_token, ttl_seconds)`.
-- [ ] Add `release_kanglong_run_lease(run_id, lease_token, fencing_token)`.
+- [x] Extend `progress_json` contract with `next_wake_at`, `scheduled_reason`, `worker_epoch`, `lease_token`, `lock_expires_at`, `action_version`, and `control_request`.
+- [x] Update `kanglong_locks` to include `lease_token`, `fencing_token`, `worker_epoch`, and `expires_at`.
+- [x] Add `acquire_kanglong_run_lease(run_id, worker_id, ttl_seconds)`.
+- [x] Add `renew_kanglong_run_lease(run_id, lease_token, fencing_token, ttl_seconds)`.
+- [x] Add `release_kanglong_run_lease(run_id, lease_token, fencing_token)`.
 
 ### Task 3.5: Implement atomic checkpoint commit
 
-- [ ] Add `commit_kanglong_checkpoint(...)` in `paired_opener/storage.py`.
-- [ ] Start one SQLite transaction.
-- [ ] Verify the current latest checkpoint id and previous hash before inserts.
-- [ ] Insert ledger entries.
-- [ ] Insert events with the new checkpoint id.
-- [ ] Insert `kanglong_run_checkpoints` row.
-- [ ] Update `kanglong_runs.progress_json`, `status`, `available_actions_json`, and `report_summary_json` when provided.
-- [ ] Commit transaction once all inserts succeed.
-- [ ] Roll back the transaction on hash mismatch, stale checkpoint, stale action version, or lease conflict.
-- [ ] Run `pytest tests/test_kanglong_storage.py -q`.
+- [x] Add `commit_kanglong_checkpoint(...)` in `paired_opener/storage.py`.
+- [x] Start one SQLite transaction.
+- [x] Verify the current latest checkpoint id and previous hash before inserts.
+- [x] Insert ledger entries.
+- [x] Insert events with the new checkpoint id.
+- [x] Insert `kanglong_run_checkpoints` row.
+- [x] Update `kanglong_runs.progress_json`, `status`, `available_actions_json`, and `report_summary_json` when provided.
+- [x] Commit transaction once all inserts succeed.
+- [x] Roll back the transaction on hash mismatch, stale checkpoint, stale action version, or lease conflict.
+- [x] Run `pytest tests/test_kanglong_storage_workflow.py -q`.
 
 ---
 
