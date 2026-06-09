@@ -139,6 +139,12 @@ class KanglongPlanRequest(BaseModel):
     main_account_id: str
     subaccount_ids: list[str] = Field(..., min_length=1)
     selected_side: PositionSide | None = None
+    transfer_mode: str = Field(default="transfer", pattern="^transfer$")
+    leverage: int = Field(default=75, ge=75, le=75)
+    order_side: PositionSide | None = None
+    transfer_percent: Decimal = Field(default=Decimal("100"), gt=0, le=100)
+    round_count: int = Field(default=30, ge=1, le=10_000)
+    round_interval_seconds: int = Field(default=3, ge=0, le=3600)
     account_source: str = Field(default="runtime", pattern="^(runtime|test_template)$")
     test_template_id: str | None = None
     template_content_hash: str | None = None
@@ -169,6 +175,8 @@ class KanglongTemplateDeleteResponse(BaseModel):
 
 class KanglongActionRequest(BaseModel):
     plan_version: str
+    plan_input_hash: str | None = None
+    confirmed_plan_hash: str | None = None
     idempotency_key: str = Field(..., min_length=8, max_length=128)
     operator: str = Field(default="manual")
     confirmed_warning_codes: list[str] = Field(default_factory=list)
@@ -185,6 +193,9 @@ class KanglongPlanResponse(BaseModel):
     run_id: str
     status: str
     plan_version: str
+    plan_input_hash: str | None = None
+    confirmed_plan_hash: str | None = None
+    transfer_settings: dict[str, Any] | None = None
     snapshot_bundle_id: str
     result_grade: str | None = None
     error_code: str | None = None

@@ -6,7 +6,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from paired_opener.domain import PositionSide
+from paired_opener.domain import OrderSide, PositionSide
 
 
 def utc_now() -> datetime:
@@ -71,6 +71,115 @@ class KanglongEventStatus(StrEnum):
     REJECTED = "rejected"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+
+
+def _position_side(value: PositionSide | str) -> PositionSide:
+    if isinstance(value, PositionSide):
+        return value
+    normalized = str(value or "").strip().upper()
+    if normalized == "LONG":
+        return PositionSide.LONG
+    if normalized == "SHORT":
+        return PositionSide.SHORT
+    raise ValueError("kanglong_invalid_transfer_setting")
+
+
+def _transfer_order_sides(direction: PositionSide) -> tuple[OrderSide, OrderSide]:
+    if direction == PositionSide.LONG:
+        return OrderSide.SELL, OrderSide.BUY
+    return OrderSide.BUY, OrderSide.SELL
+
+
+@dataclass(slots=True)
+class TransferExecutionSettings:
+    symbol: str
+    direction: PositionSide
+    mode: str
+    order_side: PositionSide
+    close_order_side: OrderSide
+    open_order_side: OrderSide
+    leverage: int
+    transfer_percent: Decimal
+    round_count: int
+    round_interval_seconds: int
+    per_round_qty: Decimal
+
+    @classmethod
+    def from_input(
+        cls,
+        *,
+        symbol: str,
+        direction: PositionSide | str,
+        transfer_percent: Decimal | str | int,
+        round_count: int | str,
+        round_interval_seconds: int | str,
+        per_round_qty: Decimal | str | int = Decimal("0"),
+        mode: str = "transfer",
+        leverage: int | str = 75,
+        order_side: PositionSide | str | None = None,
+    ) -> TransferExecutionSettings:
+        normalized_symbol = str(symbol or "").strip().upper()
+        normalized_direction = _position_side(direction)
+        normalized_order_side = _position_side(order_side) if order_side is not None else normalized_direction
+        normalized_leverage = int(leverage)
+        normalized_percent = Decimal(str(transfer_percent))
+        normalized_round_count = int(round_count)
+        normalized_interval = int(round_interval_seconds)
+        normalized_per_round_qty = Decimal(str(per_round_qty))
+        if (
+            not normalized_symbol
+            or mode != "transfer"
+            or normalized_leverage != 75
+            or normalized_order_side != normalized_direction
+            or normalized_percent <= Decimal("0")
+            or normalized_percent > Decimal("100")
+            or normalized_round_count < 1
+            or normalized_interval < 0
+            or normalized_per_round_qty < Decimal("0")
+        ):
+            raise ValueError("kanglong_invalid_transfer_setting")
+        close_order_side, open_order_side = _transfer_order_sides(normalized_direction)
+        return cls(
+            symbol=normalized_symbol,
+            direction=normalized_direction,
+            mode="transfer",
+            order_side=normalized_order_side,
+            close_order_side=close_order_side,
+            open_order_side=open_order_side,
+            leverage=75,
+            transfer_percent=normalized_percent,
+            round_count=normalized_round_count,
+            round_interval_seconds=normalized_interval,
+            per_round_qty=normalized_per_round_qty,
+        )
+
+    def with_per_round_qty(self, per_round_qty: Decimal) -> TransferExecutionSettings:
+        return TransferExecutionSettings.from_input(
+            symbol=self.symbol,
+            direction=self.direction,
+            transfer_percent=self.transfer_percent,
+            round_count=self.round_count,
+            round_interval_seconds=self.round_interval_seconds,
+            per_round_qty=per_round_qty,
+            mode=self.mode,
+            leverage=self.leverage,
+            order_side=self.order_side,
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "direction": self.direction.value.lower(),
+            "mode": self.mode,
+            "order_side": self.order_side.value,
+            "close_order_side": self.close_order_side.value,
+            "open_order_side": self.open_order_side.value,
+            "leverage": self.leverage,
+            "transfer_percent": decimal_text(self.transfer_percent),
+            "round_count": self.round_count,
+            "round_interval_seconds": self.round_interval_seconds,
+            "per_round_qty": decimal_text(self.per_round_qty),
+        }
 
 
 @dataclass(slots=True)

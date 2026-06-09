@@ -4,6 +4,7 @@ import asyncio
 from decimal import Decimal
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from paired_opener import api as api_module
@@ -32,6 +33,51 @@ def test_kanglong_request_defaults_to_ethusdc_and_auto_side() -> None:
     assert plan_request.symbol == "ETHUSDC"
     assert plan_request.selected_side is None
     assert plan_request.mode == "simulation"
+    assert plan_request.transfer_mode == "transfer"
+    assert plan_request.leverage == 75
+    assert plan_request.transfer_percent == Decimal("100")
+
+
+def test_kanglong_plan_request_accepts_editable_transfer_settings_and_locks_derived_fields() -> None:
+    request = KanglongPlanRequest(
+        main_account_id="main",
+        subaccount_ids=["sub1"],
+        selected_side=PositionSide.LONG,
+        transfer_percent=Decimal("25"),
+        round_count=4,
+        round_interval_seconds=9,
+    )
+
+    assert request.transfer_percent == Decimal("25")
+    assert request.round_count == 4
+    assert request.round_interval_seconds == 9
+
+    with pytest.raises(ValueError):
+        KanglongPlanRequest(
+            main_account_id="main",
+            subaccount_ids=["sub1"],
+            transfer_mode="regular",
+        )
+    with pytest.raises(ValueError):
+        KanglongPlanRequest(
+            main_account_id="main",
+            subaccount_ids=["sub1"],
+            leverage=50,
+        )
+
+
+def test_detect_link_rejects_editing_locked_transfer_fields() -> None:
+    request = KanglongPlanRequest(
+        main_account_id="main",
+        subaccount_ids=["sub1"],
+        selected_side=PositionSide.LONG,
+        order_side=PositionSide.SHORT,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        api_module._kanglong_transfer_settings_from_request(request)
+
+    assert exc_info.value.detail["code"] == "kanglong_invalid_transfer_setting"
 
 
 class StubKanglongService:
@@ -39,12 +85,17 @@ class StubKanglongService:
         self.plans: dict[str, dict] = {}
         self.list_events_calls: list[tuple[str, int | None, int]] = []
         self.completed_executions: list[str] = []
+        self.create_calls: list[dict] = []
+        self.confirm_calls: list[dict] = []
+        self.start_execute_calls: list[dict] = []
 
     def create_plan(self, **kwargs) -> dict:
+        self.create_calls.append(dict(kwargs))
         payload = {
             "run_id": kwargs["run_id"],
             "status": "chain_ready",
             "plan_version": "plan-1",
+            "plan_input_hash": "plan-input-hash-1",
             "snapshot_bundle_id": kwargs.get("snapshot_bundle_id") or "snap-1",
             "available_actions": ["confirm", "refresh_plan"],
             "report": {"summary": {"group_count": 0}},
@@ -53,10 +104,13 @@ class StubKanglongService:
         return payload
 
     def confirm_plan(self, **kwargs) -> dict:
+        self.confirm_calls.append(dict(kwargs))
         payload = {
             "run_id": kwargs["run_id"],
             "status": "plan_confirmed",
             "plan_version": kwargs["plan_version"],
+            "plan_input_hash": kwargs.get("plan_input_hash"),
+            "confirmed_plan_hash": "confirmed-plan-hash-1",
             "snapshot_bundle_id": "snap-1",
             "available_actions": ["execute", "refresh_plan"],
             "report": {},
@@ -76,6 +130,7 @@ class StubKanglongService:
         return payload
 
     def start_execute_plan(self, **kwargs) -> dict:
+        self.start_execute_calls.append(dict(kwargs))
         payload = {
             "run_id": kwargs["run_id"],
             "status": "execution_starting",
@@ -263,6 +318,70 @@ async def test_kanglong_split_api_plan_confirm_execute() -> None:
     assert confirmed.status == "plan_confirmed"
     assert executed.status == "execution_starting"
     assert events.latest_event_id == 0
+
+
+@pytest.mark.asyncio
+async def test_kanglong_api_passes_plan_and_confirmed_hashes_to_service() -> None:
+    service = StubKanglongService()
+    api_module.app.state.kanglong_service = service
+    original_collector = api_module._collect_kanglong_plan_inputs
+
+    async def fake_collector(request):
+        return {
+            "symbol": request.symbol,
+            "main_account_id": request.main_account_id,
+            "subaccount_ids": request.subaccount_ids,
+            "selected_side": request.selected_side,
+            "transfer_settings": {
+                "transfer_percent": request.transfer_percent,
+                "round_count": request.round_count,
+                "round_interval_seconds": request.round_interval_seconds,
+            },
+            "snapshot_bundle_id": "snap-1",
+            "close_price": Decimal("3100.00"),
+            "open_price": Decimal("3100.50"),
+            "fee_rate": Decimal("0.0005"),
+            "rules": SymbolRules("ETHUSDC", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("5"), 125),
+            "main_snapshot": snapshot("main", "0", "0", "0", "0"),
+            "subaccount_snapshots": [snapshot("sub1", "1", "1", "100", "0")],
+            "config": KanglongSymbolConfig(),
+        }
+
+    api_module._collect_kanglong_plan_inputs = fake_collector
+
+    try:
+        plan = await api_module.create_kanglong_simulation_plan(
+            KanglongPlanRequest(
+                main_account_id="main",
+                subaccount_ids=["sub1"],
+                selected_side=PositionSide.LONG,
+                transfer_percent=Decimal("25"),
+                round_count=4,
+                round_interval_seconds=9,
+            )
+        )
+        confirmed = await api_module.confirm_kanglong_simulation_plan(
+            plan.run_id,
+            KanglongActionRequest(
+                plan_version=plan.plan_version,
+                plan_input_hash=plan.plan_input_hash,
+                idempotency_key="confirm-hash-0001",
+            ),
+        )
+        await api_module.execute_kanglong_simulation_plan(
+            plan.run_id,
+            KanglongActionRequest(
+                plan_version=plan.plan_version,
+                confirmed_plan_hash=confirmed.confirmed_plan_hash,
+                idempotency_key="execute-hash-0001",
+            ),
+        )
+    finally:
+        api_module._collect_kanglong_plan_inputs = original_collector
+
+    assert service.create_calls[-1]["transfer_settings"]["transfer_percent"] == Decimal("25")
+    assert service.confirm_calls[-1]["plan_input_hash"] == "plan-input-hash-1"
+    assert service.start_execute_calls[-1]["confirmed_plan_hash"] == "confirmed-plan-hash-1"
 
 
 @pytest.mark.asyncio

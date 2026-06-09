@@ -179,41 +179,41 @@ Use these error codes exactly:
 
 ### Task 2.1: Extend Kanglong models
 
-- [ ] Update `paired_opener/kanglong/models.py` with `TransferExecutionSettings`.
-- [ ] Fields: `symbol`, `direction`, `mode`, `order_side`, `leverage`, `transfer_percent`, `round_count`, `round_interval_seconds`, `per_round_qty`.
-- [ ] Validate `mode == "transfer"` and `leverage == 75`.
-- [ ] Validate `transfer_percent > 0` and `transfer_percent <= 100`.
-- [ ] Validate `round_count >= 1`.
-- [ ] Validate `round_interval_seconds >= 0`.
-- [ ] Map `direction=long` to `order_side=LONG | close long/open long`.
-- [ ] Map `direction=short` to `order_side=SHORT | close short/open short`.
+- [x] Update `paired_opener/kanglong/models.py` with `TransferExecutionSettings`.
+- [x] Fields: `symbol`, `direction`, `mode`, `order_side`, `leverage`, `transfer_percent`, `round_count`, `round_interval_seconds`, `per_round_qty`.
+- [x] Validate `mode == "transfer"` and `leverage == 75`.
+- [x] Validate `transfer_percent > 0` and `transfer_percent <= 100`.
+- [x] Validate `round_count >= 1`.
+- [x] Validate `round_interval_seconds >= 0`.
+- [x] Map `direction=long` to `order_side=LONG | close long/open long`.
+- [x] Map `direction=short` to `order_side=SHORT | close short/open short`.
 
 ### Task 2.2: Add request contract tests
 
-- [ ] In `tests/test_kanglong_workflow_contracts.py`, add `test_detect_link_accepts_transfer_settings_and_returns_plan_input_hash`.
-- [ ] Add `test_detect_link_rejects_editing_locked_transfer_fields`.
-- [ ] Add `test_confirm_rejects_stale_plan_input_hash`.
-- [ ] Add `test_execute_rejects_stale_confirmed_plan_hash`.
-- [ ] Add `test_per_round_qty_uses_percent_and_round_count`.
-- [ ] Run `pytest tests/test_kanglong_workflow_contracts.py -q` and verify the new tests fail against current contracts.
+- [x] In `tests/test_kanglong_workflow_contracts.py`, add `test_detect_link_accepts_transfer_settings_and_returns_plan_input_hash`.
+- [x] Add `test_detect_link_rejects_editing_locked_transfer_fields`.
+- [x] Add `test_confirm_rejects_stale_plan_input_hash`.
+- [x] Add `test_execute_rejects_stale_confirmed_plan_hash`.
+- [x] Add `test_per_round_qty_uses_percent_and_round_count`.
+- [x] Run `python -m pytest tests/test_kanglong_workflow_contracts.py -q` and verify the new tests fail against current contracts.
 
 ### Task 2.3: Implement server-side plan input hash
 
-- [ ] In `paired_opener/kanglong/service.py`, canonicalize account pool ids, symbol, direction, transfer percent, round count, interval, and frozen account labels into `plan_input_hash`.
-- [ ] Store `plan_input_hash` on detect-link output inside `kanglong_runs.request_json`.
-- [ ] In confirm, require the submitted `plan_input_hash` to equal the latest run value.
-- [ ] Generate `confirmed_plan_hash` from the confirmed chain plan, round settings, and frozen execution labels.
-- [ ] Store `confirmed_plan_hash` in `plan_json`.
-- [ ] In execute, require the submitted `confirmed_plan_hash` to match the stored value.
+- [x] In `paired_opener/kanglong/service.py`, canonicalize account pool ids, symbol, direction, transfer percent, round count, interval, and frozen account labels into `plan_input_hash`.
+- [x] Store `plan_input_hash` on detect-link output inside `kanglong_runs.request_json`.
+- [x] In confirm, reject a submitted `plan_input_hash` that differs from the latest run value.
+- [x] Generate `confirmed_plan_hash` from the confirmed chain plan, round settings, and frozen execution labels.
+- [x] Store `confirmed_plan_hash` in `plan_json`.
+- [x] In execute, reject a submitted `confirmed_plan_hash` that differs from the stored value.
 
 ### Task 2.4: Update planner quantity semantics
 
-- [ ] In `paired_opener/kanglong/planner.py`, calculate total planned transfer quantity from current position quantity multiplied by `transfer_percent / 100`.
-- [ ] Calculate `per_round_qty = total_planned_qty / round_count`, quantized to ETH precision used by existing simulation code.
-- [ ] Keep per-round quantity read-only in the API response.
-- [ ] Generate supplemental rounds only during execution, not during link planning.
-- [ ] Preserve residual quantity so the final round can close dust without exceeding the configured per-round cap.
-- [ ] Run `pytest tests/test_kanglong_workflow_contracts.py -q`.
+- [x] In `paired_opener/kanglong/service.py`, calculate total planned transfer quantity from current position quantity multiplied by `transfer_percent / 100` before calling `build_kanglong_plan`.
+- [x] Calculate `per_round_qty = total_planned_qty / round_count`, quantized to ETH precision used by existing simulation code.
+- [x] Keep per-round quantity read-only in the API response.
+- [x] Generate supplemental rounds only during execution, not during link planning.
+- [x] Preserve residual quantity so the final round can close dust without exceeding the configured per-round cap.
+- [x] Run `python -m pytest tests/test_kanglong_workflow_contracts.py -q`.
 
 ---
 

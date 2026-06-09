@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -21,6 +21,7 @@ from paired_opener.kanglong.models import (
     KanglongResultGrade,
     KanglongRunStatus,
     ResidualLedgerEntry,
+    TransferExecutionSettings,
     decimal_text,
     payload_value,
 )
@@ -28,6 +29,7 @@ from paired_opener.kanglong.planner import KanglongGroupRoundLimitExceeded, buil
 from paired_opener.kanglong.precheck import run_static_precheck
 from paired_opener.kanglong.reporter import summarize_costs
 from paired_opener.kanglong.simulator import simulate_group
+from paired_opener.rounding import normalize_qty
 from paired_opener.storage import SqliteRepository
 
 _DEFAULT_SYNTHETIC_LEVERAGE = 1
@@ -66,6 +68,79 @@ def _new_plan_version() -> str:
 def _request_hash(payload: dict[str, Any]) -> str:
     encoded = json.dumps(_payloadify(payload), sort_keys=True, separators=(",", ":"))
     return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _coerce_transfer_settings(
+    raw_settings: TransferExecutionSettings | dict[str, Any] | None,
+    *,
+    symbol: str,
+    direction: PositionSide,
+) -> TransferExecutionSettings | None:
+    if raw_settings is None:
+        return None
+    if isinstance(raw_settings, TransferExecutionSettings):
+        payload = raw_settings.to_payload()
+    else:
+        payload = dict(raw_settings)
+    return TransferExecutionSettings.from_input(
+        symbol=str(payload.get("symbol") or symbol),
+        direction=payload.get("direction") or direction,
+        transfer_percent=payload.get("transfer_percent", Decimal("100")),
+        round_count=payload.get("round_count", 1),
+        round_interval_seconds=payload.get("round_interval_seconds", 3),
+        per_round_qty=payload.get("per_round_qty", Decimal("0")),
+        mode=str(payload.get("mode") or payload.get("transfer_mode") or "transfer"),
+        leverage=payload.get("leverage", 75),
+        order_side=payload.get("order_side"),
+    )
+
+
+def _scale_transfer_qty(
+    planned_release_qty: Decimal,
+    settings: TransferExecutionSettings,
+    rules: SymbolRules,
+) -> tuple[Decimal, TransferExecutionSettings]:
+    requested_qty = normalize_qty(planned_release_qty * settings.transfer_percent / Decimal("100"), rules)
+    if requested_qty <= Decimal("0"):
+        raise ValueError("kanglong_invalid_transfer_setting")
+    per_round_qty = normalize_qty(requested_qty / Decimal(settings.round_count), rules)
+    if per_round_qty <= Decimal("0"):
+        raise ValueError("kanglong_invalid_transfer_setting")
+    return requested_qty, settings.with_per_round_qty(per_round_qty)
+
+
+def _plan_input_hash(
+    *,
+    symbol: str,
+    main_account_id: str,
+    subaccount_ids: list[str],
+    selected_side: PositionSide,
+    transfer_settings: TransferExecutionSettings | None,
+    plan_labels_snapshot: dict[str, str],
+) -> str:
+    return _request_hash(
+        {
+            "symbol": symbol.strip().upper(),
+            "main_account_id": main_account_id,
+            "subaccount_ids": subaccount_ids,
+            "selected_side": selected_side.value,
+            "transfer_settings": transfer_settings.to_payload() if transfer_settings else None,
+            "plan_labels_snapshot": dict(sorted(plan_labels_snapshot.items())),
+        }
+    )
+
+
+def _confirmed_plan_hash(stored: dict[str, Any]) -> str:
+    request_payload = stored.get("request") or {}
+    plan_payload = stored.get("plan") or {}
+    return _request_hash(
+        {
+            "plan_input_hash": request_payload.get("plan_input_hash"),
+            "transfer_settings": request_payload.get("transfer_settings"),
+            "plan_labels_snapshot": request_payload.get("plan_labels_snapshot"),
+            "plan": plan_payload,
+        }
+    )
 
 
 def _group_payload(group: KanglongGroupPlan) -> dict[str, Any]:
@@ -568,6 +643,7 @@ class KanglongSimulationService:
         close_price: Decimal,
         open_price: Decimal,
         fee_rate: Decimal,
+        transfer_settings: TransferExecutionSettings | dict[str, Any] | None = None,
         request_metadata: dict[str, Any] | None = None,
         account_snapshot_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -632,7 +708,49 @@ class KanglongSimulationService:
             )
             return payload
 
-        planning_accounts = build_planning_accounts(subaccount_snapshots, precheck.selected_side, config)
+        plan_labels_snapshot = _chain_config_account_labels(
+            main_snapshot=main_snapshot,
+            subaccount_snapshots=subaccount_snapshots,
+            account_snapshot_payload=account_snapshot_payload,
+        )
+        transfer_settings_model = _coerce_transfer_settings(
+            transfer_settings,
+            symbol=symbol,
+            direction=precheck.selected_side,
+        )
+        planning_config = config
+        if transfer_settings_model is not None:
+            scaled_qty, transfer_settings_model = _scale_transfer_qty(
+                precheck.planned_release_qty,
+                transfer_settings_model,
+                rules,
+            )
+            precheck.planned_release_qty = scaled_qty
+            planning_config = replace(
+                config,
+                per_round_qty_limit=transfer_settings_model.per_round_qty,
+                max_rounds_per_group=max(config.max_rounds_per_group, transfer_settings_model.round_count),
+            )
+        plan_input_hash = _plan_input_hash(
+            symbol=symbol,
+            main_account_id=main_account_id,
+            subaccount_ids=subaccount_ids,
+            selected_side=precheck.selected_side,
+            transfer_settings=transfer_settings_model,
+            plan_labels_snapshot=plan_labels_snapshot,
+        )
+        request_payload.update(
+            {
+                "selected_side": precheck.selected_side.value,
+                "plan_input_hash": plan_input_hash,
+                "plan_labels_snapshot": plan_labels_snapshot,
+            }
+        )
+        if transfer_settings_model is not None:
+            request_payload["transfer_settings"] = transfer_settings_model.to_payload()
+        self._repository.update_kanglong_run_request(run_id, request_payload)
+
+        planning_accounts = build_planning_accounts(subaccount_snapshots, precheck.selected_side, planning_config)
         try:
             plan = build_kanglong_plan(
                 run_id=run_id,
@@ -642,7 +760,7 @@ class KanglongSimulationService:
                 first_donor_account_id=precheck.first_donor_account_id,
                 planned_release_qty=precheck.planned_release_qty,
                 accounts=planning_accounts,
-                config=config,
+                config=planning_config,
             )
         except KanglongGroupRoundLimitExceeded as exc:
             status = (
@@ -687,7 +805,7 @@ class KanglongSimulationService:
         lock_conflict = self._repository.acquire_kanglong_locks(
             run_id=run_id,
             lock_scopes=_lock_scopes(symbol, main_account_id, subaccount_ids),
-            ttl_ms=config.run_lock_ttl_ms,
+            ttl_ms=planning_config.run_lock_ttl_ms,
         )
         if lock_conflict is not None:
             report = {
@@ -728,7 +846,7 @@ class KanglongSimulationService:
                 close_price=close_price,
                 open_price=open_price,
                 fee_rate=fee_rate,
-                config=config,
+                config=planning_config,
             )
             events.extend(result.events)
             residuals.extend(result.residual_ledger)
@@ -738,9 +856,12 @@ class KanglongSimulationService:
             "plan_version": plan_version,
             "snapshot_bundle_id": snapshot_bundle_id,
             "selected_side": precheck.selected_side.value,
+            "plan_input_hash": plan_input_hash,
             "groups": [_group_payload(group) for group in plan.groups],
             "batch_debt_buffers": _payloadify(plan.batch_debt_buffers),
         }
+        if transfer_settings_model is not None:
+            plan_payload["transfer_settings"] = transfer_settings_model.to_payload()
         summary = {
             "status": KanglongRunStatus.CHAIN_READY.value,
             "selected_side": precheck.selected_side.value,
@@ -768,16 +889,21 @@ class KanglongSimulationService:
             "warnings": [],
             "blocks": [],
         }
+        if transfer_settings_model is not None:
+            report["transfer_settings"] = transfer_settings_model.to_payload()
         _attach_account_snapshot(report, account_snapshot_payload)
         available_actions = ["confirm", "refresh_plan"]
         payload = {
             "run_id": run_id,
             "status": KanglongRunStatus.CHAIN_READY.value,
             "plan_version": plan_version,
+            "plan_input_hash": plan_input_hash,
             "snapshot_bundle_id": snapshot_bundle_id,
             "available_actions": available_actions,
             "report": report,
         }
+        if transfer_settings_model is not None:
+            payload["transfer_settings"] = transfer_settings_model.to_payload()
         self._repository.update_kanglong_run(
             run_id,
             status=payload["status"],
@@ -809,6 +935,7 @@ class KanglongSimulationService:
         *,
         run_id: str,
         plan_version: str,
+        plan_input_hash: str | None = None,
         idempotency_key: str,
         operator: str,
         confirmed_warning_codes: list[str],
@@ -818,6 +945,7 @@ class KanglongSimulationService:
                 "action": "confirm",
                 "run_id": run_id,
                 "plan_version": plan_version,
+                "plan_input_hash": plan_input_hash,
                 "operator": operator,
                 "confirmed_warning_codes": confirmed_warning_codes,
             }
@@ -833,6 +961,7 @@ class KanglongSimulationService:
         *,
         run_id: str,
         plan_version: str,
+        plan_input_hash: str | None = None,
         idempotency_key: str,
         operator: str,
         confirmed_warning_codes: list[str],
@@ -840,6 +969,7 @@ class KanglongSimulationService:
         request_hash, existing_response = self.confirm_plan_idempotency_response(
             run_id=run_id,
             plan_version=plan_version,
+            plan_input_hash=plan_input_hash,
             idempotency_key=idempotency_key,
             operator=operator,
             confirmed_warning_codes=confirmed_warning_codes,
@@ -852,16 +982,28 @@ class KanglongSimulationService:
             return self._not_found(run_id, plan_version)
         if stored.get("plan_version") != plan_version:
             return self._blocked_plan_stale(run_id, plan_version, stored)
+        stored_plan_input_hash = (stored.get("request") or {}).get("plan_input_hash")
+        if plan_input_hash is not None and stored_plan_input_hash and plan_input_hash != stored_plan_input_hash:
+            return self._stale_hash_response(
+                run_id,
+                plan_version,
+                stored,
+                error_code="kanglong_stale_plan_input_hash",
+            )
         if stored.get("status") != KanglongRunStatus.CHAIN_READY.value:
             return self._blocked_plan_recheck_failed(run_id, plan_version, stored)
 
         available_actions = ["execute", "refresh_plan"]
         confirmed_at = _now_text()
+        plan_payload = copy.deepcopy(stored.get("plan") or {})
+        confirmed_plan_hash = _confirmed_plan_hash({**stored, "plan": plan_payload})
+        plan_payload["confirmed_plan_hash"] = confirmed_plan_hash
         self._repository.update_kanglong_run(
             run_id,
             status=KanglongRunStatus.PLAN_CONFIRMED.value,
             confirmed_at=confirmed_at,
             available_actions=available_actions,
+            plan=plan_payload,
         )
         response = _response_base(
             run_id,
@@ -871,6 +1013,8 @@ class KanglongSimulationService:
             available_actions=available_actions,
             confirmed_at=confirmed_at,
             report=stored.get("report") or {},
+            plan_input_hash=stored_plan_input_hash,
+            confirmed_plan_hash=confirmed_plan_hash,
         )
         return self._remember_idempotency(idempotency_key, request_hash, response)
 
@@ -879,6 +1023,7 @@ class KanglongSimulationService:
         *,
         run_id: str,
         plan_version: str,
+        confirmed_plan_hash: str | None = None,
         idempotency_key: str,
     ) -> tuple[str, dict[str, Any] | None]:
         request_hash = _request_hash(
@@ -886,6 +1031,7 @@ class KanglongSimulationService:
                 "action": "execute",
                 "run_id": run_id,
                 "plan_version": plan_version,
+                "confirmed_plan_hash": confirmed_plan_hash,
             }
         )
         return request_hash, self._idempotency_response(
@@ -899,6 +1045,7 @@ class KanglongSimulationService:
         *,
         run_id: str,
         plan_version: str,
+        confirmed_plan_hash: str | None = None,
         idempotency_key: str,
         close_price: Decimal,
         open_price: Decimal,
@@ -914,6 +1061,7 @@ class KanglongSimulationService:
         request_hash, existing_response = self.execute_plan_idempotency_response(
             run_id=run_id,
             plan_version=plan_version,
+            confirmed_plan_hash=confirmed_plan_hash,
             idempotency_key=idempotency_key,
         )
         if existing_response is not None:
@@ -924,6 +1072,18 @@ class KanglongSimulationService:
             return self._not_found(run_id, plan_version)
         if stored.get("plan_version") != plan_version:
             return self._blocked_plan_stale(run_id, plan_version, stored)
+        stored_confirmed_plan_hash = (stored.get("plan") or {}).get("confirmed_plan_hash")
+        if (
+            confirmed_plan_hash is not None
+            and stored_confirmed_plan_hash
+            and confirmed_plan_hash != stored_confirmed_plan_hash
+        ):
+            return self._stale_hash_response(
+                run_id,
+                plan_version,
+                stored,
+                error_code="kanglong_stale_confirmed_plan_hash",
+            )
         if stored.get("status") != KanglongRunStatus.PLAN_CONFIRMED.value:
             return self._blocked_plan_recheck_failed(run_id, plan_version, stored)
 
@@ -990,6 +1150,7 @@ class KanglongSimulationService:
         *,
         run_id: str,
         plan_version: str,
+        confirmed_plan_hash: str | None = None,
         idempotency_key: str,
         close_price: Decimal,
         open_price: Decimal,
@@ -1004,6 +1165,7 @@ class KanglongSimulationService:
         prepared = self._begin_execute_plan(
             run_id=run_id,
             plan_version=plan_version,
+            confirmed_plan_hash=confirmed_plan_hash,
             idempotency_key=idempotency_key,
             close_price=close_price,
             open_price=open_price,
@@ -1025,6 +1187,7 @@ class KanglongSimulationService:
         *,
         run_id: str,
         plan_version: str,
+        confirmed_plan_hash: str | None = None,
         idempotency_key: str,
         close_price: Decimal,
         open_price: Decimal,
@@ -1039,6 +1202,7 @@ class KanglongSimulationService:
         prepared = self._begin_execute_plan(
             run_id=run_id,
             plan_version=plan_version,
+            confirmed_plan_hash=confirmed_plan_hash,
             idempotency_key=idempotency_key,
             close_price=close_price,
             open_price=open_price,
@@ -1072,6 +1236,7 @@ class KanglongSimulationService:
         *,
         run_id: str,
         plan_version: str,
+        confirmed_plan_hash: str | None = None,
         idempotency_key: str,
         close_price: Decimal,
         open_price: Decimal,
@@ -1094,6 +1259,7 @@ class KanglongSimulationService:
                 "action": "execute",
                 "run_id": run_id,
                 "plan_version": plan_version,
+                "confirmed_plan_hash": confirmed_plan_hash,
             }
         )
         stored = self._repository.get_kanglong_run(run_id)
@@ -1718,6 +1884,18 @@ class KanglongSimulationService:
             report=stored.get("report") or {},
             requested_plan_version=requested_plan_version,
         )
+
+    def _stale_hash_response(
+        self,
+        run_id: str,
+        requested_plan_version: str,
+        stored: dict[str, Any],
+        *,
+        error_code: str,
+    ) -> dict[str, Any]:
+        response = self._blocked_plan_stale(run_id, requested_plan_version, stored)
+        response["error_code"] = error_code
+        return response
 
     def _blocked_plan_recheck_failed(
         self,

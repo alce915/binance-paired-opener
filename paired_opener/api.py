@@ -279,6 +279,7 @@ def _started_kanglong_execution_kwargs(
     execute_kwargs: dict[str, Any] = {
         "run_id": run_id,
         "plan_version": request.plan_version,
+        "confirmed_plan_hash": request.confirmed_plan_hash,
         "idempotency_key": request.idempotency_key,
         "close_price": _decimal_from_payload(price_snapshot.get("close_price")),
         "open_price": _decimal_from_payload(price_snapshot.get("open_price")),
@@ -373,6 +374,34 @@ def _reject_runtime_template_fields(request: KanglongPlanRequest) -> None:
         )
 
 
+def _kanglong_transfer_settings_from_request(request: KanglongPlanRequest) -> dict[str, Any] | None:
+    if request.order_side is not None and request.selected_side is not None and request.order_side != request.selected_side:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "kanglong_invalid_transfer_setting", "field": "order_side"},
+        )
+    transfer_field_names = {
+        "transfer_mode",
+        "leverage",
+        "order_side",
+        "transfer_percent",
+        "round_count",
+        "round_interval_seconds",
+    }
+    if not (request.model_fields_set & transfer_field_names):
+        return None
+    return {
+        "symbol": request.symbol,
+        "direction": request.selected_side.value if request.selected_side is not None else None,
+        "mode": request.transfer_mode,
+        "order_side": request.order_side.value if request.order_side is not None else None,
+        "leverage": request.leverage,
+        "transfer_percent": request.transfer_percent,
+        "round_count": request.round_count,
+        "round_interval_seconds": request.round_interval_seconds,
+    }
+
+
 async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) -> dict:
     _validate_kanglong_account_ids(request)
     _reject_runtime_template_fields(request)
@@ -429,6 +458,7 @@ async def _collect_runtime_kanglong_plan_inputs(request: KanglongPlanRequest) ->
         "close_price": Decimal(str(quote.bid_price)),
         "open_price": Decimal(str(quote.ask_price)),
         "fee_rate": Decimal("0.0005"),
+        "transfer_settings": _kanglong_transfer_settings_from_request(request),
         "request_metadata": {"account_source": "runtime"},
     }
 
@@ -605,6 +635,7 @@ async def _collect_template_kanglong_plan_inputs(request: KanglongPlanRequest) -
         "close_price": best_bid,
         "open_price": best_ask,
         "fee_rate": fee_rate,
+        "transfer_settings": _kanglong_transfer_settings_from_request(request),
         "request_metadata": request_metadata,
         "account_snapshot_payload": snapshot_payload,
     }
@@ -1143,6 +1174,7 @@ async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionR
         _, idempotency_response = idempotency_lookup(
             run_id=run_id,
             plan_version=request.plan_version,
+            plan_input_hash=request.plan_input_hash,
             idempotency_key=request.idempotency_key,
             operator=request.operator,
             confirmed_warning_codes=request.confirmed_warning_codes,
@@ -1156,6 +1188,7 @@ async def confirm_kanglong_simulation_plan(run_id: str, request: KanglongActionR
     payload = service.confirm_plan(
         run_id=run_id,
         plan_version=request.plan_version,
+        plan_input_hash=request.plan_input_hash,
         idempotency_key=request.idempotency_key,
         operator=request.operator,
         confirmed_warning_codes=request.confirmed_warning_codes,
@@ -1172,6 +1205,7 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
         _, idempotency_response = idempotency_lookup(
             run_id=run_id,
             plan_version=request.plan_version,
+            confirmed_plan_hash=request.confirmed_plan_hash,
             idempotency_key=request.idempotency_key,
         )
         if idempotency_response is not None:
@@ -1193,6 +1227,7 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
     execute_kwargs = {
         "run_id": run_id,
         "plan_version": request.plan_version,
+        "confirmed_plan_hash": request.confirmed_plan_hash,
         "idempotency_key": request.idempotency_key,
         "close_price": Decimal("0"),
         "open_price": Decimal("0"),
@@ -1237,6 +1272,9 @@ async def execute_kanglong_simulation_plan(run_id: str, request: KanglongActionR
                     test_template_id=stored_request.get("test_template_id"),
                     template_content_hash=stored_request.get("template_content_hash"),
                     market_data_account_id=stored_request.get("market_data_account_id"),
+                    transfer_percent=Decimal(str((stored_request.get("transfer_settings") or {}).get("transfer_percent", "100"))),
+                    round_count=int((stored_request.get("transfer_settings") or {}).get("round_count", 30)),
+                    round_interval_seconds=int((stored_request.get("transfer_settings") or {}).get("round_interval_seconds", 3)),
                 )
                 try:
                     inputs = await _collect_kanglong_plan_inputs(plan_request)

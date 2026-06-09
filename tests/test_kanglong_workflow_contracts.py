@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from paired_opener import api as api_module
 from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
-from paired_opener.kanglong.models import KanglongRunStatus
+from paired_opener.kanglong.models import KanglongRunStatus, TransferExecutionSettings
 from paired_opener.kanglong.service import KanglongSimulationService, _apply_group_result_to_synthetic_accounts
 from paired_opener.schemas import (
     KanglongActionRequest,
@@ -68,6 +68,56 @@ def test_events_response_has_incremental_cursor_fields() -> None:
     assert response.has_more is False
 
 
+def test_transfer_execution_settings_lock_mode_side_and_leverage() -> None:
+    settings = TransferExecutionSettings.from_input(
+        symbol="ethusdc",
+        direction=PositionSide.LONG,
+        transfer_percent=Decimal("25"),
+        round_count=4,
+        round_interval_seconds=3,
+        per_round_qty=Decimal("0.125"),
+    )
+
+    assert settings.symbol == "ETHUSDC"
+    assert settings.mode == "transfer"
+    assert settings.order_side == PositionSide.LONG
+    assert settings.close_order_side == "SELL"
+    assert settings.open_order_side == "BUY"
+    assert settings.leverage == 75
+    assert settings.to_payload()["transfer_percent"] == "25"
+
+    with pytest.raises(ValueError, match="kanglong_invalid_transfer_setting"):
+        TransferExecutionSettings.from_input(
+            symbol="ETHUSDC",
+            direction=PositionSide.LONG,
+            transfer_percent=Decimal("25"),
+            round_count=4,
+            round_interval_seconds=3,
+            per_round_qty=Decimal("0.125"),
+            mode="regular",
+        )
+    with pytest.raises(ValueError, match="kanglong_invalid_transfer_setting"):
+        TransferExecutionSettings.from_input(
+            symbol="ETHUSDC",
+            direction=PositionSide.LONG,
+            transfer_percent=Decimal("25"),
+            round_count=4,
+            round_interval_seconds=3,
+            per_round_qty=Decimal("0.125"),
+            leverage=50,
+        )
+    with pytest.raises(ValueError, match="kanglong_invalid_transfer_setting"):
+        TransferExecutionSettings.from_input(
+            symbol="ETHUSDC",
+            direction=PositionSide.LONG,
+            transfer_percent=Decimal("25"),
+            round_count=4,
+            round_interval_seconds=3,
+            per_round_qty=Decimal("0.125"),
+            order_side=PositionSide.SHORT,
+        )
+
+
 def _rules() -> SymbolRules:
     return SymbolRules("ETHUSDC", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("5"), 125)
 
@@ -77,6 +127,7 @@ def _create_ready_plan(
     *,
     run_id: str,
     snapshot_bundle_id: str = "snap-1",
+    transfer_settings: dict | TransferExecutionSettings | None = None,
 ) -> dict:
     return service.create_plan(
         run_id=run_id,
@@ -95,6 +146,7 @@ def _create_ready_plan(
         close_price=Decimal("3100.00"),
         open_price=Decimal("3100.50"),
         fee_rate=Decimal("0.0005"),
+        transfer_settings=transfer_settings,
     )
 
 
@@ -256,6 +308,144 @@ def test_service_plan_confirm_execute_records_state_and_events(tmp_path) -> None
     assert "execute" in confirmed["available_actions"]
     assert executed["status"] == "completed"
     assert events["latest_event_id"] > 0
+
+
+def test_detect_link_accepts_transfer_settings_and_returns_plan_input_hash(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(
+            service,
+            run_id="run-transfer-settings",
+            transfer_settings={
+                "transfer_percent": Decimal("50"),
+                "round_count": 5,
+                "round_interval_seconds": 7,
+            },
+        )
+        stored = repository.get_kanglong_run("run-transfer-settings")
+    finally:
+        repository.close()
+
+    assert plan["status"] == "chain_ready"
+    assert plan["plan_input_hash"]
+    assert stored["request"]["plan_input_hash"] == plan["plan_input_hash"]
+    assert stored["request"]["transfer_settings"]["transfer_percent"] == "50"
+    assert plan["report"]["transfer_settings"]["round_count"] == 5
+    assert plan["report"]["transfer_settings"]["round_interval_seconds"] == 7
+    assert plan["report"]["transfer_settings"]["per_round_qty"] == "0.100"
+
+
+def test_per_round_qty_uses_percent_and_round_count(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(
+            service,
+            run_id="run-transfer-qty",
+            transfer_settings={
+                "transfer_percent": Decimal("50"),
+                "round_count": 5,
+                "round_interval_seconds": 3,
+            },
+        )
+    finally:
+        repository.close()
+
+    summary = plan["report"]["summary"]
+    groups = plan["report"]["plan"]["groups"]
+    assert Decimal(summary["planned_release_qty"]) == Decimal("0.5")
+    assert plan["report"]["transfer_settings"]["round_count"] == 5
+    assert len(groups[0]["round_qtys"]) == 5
+    assert Decimal(groups[0]["target_qty"]) == Decimal("0.5")
+    assert groups[0]["round_qtys"] == ["0.100", "0.100", "0.100", "0.100", "0.100"]
+
+
+def test_confirm_rejects_stale_plan_input_hash(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(
+            service,
+            run_id="run-confirm-hash",
+            transfer_settings={
+                "transfer_percent": Decimal("50"),
+                "round_count": 5,
+                "round_interval_seconds": 3,
+            },
+        )
+        stale = service.confirm_plan(
+            run_id="run-confirm-hash",
+            plan_version=plan["plan_version"],
+            plan_input_hash="stale-plan-input-hash",
+            idempotency_key="confirm-stale-hash-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        confirmed = service.confirm_plan(
+            run_id="run-confirm-hash",
+            plan_version=plan["plan_version"],
+            plan_input_hash=plan["plan_input_hash"],
+            idempotency_key="confirm-good-hash-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+    finally:
+        repository.close()
+
+    assert stale["status"] == "blocked_plan_stale"
+    assert stale["error_code"] == "kanglong_stale_plan_input_hash"
+    assert stale["available_actions"] == ["refresh_plan"]
+    assert confirmed["status"] == "plan_confirmed"
+    assert confirmed["confirmed_plan_hash"]
+
+
+def test_execute_rejects_stale_confirmed_plan_hash(tmp_path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    service = KanglongSimulationService(repository)
+    try:
+        plan = _create_ready_plan(
+            service,
+            run_id="run-execute-hash",
+            transfer_settings={
+                "transfer_percent": Decimal("50"),
+                "round_count": 5,
+                "round_interval_seconds": 3,
+            },
+        )
+        confirmed = service.confirm_plan(
+            run_id="run-execute-hash",
+            plan_version=plan["plan_version"],
+            plan_input_hash=plan["plan_input_hash"],
+            idempotency_key="confirm-execute-hash-0001",
+            operator="tester",
+            confirmed_warning_codes=[],
+        )
+        stale = service.execute_plan(
+            run_id="run-execute-hash",
+            plan_version=plan["plan_version"],
+            confirmed_plan_hash="stale-confirmed-plan-hash",
+            idempotency_key="execute-stale-hash-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+        )
+        executed = service.execute_plan(
+            run_id="run-execute-hash",
+            plan_version=plan["plan_version"],
+            confirmed_plan_hash=confirmed["confirmed_plan_hash"],
+            idempotency_key="execute-good-hash-0001",
+            close_price=Decimal("3100.00"),
+            open_price=Decimal("3100.50"),
+            fee_rate=Decimal("0.0005"),
+        )
+    finally:
+        repository.close()
+
+    assert stale["status"] == "blocked_plan_stale"
+    assert stale["error_code"] == "kanglong_stale_confirmed_plan_hash"
+    assert stale["available_actions"] == ["refresh_plan"]
+    assert executed["status"] == "completed"
 
 
 def test_service_plan_report_contains_chain_order_config(tmp_path) -> None:

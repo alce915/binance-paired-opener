@@ -323,6 +323,18 @@ class SqliteRepository:
             return None
         return self._deserialize_kanglong_run_row(row)
 
+    def update_kanglong_run_request(self, run_id: str, request: dict[str, Any]) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET request_json = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (_json_dumps(request), datetime.now(UTC).isoformat(), run_id),
+            )
+
     def update_kanglong_run(
         self,
         run_id: str,
