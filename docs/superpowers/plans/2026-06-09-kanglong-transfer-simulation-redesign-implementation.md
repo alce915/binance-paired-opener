@@ -272,43 +272,45 @@ Use these error codes exactly:
 
 ### Task 4.1: Add ledger tests
 
-- [ ] Create `tests/test_kanglong_ledger.py`.
-- [ ] Add `test_baseline_hash_is_stable_for_canonical_decimal_values`.
-- [ ] Add `test_ledger_hash_chains_previous_hash_and_checkpoint_entries`.
-- [ ] Add `test_ledger_state_hash_changes_when_account_margin_changes`.
-- [ ] Add `test_operation_payload_hash_prevents_replay_with_changed_payload`.
-- [ ] Add `test_fee_and_price_wear_entries_are_separate_amounts`.
-- [ ] Run `pytest tests/test_kanglong_ledger.py -q` and verify these tests fail.
+- [x] Create `tests/test_kanglong_ledger.py`.
+- [x] Add `test_baseline_hash_is_stable_for_canonical_decimal_values`.
+- [x] Add `test_ledger_hash_chains_previous_hash_and_checkpoint_entries`.
+- [x] Add `test_ledger_state_hash_changes_when_account_margin_changes`.
+- [x] Add `test_operation_payload_hash_prevents_replay_with_changed_payload`.
+- [x] Add `test_fee_and_price_wear_entries_are_separate_amounts`.
+- [x] Add `test_storage_recomputes_checkpoint_hashes_from_ledger_objects`.
+- [x] Add `test_storage_rejects_ledger_object_bound_to_another_checkpoint`.
+- [x] Run `pytest tests/test_kanglong_ledger.py -q` and verify these tests fail.
 
 ### Task 4.2: Create `paired_opener/kanglong/ledger.py`
 
-- [ ] Add `KanglongLedgerBaseline`.
-- [ ] Add `KanglongLedgerEntry`.
-- [ ] Add `KanglongCheckpoint`.
-- [ ] Add `canonical_decimal(value, places)`.
-- [ ] Add `canonical_json(value)`.
-- [ ] Add `hash_baseline(baseline)`.
-- [ ] Add `hash_operation_payload(payload)`.
-- [ ] Add `hash_checkpoint(previous_ledger_hash, entries)`.
-- [ ] Add `hash_ledger_state(baselines, entries)`.
+- [x] Add `KanglongLedgerBaseline`.
+- [x] Add `KanglongLedgerEntry`.
+- [x] Add `KanglongCheckpoint`.
+- [x] Add `canonical_decimal(value, places)`.
+- [x] Add `canonical_json(value)`.
+- [x] Add `hash_baseline(baseline)`.
+- [x] Add `hash_operation_payload(payload)`.
+- [x] Add `hash_checkpoint(previous_ledger_hash, entries)`.
+- [x] Add `hash_ledger_state(baselines, entries)`.
 
 ### Task 4.3: Define transfer ledger entries
 
-- [ ] Use entry type `close_position` for the source account leg.
-- [ ] Use entry type `open_position` for the target account leg.
-- [ ] Use entry type `fee` for fee deductions.
-- [ ] Use entry type `price_wear` for difference between planned reference price and execution average price.
-- [ ] Use entry type `residual` for dust left after the final allowed round.
-- [ ] Use entry type `control` for pause, stop, resume, recover transitions.
-- [ ] Use entry type `report` for final report summary provenance.
+- [x] Use entry type `close_position` for the source account leg.
+- [x] Use entry type `open_position` for the target account leg.
+- [x] Use entry type `fee` for fee deductions.
+- [x] Use entry type `price_wear` for difference between planned reference price and execution average price.
+- [x] Use entry type `residual` for dust left after the final allowed round.
+- [x] Use entry type `control` for pause, stop, resume, recover transitions.
+- [x] Use entry type `report` for final report summary provenance.
 
 ### Task 4.4: Wire ledger helpers to storage
 
-- [ ] Convert `KanglongLedgerEntry` objects to `kanglong_ledger_entries` insert parameters.
-- [ ] Convert stored entries back to dataclasses for hash recalculation.
-- [ ] Recompute checkpoint hash before each `commit_kanglong_checkpoint`.
-- [ ] Recompute state hash after baseline plus all committed entries.
-- [ ] Run `pytest tests/test_kanglong_ledger.py tests/test_kanglong_storage.py -q`.
+- [x] Convert `KanglongLedgerEntry` objects to `kanglong_ledger_entries` insert parameters.
+- [x] Convert stored entries back to dataclasses for hash recalculation.
+- [x] Recompute checkpoint hash before each `commit_kanglong_checkpoint`.
+- [x] Recompute state hash after baseline plus all committed entries.
+- [x] Run `pytest tests/test_kanglong_ledger.py tests/test_kanglong_storage_workflow.py -q`.
 
 ---
 

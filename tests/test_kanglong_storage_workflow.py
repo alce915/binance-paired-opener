@@ -253,7 +253,10 @@ def test_commit_checkpoint_inserts_events_entries_and_checkpoint_atomically(tmp_
 
     assert committed["checkpoint_id"] == 1
     assert committed["event_ids"]
-    assert checkpoint["ledger_hash"] == "ledger-1"
+    assert checkpoint["ledger_hash"] == committed["ledger_hash"]
+    assert checkpoint["ledger_state_hash"] == committed["ledger_state_hash"]
+    assert checkpoint["ledger_hash"].startswith("sha256:")
+    assert checkpoint["ledger_state_hash"].startswith("sha256:")
     assert checkpoint["events_high_watermark"] == committed["event_ids"][-1]
     assert entries[0]["operation_id"] == "op-1"
     assert entries[0]["fee_amount"] == "1"
@@ -262,7 +265,7 @@ def test_commit_checkpoint_inserts_events_entries_and_checkpoint_atomically(tmp_
     assert stored["available_actions"] == ["pause", "stop", "view_report"]
     assert stored["progress"]["checkpoint_id"] == 1
     assert stored["report_summary"]["summary_status"] == "running"
-    assert baselines[0]["baseline_hash"] == "baseline-main"
+    assert baselines[0]["baseline_hash"].startswith("sha256:")
 
 
 def test_checkpoint_hash_chain_rejects_previous_hash_mismatch(tmp_path: Path) -> None:

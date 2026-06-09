@@ -11,6 +11,14 @@ from uuid import uuid4
 
 from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME, redact_debug_text
 from paired_opener.domain import OpenSession, RecoveryStatus, RoundExecution, SessionStatus, SessionStopReason
+from paired_opener.kanglong.ledger import (
+    KanglongLedgerBaseline,
+    KanglongLedgerEntry,
+    baseline_from_storage_payload,
+    hash_checkpoint,
+    hash_ledger_state,
+    ledger_entry_from_storage_payload,
+)
 
 
 def _json_dumps(payload: Any) -> str:
@@ -625,7 +633,11 @@ class SqliteRepository:
         ).fetchone()
         return int(row["latest_event_id"] or 0) if row is not None else 0
 
-    def save_kanglong_ledger_baselines(self, run_id: str, baselines: list[dict[str, Any]]) -> None:
+    def save_kanglong_ledger_baselines(
+        self,
+        run_id: str,
+        baselines: list[dict[str, Any] | KanglongLedgerBaseline],
+    ) -> None:
         now = datetime.now(UTC).isoformat()
         fields = [
             "wallet_balance",
@@ -646,7 +658,16 @@ class SqliteRepository:
                 "DELETE FROM kanglong_ledger_baselines WHERE run_id = ?",
                 (run_id,),
             )
-            for baseline in baselines:
+            for raw_baseline in baselines:
+                if isinstance(raw_baseline, KanglongLedgerBaseline):
+                    baseline = raw_baseline
+                    if baseline.run_id != run_id:
+                        raise ValueError("kanglong_operation_payload_mismatch")
+                else:
+                    baseline_payload = dict(raw_baseline)
+                    baseline_payload.setdefault("run_id", run_id)
+                    baseline = baseline_from_storage_payload(baseline_payload)
+                payload = baseline.to_storage_payload()
                 self._connection.execute(
                     """
                     INSERT INTO kanglong_ledger_baselines (
@@ -659,12 +680,12 @@ class SqliteRepository:
                     """,
                     (
                         run_id,
-                        str(baseline["account_id"]),
-                        *(str(baseline.get(field, "0")) for field in fields[:9]),
-                        int(baseline.get("long_leverage", 1)),
-                        *(str(baseline.get(field, "0")) for field in fields[9:]),
-                        int(baseline.get("short_leverage", 1)),
-                        str(baseline["baseline_hash"]),
+                        str(payload["account_id"]),
+                        *(str(payload.get(field, "0")) for field in fields[:9]),
+                        int(payload.get("long_leverage", 1)),
+                        *(str(payload.get(field, "0")) for field in fields[9:]),
+                        int(payload.get("short_leverage", 1)),
+                        str(payload["baseline_hash"]),
                         now,
                     ),
                 )
@@ -724,7 +745,7 @@ class SqliteRepository:
         previous_ledger_hash: str,
         ledger_hash: str,
         ledger_state_hash: str,
-        ledger_entries: list[dict[str, Any]],
+        ledger_entries: list[dict[str, Any] | KanglongLedgerEntry],
         events: list[dict[str, Any]],
         status: str | None = None,
         available_actions: list[str] | None = None,
@@ -754,8 +775,52 @@ class SqliteRepository:
             if int(checkpoint_id) != latest_checkpoint_id + 1:
                 raise ValueError("kanglong_stale_checkpoint")
 
-            for index, entry in enumerate(ledger_entries, start=1):
-                sequence = int(entry.get("sequence", index))
+            baseline_rows = self._connection.execute(
+                "SELECT * FROM kanglong_ledger_baselines WHERE run_id = ? ORDER BY account_id ASC",
+                (run_id,),
+            ).fetchall()
+            baselines = [baseline_from_storage_payload(dict(row)) for row in baseline_rows]
+            previous_rows = self._connection.execute(
+                """
+                SELECT * FROM kanglong_ledger_entries
+                WHERE run_id = ?
+                ORDER BY checkpoint_id ASC, sequence ASC, entry_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            previous_entries = []
+            for row in previous_rows:
+                previous_entry_payload = dict(row)
+                previous_entry_payload["payload"] = _json_load(
+                    previous_entry_payload.pop("payload_json", "{}"),
+                    {},
+                )
+                previous_entries.append(ledger_entry_from_storage_payload(previous_entry_payload))
+
+            normalized_entries: list[KanglongLedgerEntry] = []
+            for index, raw_entry in enumerate(ledger_entries, start=1):
+                if isinstance(raw_entry, KanglongLedgerEntry):
+                    entry = raw_entry
+                    if entry.run_id != run_id or entry.checkpoint_id != int(checkpoint_id):
+                        raise ValueError("kanglong_operation_payload_mismatch")
+                else:
+                    entry_payload = dict(raw_entry)
+                    sequence = int(entry_payload.get("sequence", index))
+                    entry_payload.setdefault("run_id", run_id)
+                    entry_payload.setdefault("checkpoint_id", int(checkpoint_id))
+                    entry_payload.setdefault(
+                        "operation_id",
+                        f"{run_id}:checkpoint:{checkpoint_id}:entry:{sequence}",
+                    )
+                    entry_payload["sequence"] = sequence
+                    entry = ledger_entry_from_storage_payload(entry_payload)
+                normalized_entries.append(entry)
+
+            computed_ledger_hash = hash_checkpoint(previous_ledger_hash, normalized_entries)
+            computed_ledger_state_hash = hash_ledger_state(baselines, [*previous_entries, *normalized_entries])
+
+            for entry in normalized_entries:
+                storage_payload = entry.to_storage_payload()
                 self._connection.execute(
                     """
                     INSERT INTO kanglong_ledger_entries (
@@ -768,22 +833,22 @@ class SqliteRepository:
                     (
                         run_id,
                         int(checkpoint_id),
-                        sequence,
-                        str(entry.get("operation_id") or f"{run_id}:checkpoint:{checkpoint_id}"),
-                        entry.get("account_id"),
-                        str(entry["entry_type"]),
-                        entry.get("asset"),
-                        str(entry.get("amount", "0")),
-                        str(entry.get("qty_delta", "0")),
-                        str(entry.get("margin_delta", "0")),
-                        str(entry.get("available_delta", "0")),
-                        str(entry.get("equity_delta", "0")),
-                        str(entry.get("realized_pnl_delta", "0")),
-                        str(entry.get("price_wear", "0")),
-                        str(entry.get("fee_amount", "0")),
-                        entry.get("fee_asset"),
-                        entry.get("operation_payload_hash"),
-                        _json_dumps(entry.get("payload") or {}),
+                        int(storage_payload["sequence"]),
+                        str(storage_payload["operation_id"]),
+                        storage_payload.get("account_id"),
+                        str(storage_payload["entry_type"]),
+                        storage_payload.get("asset"),
+                        str(storage_payload.get("amount", "0")),
+                        str(storage_payload.get("qty_delta", "0")),
+                        str(storage_payload.get("margin_delta", "0")),
+                        str(storage_payload.get("available_delta", "0")),
+                        str(storage_payload.get("equity_delta", "0")),
+                        str(storage_payload.get("realized_pnl_delta", "0")),
+                        str(storage_payload.get("price_wear", "0")),
+                        str(storage_payload.get("fee_amount", "0")),
+                        storage_payload.get("fee_asset"),
+                        storage_payload.get("operation_payload_hash"),
+                        _json_dumps(storage_payload.get("payload") or {}),
                         now,
                     ),
                 )
@@ -820,9 +885,9 @@ class SqliteRepository:
                     run_id,
                     int(checkpoint_id),
                     previous_ledger_hash,
-                    ledger_hash,
-                    ledger_state_hash,
-                    len(ledger_entries),
+                    computed_ledger_hash,
+                    computed_ledger_state_hash,
+                    len(normalized_entries),
                     int(events_high_watermark),
                     1 if is_safe else 0,
                     now,
@@ -861,8 +926,8 @@ class SqliteRepository:
         return {
             "run_id": run_id,
             "checkpoint_id": int(checkpoint_id),
-            "ledger_hash": ledger_hash,
-            "ledger_state_hash": ledger_state_hash,
+            "ledger_hash": computed_ledger_hash,
+            "ledger_state_hash": computed_ledger_state_hash,
             "event_ids": event_ids,
         }
 
