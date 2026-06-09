@@ -445,19 +445,19 @@ Use these error codes exactly:
 
 ### Task 8.1: Add frontend contract tests
 
-- [ ] In `tests/test_app_kanglong_display.mjs`, add `test_transfer_settings_panel_renders_between_account_pool_and_link_detection`.
-- [ ] Add `test_locked_fields_follow_symbol_direction_and_leverage`.
-- [ ] Add `test_editable_percent_rounds_interval_are_sent_to_detect_link`.
-- [ ] Add `test_confirm_button_enables_without_page_refresh_after_status_passes`.
-- [ ] Add `test_execute_button_enables_without_page_refresh_after_confirm`.
-- [ ] Add `test_execution_logs_do_not_show_template_or_sub_internal_ids`.
-- [ ] Add `test_report_panel_shows_fee_and_price_wear_totals`.
-- [ ] Run `node tests/test_app_kanglong_display.mjs` and verify these tests fail.
+- [x] In `tests/test_app_kanglong_display.mjs`, add `test_transfer_settings_panel_renders_between_account_pool_and_link_detection`.
+- [x] Add `test_locked_fields_follow_symbol_direction_and_leverage`.
+- [x] Add `test_editable_percent_rounds_interval_are_sent_to_detect_link`.
+- [x] Add `test_confirm_button_enables_without_page_refresh_after_status_passes`.
+- [x] Add `test_execute_button_enables_without_page_refresh_after_confirm`.
+- [x] Add `test_execution_logs_do_not_show_template_or_sub_internal_ids`.
+- [x] Add `test_report_panel_shows_fee_and_price_wear_totals`.
+- [x] Run `node tests/test_app_kanglong_display.mjs` and verify these tests fail.
 
 ### Task 8.2: Build transfer settings UI
 
-- [ ] In `paired_opener/static/app.js`, render the settings block between account pool and detect-link.
-- [ ] Add stable `data-testid` values:
+- [x] In `paired_opener/static/app.js`, render the settings block between account pool and detect-link.
+- [x] Add stable `data-testid` values:
   - `kanglong-transfer-symbol`
   - `kanglong-transfer-mode`
   - `kanglong-transfer-order-side`
@@ -469,28 +469,28 @@ Use these error codes exactly:
   - `kanglong-detect-link-button`
   - `kanglong-confirm-link-button`
   - `kanglong-execute-button`
-- [ ] Lock symbol, mode, order side, leverage, and per-round quantity.
-- [ ] Update symbol from the main symbol selector.
-- [ ] Update order side from migration direction.
-- [ ] Set mode display to `移仓`.
-- [ ] Set leverage display to `75X`.
+- [x] Lock symbol, mode, order side, leverage, and per-round quantity.
+- [x] Update symbol from the main symbol selector.
+- [x] Update order side from migration direction.
+- [x] Set mode display to `移仓`.
+- [x] Set leverage display to `75X`.
 
 ### Task 8.3: Wire immediate action refresh
 
-- [ ] Store latest `plan_input_hash`, `confirmed_plan_hash`, `available_actions`, and `action_version` in Kanglong UI state.
-- [ ] After account status succeeds, update button disabled states from returned actions without reload.
-- [ ] After detect-link succeeds, enable confirm when `confirm` is present.
-- [ ] After confirm succeeds, enable execute when `execute` is present.
-- [ ] When editable settings change, clear stale `confirmed_plan_hash` and disable execute until confirm runs again.
+- [x] Store latest `plan_input_hash`, `confirmed_plan_hash`, `available_actions`, and `action_version` in Kanglong UI state.
+- [x] After account status succeeds, update button disabled states from returned actions without reload.
+- [x] After detect-link succeeds, enable confirm when `confirm` is present.
+- [x] After confirm succeeds, enable execute when `execute` is present.
+- [x] When editable settings change, clear stale `confirmed_plan_hash` and disable execute until confirm runs again.
 - [ ] Display stale-hash API errors beside the related action button.
 
 ### Task 8.4: Clean display labels and logs
 
-- [ ] Use frozen display labels from `plan_labels_snapshot` and `account_labels_snapshot`.
-- [ ] Remove raw strings matching `tpl:*`, `sub:*`, and `main:*` from visible account cards and execution logs.
-- [ ] Keep internal ids only in hidden state or API payloads.
+- [x] Use frozen display labels from `plan_labels_snapshot` and `account_labels_snapshot`.
+- [x] Remove raw strings matching `tpl:*`, `sub:*`, and `main:*` from visible account cards and execution logs.
+- [x] Keep internal ids only in hidden state or API payloads.
 - [ ] Add log rows for source close, target open, residual, supplemental round, fee, price wear, pause, resume, stop, recover, and report generation.
-- [ ] Run `node tests/test_app_kanglong_display.mjs`.
+- [x] Run `node tests/test_app_kanglong_display.mjs`.
 
 ---
 
@@ -552,7 +552,7 @@ Use these error codes exactly:
 - [ ] Resume/retry behavior is idempotent for the same operation payload.
 - [ ] Payload mismatch enters `needs_abort_recover`.
 - [ ] Pause and stop are represented as control requests consumed at checkpoint boundaries.
-- [ ] UI actions update from API state without requiring page refresh.
-- [ ] Visible account labels do not expose template/sub/main internal ids.
-- [ ] Report totals distinguish fee cost from price-wear cost.
+- [x] UI actions update from API state without requiring page refresh.
+- [x] Visible account labels do not expose template/sub/main internal ids.
+- [x] Report totals distinguish fee cost from price-wear cost.
 - [ ] Browser smoke proves transfer is not completed instantly from static cached data.

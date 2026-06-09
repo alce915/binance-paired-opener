@@ -115,6 +115,20 @@
         gap: 16px;
         grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
       }
+      .kanglong-transfer-settings {
+        overflow: visible;
+      }
+      .kanglong-transfer-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(150px, 1fr));
+        gap: 14px;
+        padding: 12px 20px 20px;
+      }
+      .kanglong-transfer-grid input:disabled {
+        background: #f1e8da;
+        color: #776a5c;
+        opacity: 1;
+      }
       .kanglong-layout > .card > .card-title,
       .kanglong-workspace > .card > .card-title {
         padding: 16px 20px 8px;
@@ -256,6 +270,17 @@
         color: #7a6b58;
         font-size: 0.84rem;
         line-height: 1.45;
+      }
+      .kanglong-cost-summary {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        padding: 10px 12px;
+        border: 1px solid rgba(33, 152, 111, 0.22);
+        border-radius: 8px;
+        background: rgba(235, 250, 244, 0.68);
+        color: #11664b;
+        font-weight: 800;
       }
       .kanglong-chain-config {
         white-space: pre-wrap;
@@ -942,7 +967,7 @@
       @media (max-width: 1240px) {
         .dashboard,
         .simulation-under-log-grid { grid-template-columns: 1fr; }
-        .orderbook-grid, .param-grid, .calc-grid, .metric-grid, .button-row, .inline-grid { grid-template-columns: 1fr; }
+        .orderbook-grid, .param-grid, .calc-grid, .metric-grid, .button-row, .inline-grid, .kanglong-transfer-grid { grid-template-columns: 1fr; }
         button.inline-btn { width: 100%; }
       }
       @media (max-width: 640px) {
@@ -988,9 +1013,9 @@
               <option value="SHORT" data-i18n="console.position_side.short"></option>
             </select>
           </div>
-          <button id="kanglongDetectPlanBtn" type="button" data-i18n="console.kanglong.actions.detect"></button>
-          <button id="kanglongConfirmPlanBtn" type="button" data-i18n="console.kanglong.actions.confirm" disabled></button>
-          <button id="kanglongExecutePlanBtn" type="button" data-i18n="console.kanglong.actions.execute" disabled></button>
+          <button id="kanglongDetectPlanBtn" type="button" data-testid="kanglong-detect-link-button" data-i18n="console.kanglong.actions.detect"></button>
+          <button id="kanglongConfirmPlanBtn" type="button" data-testid="kanglong-confirm-link-button" data-i18n="console.kanglong.actions.confirm" disabled></button>
+          <button id="kanglongExecutePlanBtn" type="button" data-testid="kanglong-execute-button" data-i18n="console.kanglong.actions.execute" disabled></button>
         </div>
         <div class="kanglong-layout">
           <section class="card kanglong-account-section">
@@ -1009,6 +1034,43 @@
             <div id="kanglongSelectedSubaccounts" class="kanglong-compact-list"></div>
           </section>
         </div>
+        <section id="kanglongTransferSettings" class="card kanglong-transfer-settings" data-testid="kanglong-transfer-settings">
+          <h2 class="card-title" data-i18n="console.kanglong.transfer_settings.title"></h2>
+          <div class="kanglong-transfer-grid">
+            <div class="field">
+              <label for="kanglongTransferSymbol" data-i18n="console.kanglong.transfer_settings.symbol"></label>
+              <input id="kanglongTransferSymbol" data-testid="kanglong-transfer-symbol" value="ETHUSDC" disabled />
+            </div>
+            <div class="field">
+              <label for="kanglongTransferMode" data-i18n="console.kanglong.transfer_settings.mode"></label>
+              <input id="kanglongTransferMode" data-testid="kanglong-transfer-mode" value="移仓" disabled />
+            </div>
+            <div class="field">
+              <label for="kanglongTransferOrderSide" data-i18n="console.kanglong.transfer_settings.order_side"></label>
+              <input id="kanglongTransferOrderSide" data-testid="kanglong-transfer-order-side" value="" disabled />
+            </div>
+            <div class="field">
+              <label for="kanglongTransferLeverage" data-i18n="console.kanglong.transfer_settings.leverage"></label>
+              <input id="kanglongTransferLeverage" data-testid="kanglong-transfer-leverage" value="75X" disabled />
+            </div>
+            <div class="field">
+              <label for="kanglongTransferPercent" data-i18n="console.kanglong.transfer_settings.percent"></label>
+              <input id="kanglongTransferPercent" data-testid="kanglong-transfer-percent" type="number" min="0.01" max="100" step="0.01" value="100" />
+            </div>
+            <div class="field">
+              <label for="kanglongTransferRounds" data-i18n="console.kanglong.transfer_settings.rounds"></label>
+              <input id="kanglongTransferRounds" data-testid="kanglong-transfer-round-count" type="number" min="1" max="10000" step="1" value="30" />
+            </div>
+            <div class="field">
+              <label for="kanglongTransferRoundQty" data-i18n="console.kanglong.transfer_settings.round_qty"></label>
+              <input id="kanglongTransferRoundQty" data-testid="kanglong-transfer-per-round-qty" value="0" disabled />
+            </div>
+            <div class="field">
+              <label for="kanglongTransferInterval" data-i18n="console.kanglong.transfer_settings.interval"></label>
+              <input id="kanglongTransferInterval" data-testid="kanglong-transfer-round-interval" type="number" min="0" max="3600" step="1" value="3" />
+            </div>
+          </div>
+        </section>
         <section class="card kanglong-plan-section">
           <h2 class="card-title" data-i18n="console.kanglong.plan.summary_title"></h2>
           <div id="kanglongPlanSummary" class="kanglong-plan-summary"></div>

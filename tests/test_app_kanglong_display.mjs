@@ -14,6 +14,15 @@ for (const id of [
   "kanglongAccountPool",
   "kanglongAddSelectedBtn",
   "kanglongSelectedSubaccounts",
+  "kanglongTransferSettings",
+  "kanglongTransferSymbol",
+  "kanglongTransferMode",
+  "kanglongTransferOrderSide",
+  "kanglongTransferLeverage",
+  "kanglongTransferPercent",
+  "kanglongTransferRounds",
+  "kanglongTransferRoundQty",
+  "kanglongTransferInterval",
   "kanglongPlanSummary",
   "kanglongLogFilters",
   "kanglongExecutionLog",
@@ -26,14 +35,37 @@ for (const id of [
   assert.ok(indexSource.includes(`id="${id}"`), `${id} should exist in index.html`);
 }
 
+for (const testId of [
+  "kanglong-transfer-symbol",
+  "kanglong-transfer-mode",
+  "kanglong-transfer-order-side",
+  "kanglong-transfer-leverage",
+  "kanglong-transfer-percent",
+  "kanglong-transfer-round-count",
+  "kanglong-transfer-round-interval",
+  "kanglong-transfer-per-round-qty",
+  "kanglong-detect-link-button",
+  "kanglong-confirm-link-button",
+  "kanglong-execute-button",
+]) {
+  assert.ok(indexSource.includes(`data-testid="${testId}"`), `${testId} should be stable in index.html`);
+}
+
 assert.equal(indexSource.includes(`id="kanglongPanel"`), false, "old simulation Kanglong panel should be removed");
 assert.ok(appSource.includes(`"kanglong"`), "app.js should recognize kanglong as an app page");
 assert.ok(appSource.includes(`KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan"`), "app.js should declare the split plan endpoint reference");
 assert.ok(appSource.includes(`"/kanglong/simulation/run/active"`), "app.js should request the active Kanglong run endpoint");
 assert.equal(/request\(\s*["']\/kanglong\/simulation\/run["']/.test(appSource), false, "frontend should not POST to the deprecated Kanglong run endpoint");
+assert.ok(
+  indexSource.indexOf('id="kanglongAccountPool"') < indexSource.indexOf('id="kanglongTransferSettings"')
+    && indexSource.indexOf('id="kanglongTransferSettings"') < indexSource.indexOf('id="kanglongPlanSummary"'),
+  "transfer settings should render between the account pool and link detection summary",
+);
 
 for (const symbol of [
   "kanglongState",
+  "renderKanglongTransferSettings",
+  "readKanglongTransferSettings",
   "renderKanglongAccountPool",
   "addSelectedKanglongAccounts",
   "removeSelectedKanglongAccount",
@@ -83,7 +115,10 @@ assert.equal(
 );
 {
   const applyAppPageSource = appSlice("async function applyAppPage", "function nextKanglongTemplateRowId");
-  const kanglongBranchStart = applyAppPageSource.indexOf('appPage === "kanglong"');
+  const kanglongBranchStart = Math.max(
+    applyAppPageSource.indexOf('nextPage === "kanglong"'),
+    applyAppPageSource.indexOf('appPage === "kanglong"'),
+  );
   assert.notEqual(kanglongBranchStart, -1, "applyAppPage should include a Kanglong branch");
   const kanglongBranch = applyAppPageSource.slice(kanglongBranchStart);
   assert.ok(
@@ -264,6 +299,10 @@ function makeKanglongHarness(requestImpl) {
       marketDataAccountId: null,
       templatePreview: null,
       realAccountPoolSnapshot: null,
+      planInputHash: "",
+      confirmedPlanHash: "",
+      availableActions: [],
+      actionVersion: 0,
     };
     let kanglongActiveRunRestored = false;
     let activeKanglongExecutionPoller = null;
@@ -296,6 +335,27 @@ function makeKanglongHarness(requestImpl) {
     const kanglongPlanSummary = makeContainer();
     const kanglongLogFilters = makeContainer();
     const kanglongExecutionLog = makeContainer();
+    function makeInput(value = "") {
+      return {
+        value,
+        disabled: false,
+        readOnly: false,
+        dataset: {},
+        textContent: "",
+        addEventListener(eventName, handler) {
+          this["on" + eventName] = handler;
+        },
+      };
+    }
+    const kanglongTransferSettings = makeContainer();
+    const kanglongTransferSymbol = makeInput("ETHUSDC");
+    const kanglongTransferMode = makeInput("");
+    const kanglongTransferOrderSide = makeInput("");
+    const kanglongTransferLeverage = makeInput("");
+    const kanglongTransferPercent = makeInput("100");
+    const kanglongTransferRounds = makeInput("30");
+    const kanglongTransferRoundQty = makeInput("0");
+    const kanglongTransferInterval = makeInput("3");
     const document = {
       createElement(tagName) {
         return {
@@ -347,6 +407,12 @@ function makeKanglongHarness(requestImpl) {
       if (typeof account === "string") return account.trim().toLowerCase();
       return String(account?.id || account?.account_id || "").trim().toLowerCase();
     }
+    function selectedKanglongSymbol() {
+      return String(kanglongSymbol?.value || DEFAULT_SYMBOL).trim().toUpperCase();
+    }
+    function selectedKanglongSide() {
+      return String(kanglongSide?.value || "").trim().toUpperCase();
+    }
     function nowTime() {
       return "12:00:00";
     }
@@ -373,6 +439,7 @@ function makeKanglongHarness(requestImpl) {
     globalThis.api = {
       appendKanglongExecutionEvent,
       confirmButton: kanglongConfirmPlanBtn,
+      confirmKanglongPlan,
       createKanglongPlan,
       detectButton: kanglongDetectPlanBtn,
       executeKanglongPlan,
@@ -382,6 +449,9 @@ function makeKanglongHarness(requestImpl) {
       planSummary: kanglongPlanSummary,
       pollKanglongEvents,
       renderKanglongPlanSummary,
+      renderKanglongTransferSettings,
+      readKanglongTransferSettings,
+      handleKanglongTransferSettingsChanged,
       renderKanglongLogFilters,
       restoreActiveKanglongRun,
       runKanglongWorkflowAction,
@@ -392,6 +462,17 @@ function makeKanglongHarness(requestImpl) {
       },
       setKanglongLogFilter,
       state: kanglongState,
+      symbolInput: kanglongSymbol,
+      sideInput: kanglongSide,
+      transferSettings: kanglongTransferSettings,
+      transferSymbol: kanglongTransferSymbol,
+      transferMode: kanglongTransferMode,
+      transferOrderSide: kanglongTransferOrderSide,
+      transferLeverage: kanglongTransferLeverage,
+      transferPercent: kanglongTransferPercent,
+      transferRounds: kanglongTransferRounds,
+      transferRoundQty: kanglongTransferRoundQty,
+      transferInterval: kanglongTransferInterval,
       logs: appendLogEntries,
       renderAccountPoolCalls,
     };
@@ -412,26 +493,154 @@ function makeKanglongHarness(requestImpl) {
 }
 
 {
+  const api = makeKanglongHarness(async () => ({}));
+  api.symbolInput.value = "BTCUSDC";
+  api.sideInput.value = "SHORT";
+  api.renderKanglongTransferSettings({
+    transfer_settings: {
+      transfer_percent: "25",
+      round_count: 12,
+      round_interval_seconds: 9,
+      per_round_qty: "0.250",
+    },
+  });
+
+  assert.equal(api.transferSymbol.value, "BTCUSDC", "locked transfer symbol should follow the Kanglong symbol selector");
+  assert.equal(api.transferSymbol.disabled, true, "transfer symbol should be locked");
+  assert.equal(api.transferMode.value, "移仓", "transfer mode should be locked to migration");
+  assert.equal(api.transferMode.disabled, true, "transfer mode should be locked");
+  assert.match(api.transferOrderSide.value, /SHORT|做空开仓/, "open order side should follow the migration direction");
+  assert.equal(api.transferOrderSide.disabled, true, "open order side should be locked");
+  assert.equal(api.transferLeverage.value, "75X", "leverage should be fixed at 75X");
+  assert.equal(api.transferLeverage.disabled, true, "leverage should be locked");
+  assert.equal(api.transferRoundQty.value, "0.250", "per-round quantity should display the calculated backend result");
+  assert.equal(api.transferRoundQty.disabled, true, "per-round quantity should be read-only");
+  assert.equal(api.transferPercent.value, "25", "transfer percent should be editable and restorable from the plan");
+  assert.equal(api.transferRounds.value, "12", "round count should be editable and restorable from the plan");
+  assert.equal(api.transferInterval.value, "9", "round interval should be editable and restorable from the plan");
+}
+
+{
   const calls = [];
-  const api = makeKanglongHarness(async (requestPath) => {
+  const requestBodies = [];
+  const api = makeKanglongHarness(async (requestPath, options = {}) => {
     calls.push(requestPath);
     assert.equal(requestPath, "/kanglong/simulation/plan");
+    requestBodies.push(JSON.parse(options.body));
     return {
       run_id: "ready-run",
       status: "chain_ready",
       plan_version: "ready-plan",
+      plan_input_hash: "plan-input-ready",
       snapshot_bundle_id: "snap-ready",
+      transfer_settings: { transfer_percent: "25", round_count: 12, round_interval_seconds: 9, per_round_qty: "0.125" },
       report: { summary: { status: "chain_ready", group_count: 1, round_count: 2, planned_release_qty: "1" } },
     };
   });
   api.confirmButton.disabled = true;
   api.executeButton.disabled = true;
+  api.symbolInput.value = "ETHUSDC";
+  api.sideInput.value = "LONG";
+  api.transferPercent.value = "25";
+  api.transferRounds.value = "12";
+  api.transferInterval.value = "9";
 
   await api.runKanglongWorkflowAction(api.detectButton, api.createKanglongPlan);
 
   assert.deepEqual(calls, ["/kanglong/simulation/plan"]);
+  assert.equal(requestBodies[0].transfer_mode, "transfer", "detect payload should lock transfer mode");
+  assert.equal(requestBodies[0].leverage, 75, "detect payload should lock 75X leverage");
+  assert.equal(requestBodies[0].order_side, "LONG", "detect payload should lock the open order side to the migration direction");
+  assert.equal(requestBodies[0].transfer_percent, "25", "detect payload should send editable transfer percent");
+  assert.equal(requestBodies[0].round_count, 12, "detect payload should send editable round count");
+  assert.equal(requestBodies[0].round_interval_seconds, 9, "detect payload should send editable round interval");
+  assert.equal(api.state.planInputHash, "plan-input-ready", "detect response should store the latest plan input hash");
+  assert.deepEqual(Array.from(api.state.availableActions).sort(), ["confirm", "refresh_plan"].sort(), "detect response should cache immediate available actions");
+  assert.equal(api.transferRoundQty.value, "0.125", "detect response should refresh calculated per-round quantity immediately");
   assert.equal(api.confirmButton.disabled, false, "detecting a ready chain should enable confirm immediately even if actions are omitted");
   assert.equal(api.executeButton.disabled, true, "detecting should not enable execute before confirm");
+}
+
+{
+  const calls = [];
+  const bodies = [];
+  const api = makeKanglongHarness(async (requestPath, options = {}) => {
+    calls.push(requestPath);
+    if (requestPath === "/kanglong/simulation/plan/hash-run/confirm") {
+      bodies.push(JSON.parse(options.body));
+      return {
+        run_id: "hash-run",
+        status: "plan_confirmed",
+        plan_version: "hash-plan",
+        confirmed_plan_hash: "confirmed-hash-1",
+        snapshot_bundle_id: "snap-hash",
+        available_actions: [],
+        report: { summary: { status: "plan_confirmed" } },
+      };
+    }
+    if (requestPath === "/kanglong/simulation/plan/hash-run/execute") {
+      bodies.push(JSON.parse(options.body));
+      return {
+        run_id: "hash-run",
+        status: "execution_starting",
+        plan_version: "hash-plan",
+        snapshot_bundle_id: "snap-hash",
+        available_actions: ["view_report"],
+        report: {},
+      };
+    }
+    assert.equal(requestPath, "/kanglong/simulation/run/hash-run/events?after_event_id=0");
+    return { run_id: "hash-run", events: [], next_after_event_id: 0, latest_event_id: 0, has_more: false };
+  });
+  api.state.plan = {
+    run_id: "hash-run",
+    status: "chain_ready",
+    plan_version: "hash-plan",
+    plan_input_hash: "plan-input-hash-1",
+    available_actions: ["confirm"],
+  };
+  api.state.planInputHash = "plan-input-hash-1";
+  api.state.confirmedPlanVersion = "";
+  api.confirmButton.disabled = false;
+  api.executeButton.disabled = true;
+
+  await api.runKanglongWorkflowAction(api.confirmButton, api.confirmKanglongPlan);
+
+  assert.equal(bodies[0].plan_input_hash, "plan-input-hash-1", "confirm should send the latest plan input hash");
+  assert.equal(api.state.confirmedPlanHash, "confirmed-hash-1", "confirm response should store the confirmed plan hash");
+  assert.equal(api.executeButton.disabled, false, "confirm should enable execute immediately when status is plan_confirmed");
+
+  await api.runKanglongWorkflowAction(api.executeButton, api.executeKanglongPlan);
+
+  assert.equal(bodies[1].confirmed_plan_hash, "confirmed-hash-1", "execute should send the latest confirmed plan hash");
+  assert.deepEqual(calls, [
+    "/kanglong/simulation/plan/hash-run/confirm",
+    "/kanglong/simulation/plan/hash-run/execute",
+    "/kanglong/simulation/run/hash-run/events?after_event_id=0",
+  ]);
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.state.plan = {
+    run_id: "stale-settings-run",
+    status: "plan_confirmed",
+    plan_version: "settings-plan",
+    available_actions: ["execute"],
+  };
+  api.state.planInputHash = "plan-input-before-change";
+  api.state.confirmedPlanHash = "confirmed-before-change";
+  api.state.confirmedPlanVersion = "settings-plan";
+  api.executeButton.disabled = false;
+  api.transferPercent.value = "30";
+
+  api.handleKanglongTransferSettingsChanged();
+
+  assert.equal(api.state.plan, null, "editing transfer settings should clear the stale detected plan");
+  assert.equal(api.state.planInputHash, "", "editing transfer settings should clear the plan input hash");
+  assert.equal(api.state.confirmedPlanHash, "", "editing transfer settings should clear the confirmed plan hash");
+  assert.equal(api.state.confirmedPlanVersion, "", "editing transfer settings should clear the confirmed plan version");
+  assert.equal(api.executeButton.disabled, true, "editing transfer settings should disable execute until the link is confirmed again");
 }
 
 {
@@ -443,6 +652,25 @@ function makeKanglongHarness(requestImpl) {
   assert.ok(api.planSummary.textContent.includes("状态：链路已确认"), "summary status should localize the top-level response status");
   assert.equal(api.planSummary.textContent.includes("plan_confirmed"), false, "summary should not expose raw status codes");
   assert.equal(api.planSummary.textContent.includes("状态：链路可确认"), false, "summary should not show stale report summary status");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.renderKanglongPlanSummary({
+    status: "running",
+    report: {
+      summary: { group_count: 2, round_count: 30, planned_release_qty: "10" },
+      costs: {
+        total_fee_cost: "1.23",
+        total_price_diff_loss: "2.34",
+        total_cost: "3.57",
+      },
+    },
+  });
+  const text = api.planSummary.textContent;
+  assert.ok(text.includes("手续费：1.23"), "plan summary should show accumulated fee cost");
+  assert.ok(text.includes("价格磨损：2.34"), "plan summary should show price-wear cost");
+  assert.ok(text.includes("总磨损：3.57"), "plan summary should show total cost");
 }
 
 {
@@ -796,6 +1024,66 @@ for (const [status, label] of Object.entries(kanglongStatusLabels)) {
   assert.ok(renderedText.includes("第 1 轮平仓"), "trade leg events should render the close/open action instead of a raw event type");
   assert.ok(renderedText.includes("jiage4 ETHUSDC LONG 成交 1.00"), "trade leg events should expose the simulated account trade details");
   assert.equal(renderedText.includes("kanglong_trade_executed"), false, "trade leg event type should not leak into the UI");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.appendKanglongExecutionEvent({
+    event_id: 9,
+    event_type: "kanglong_trade_executed",
+    payload: {
+      message_key: "events.kanglong.trade_executed",
+      message_params: {
+        group_id: "group-0001",
+        round_id: "1",
+        action_label: "开仓",
+        account_id: "tpl:tpl_eth_drop_001:sub:sub-1",
+        account_label: "测试子账号 1",
+        symbol: "ETHUSDC",
+        side: "SHORT",
+        filled_qty: "1.00",
+        avg_price: "3100.00",
+        fee: "1.55",
+        status: "filled",
+      },
+    },
+  });
+  const labeledText = api.executionLog.textContent;
+  assert.ok(labeledText.includes("测试子账号 1"), "execution logs should prefer frozen account labels");
+  assert.doesNotMatch(labeledText, /tpl:tpl_eth_drop_001:sub:sub-1/, "execution logs should not expose synthetic template account ids");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.state.plan = {
+    request: {
+      account_labels_snapshot: {
+        "tpl:tpl_eth_drop_001:sub:sub-1": "Snapshot Sub 1",
+      },
+    },
+  };
+  api.appendKanglongExecutionEvent({
+    event_id: 10,
+    event_type: "kanglong_trade_executed",
+    payload: {
+      message_key: "events.kanglong.trade_executed",
+      message_params: {
+        group_id: "group-0001",
+        round_id: "2",
+        action_label: "close",
+        account_id: "tpl:tpl_eth_drop_001:sub:sub-1",
+        symbol: "ETHUSDC",
+        side: "LONG",
+        filled_qty: "0.50",
+        avg_price: "3101.00",
+        fee: "0.80",
+        status: "filled",
+      },
+    },
+  });
+  const snapshotText = api.executionLog.textContent;
+  assert.ok(snapshotText.includes("Snapshot Sub 1"), "execution logs should fall back to frozen account label snapshots");
+  assert.doesNotMatch(snapshotText, /tpl:tpl_eth_drop_001:sub:sub-1/, "execution logs should not expose raw ids when snapshot labels exist");
 }
 
 {

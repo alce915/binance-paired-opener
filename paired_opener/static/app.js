@@ -52,6 +52,15 @@ const kanglongMainAccountCard = document.getElementById("kanglongMainAccountCard
 const kanglongAccountPool = document.getElementById("kanglongAccountPool");
 const kanglongAddSelectedBtn = document.getElementById("kanglongAddSelectedBtn");
 const kanglongSelectedSubaccounts = document.getElementById("kanglongSelectedSubaccounts");
+const kanglongTransferSettings = document.getElementById("kanglongTransferSettings");
+const kanglongTransferSymbol = document.getElementById("kanglongTransferSymbol");
+const kanglongTransferMode = document.getElementById("kanglongTransferMode");
+const kanglongTransferOrderSide = document.getElementById("kanglongTransferOrderSide");
+const kanglongTransferLeverage = document.getElementById("kanglongTransferLeverage");
+const kanglongTransferPercent = document.getElementById("kanglongTransferPercent");
+const kanglongTransferRounds = document.getElementById("kanglongTransferRounds");
+const kanglongTransferRoundQty = document.getElementById("kanglongTransferRoundQty");
+const kanglongTransferInterval = document.getElementById("kanglongTransferInterval");
 const kanglongPlanSummary = document.getElementById("kanglongPlanSummary");
 const kanglongLogFilters = document.getElementById("kanglongLogFilters");
 const kanglongExecutionLog = document.getElementById("kanglongExecutionLog");
@@ -116,6 +125,10 @@ const kanglongState = {
   checkedPoolAccountIds: new Set(),
   plan: null,
   confirmedPlanVersion: "",
+  planInputHash: "",
+  confirmedPlanHash: "",
+  availableActions: [],
+  actionVersion: 0,
   latestEventId: 0,
   seenEventIds: new Set(),
   events: [],
@@ -1575,6 +1588,7 @@ function ensureKanglongMainAccount(accounts = availableAccounts) {
 
 function renderKanglongWorkspace() {
   renderKanglongAccountPool(availableAccounts);
+  renderKanglongTransferSettings(kanglongState.plan);
   renderKanglongLogFilters();
   if (kanglongState.plan) {
     renderKanglongPlanSummary(kanglongState.plan);
@@ -1585,12 +1599,98 @@ function renderKanglongWorkspace() {
 function invalidateKanglongPlan() {
   kanglongState.plan = null;
   kanglongState.confirmedPlanVersion = "";
+  kanglongState.planInputHash = "";
+  kanglongState.confirmedPlanHash = "";
+  kanglongState.availableActions = [];
+  kanglongState.actionVersion = 0;
   kanglongState.latestEventId = 0;
   kanglongState.seenEventIds.clear();
   kanglongState.events = [];
   if (kanglongConfirmPlanBtn) kanglongConfirmPlanBtn.disabled = true;
   if (kanglongExecutePlanBtn) kanglongExecutePlanBtn.disabled = true;
   if (kanglongPlanSummary) kanglongPlanSummary.replaceChildren();
+  renderKanglongTransferSettings();
+}
+
+function kanglongTransferSettingsFromPayload(payload = {}) {
+  const direct = payload.transfer_settings || payload.transferSettings;
+  if (direct && typeof direct === "object") return direct;
+  const report = payload.report && typeof payload.report === "object" ? payload.report : {};
+  const reportSettings = report.transfer_settings || report.transferSettings;
+  if (reportSettings && typeof reportSettings === "object") return reportSettings;
+  const plan = payload.plan && typeof payload.plan === "object" ? payload.plan : {};
+  const planSettings = plan.transfer_settings || plan.transferSettings;
+  return planSettings && typeof planSettings === "object" ? planSettings : {};
+}
+
+function kanglongTransferOrderSideLabel(side) {
+  const normalized = String(side || selectedKanglongSide() || "").trim().toUpperCase();
+  if (normalized === "LONG") return "LONG | 做多开仓";
+  if (normalized === "SHORT") return "SHORT | 做空开仓";
+  return copyOrDefault("console.kanglong.side_auto", "自动选择");
+}
+
+function setKanglongInputValue(input, value) {
+  if (!input) return;
+  input.value = value === undefined || value === null ? "" : String(value);
+}
+
+function renderKanglongTransferSettings(payload = kanglongState.plan) {
+  if (typeof kanglongTransferSettings === "undefined" || !kanglongTransferSettings) return;
+  const settings = kanglongTransferSettingsFromPayload(payload || {});
+  const symbol = String(settings.symbol || selectedKanglongSymbol() || DEFAULT_SYMBOL).trim().toUpperCase();
+  const direction = String(settings.direction || settings.order_side || selectedKanglongSide() || "").trim().toUpperCase();
+  setKanglongInputValue(kanglongTransferSymbol, symbol);
+  setKanglongInputValue(kanglongTransferMode, "移仓");
+  setKanglongInputValue(kanglongTransferOrderSide, kanglongTransferOrderSideLabel(direction));
+  setKanglongInputValue(kanglongTransferLeverage, "75X");
+  setKanglongInputValue(kanglongTransferRoundQty, settings.per_round_qty ?? settings.perRoundQty ?? "0");
+  if (settings.transfer_percent !== undefined || settings.transferPercent !== undefined) {
+    setKanglongInputValue(kanglongTransferPercent, settings.transfer_percent ?? settings.transferPercent);
+  }
+  if (settings.round_count !== undefined || settings.roundCount !== undefined) {
+    setKanglongInputValue(kanglongTransferRounds, settings.round_count ?? settings.roundCount);
+  }
+  if (settings.round_interval_seconds !== undefined || settings.roundIntervalSeconds !== undefined) {
+    setKanglongInputValue(kanglongTransferInterval, settings.round_interval_seconds ?? settings.roundIntervalSeconds);
+  }
+  [
+    kanglongTransferSymbol,
+    kanglongTransferMode,
+    kanglongTransferOrderSide,
+    kanglongTransferLeverage,
+    kanglongTransferRoundQty,
+  ].forEach((input) => {
+    if (input) input.disabled = true;
+  });
+}
+
+function readKanglongTransferSettings() {
+  const direction = selectedKanglongSide();
+  return {
+    transfer_mode: "transfer",
+    leverage: 75,
+    order_side: direction || null,
+    transfer_percent: String(kanglongTransferPercent?.value || "100").trim() || "100",
+    round_count: Number.parseInt(String(kanglongTransferRounds?.value || "30"), 10) || 30,
+    round_interval_seconds: Number.parseInt(String(kanglongTransferInterval?.value || "3"), 10) || 0,
+  };
+}
+
+function rememberKanglongHashesFromPayload(payload = {}) {
+  kanglongState.planInputHash = payload.plan_input_hash || payload.planInputHash || payload.plan?.plan_input_hash || kanglongState.planInputHash || "";
+  kanglongState.confirmedPlanHash = payload.confirmed_plan_hash || payload.confirmedPlanHash || payload.plan?.confirmed_plan_hash || kanglongState.confirmedPlanHash || "";
+  kanglongState.availableActions = kanglongAvailableActions(payload);
+  const progress = payload.progress && typeof payload.progress === "object" ? payload.progress : {};
+  kanglongState.actionVersion = Number(payload.action_version ?? payload.actionVersion ?? progress.action_version ?? kanglongState.actionVersion ?? 0) || 0;
+}
+
+function handleKanglongTransferSettingsChanged() {
+  kanglongState.planInputHash = "";
+  kanglongState.confirmedPlanHash = "";
+  kanglongState.confirmedPlanVersion = "";
+  invalidateKanglongPlan();
+  renderKanglongTransferSettings();
 }
 
 function applyKanglongTemplatePreview(preview = {}) {
@@ -1845,6 +1945,31 @@ function renderKanglongChainConfig(payload = {}) {
   return wrapper;
 }
 
+function renderKanglongCostSummary(payload = {}) {
+  const report = payload?.report || {};
+  const costs = report.costs || payload.costs || report.summary?.costs || {};
+  if (!costs || typeof costs !== "object") return null;
+  const feeCost = costs.total_fee_cost ?? costs.transfer_fee_cost;
+  const priceWear = costs.total_price_diff_loss ?? costs.transfer_price_diff_loss;
+  const totalCost = costs.total_cost;
+  if (feeCost === undefined && priceWear === undefined && totalCost === undefined) return null;
+  const segments = [];
+  if (feeCost !== undefined && feeCost !== null) {
+    segments.push(copyOrDefault("console.kanglong.report.fee_cost", "手续费：{value}", { value: feeCost }));
+  }
+  if (priceWear !== undefined && priceWear !== null) {
+    segments.push(copyOrDefault("console.kanglong.report.price_wear", "价格磨损：{value}", { value: priceWear }));
+  }
+  if (totalCost !== undefined && totalCost !== null) {
+    segments.push(copyOrDefault("console.kanglong.report.total_cost", "总磨损：{value}", { value: totalCost }));
+  }
+  if (!segments.length) return null;
+  const wrapper = document.createElement("div");
+  wrapper.className = "kanglong-cost-summary";
+  wrapper.textContent = segments.join(" | ");
+  return wrapper;
+}
+
 function syncKanglongWorkflowButtons(payload = kanglongState.plan, options = {}) {
   const actions = kanglongAvailableActions(payload);
   if (kanglongConfirmPlanBtn) {
@@ -1880,8 +2005,9 @@ function renderKanglongPlanSummary(payload = {}) {
   summaryLine.className = "kanglong-plan-summary-line";
   summaryLine.textContent = segments.join(" | ");
   const capacityDetails = renderKanglongCapacityDetails(payload);
+  const costSummary = renderKanglongCostSummary(payload);
   const chainConfig = renderKanglongChainConfig(payload);
-  kanglongPlanSummary.replaceChildren(...[summaryLine, capacityDetails, chainConfig].filter(Boolean));
+  kanglongPlanSummary.replaceChildren(...[summaryLine, capacityDetails, costSummary, chainConfig].filter(Boolean));
 }
 
 function kanglongExecuteRecheckDetail(payload = {}) {
@@ -2000,10 +2126,56 @@ function kanglongFallbackEventMessage(event = {}, payload = {}) {
   return pieces.length ? pieces.join(" | ") : copyOrDefault("runtime.execution_message_unavailable", "日志信息暂不可用");
 }
 
+function kanglongAccountLabelSnapshot() {
+  const report = kanglongState.plan?.report || {};
+  const request = kanglongState.plan?.request || {};
+  return {
+    ...(request.plan_labels_snapshot || {}),
+    ...(request.account_labels_snapshot || {}),
+    ...(report.plan_labels_snapshot || {}),
+    ...(report.account_labels_snapshot || {}),
+  };
+}
+
+function kanglongDisplayLabelForAccountId(accountId, fallback = "") {
+  const raw = String(accountId || "").trim();
+  if (!raw) return fallback;
+  const snapshots = kanglongAccountLabelSnapshot();
+  if (snapshots[raw]) return snapshots[raw];
+  const account = typeof findKanglongAccount === "function" ? findKanglongAccount(raw, availableAccounts) : null;
+  if (account && typeof kanglongAccountLabel === "function") return kanglongAccountLabel(account);
+  if (/^(tpl:|sub:|main:)/i.test(raw)) return fallback || "";
+  return raw;
+}
+
+function kanglongVisibleMessageParams(params = {}) {
+  const next = { ...params };
+  const replacements = [
+    ["account_id", "account_label"],
+    ["from_account_id", "from_account_label"],
+    ["to_account_id", "to_account_label"],
+  ];
+  replacements.forEach(([idKey, labelKey]) => {
+    if (next[idKey] === undefined && next[labelKey] === undefined) return;
+    next[idKey] = next[labelKey] || kanglongDisplayLabelForAccountId(next[idKey], "");
+  });
+  return next;
+}
+
+function kanglongVisibleLogSource(source = {}) {
+  const params = source.messageParams || source.message_params;
+  if (!params || typeof params !== "object") return source;
+  return {
+    ...source,
+    messageParams: kanglongVisibleMessageParams(params),
+    message_params: kanglongVisibleMessageParams(params),
+  };
+}
+
 function appendKanglongExecutionEvent(event = {}) {
   if (!kanglongExecutionLog) return;
   const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
-  const source = Object.keys(payload).length ? payload : event;
+  const source = kanglongVisibleLogSource(Object.keys(payload).length ? payload : event);
   const fallbackMessage = kanglongFallbackEventMessage(event, payload);
   const row = document.createElement("div");
   row.className = "kanglong-log-row";
@@ -2043,6 +2215,7 @@ async function createKanglongPlan() {
     subaccount_ids: subaccountIds,
     selected_side: kanglongSide?.value || null,
     account_source: accountSource,
+    ...readKanglongTransferSettings(),
   };
   if (accountSource === KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE) {
     if (isKanglongTemplateSnapshotStale()) {
@@ -2059,12 +2232,15 @@ async function createKanglongPlan() {
   });
   kanglongState.plan = payload;
   kanglongState.confirmedPlanVersion = "";
+  rememberKanglongHashesFromPayload(payload);
+  kanglongState.confirmedPlanHash = "";
   kanglongState.latestEventId = 0;
   kanglongState.seenEventIds.clear();
   kanglongActiveRunRestored = true;
   if (kanglongExecutionLog) {
     setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
   }
+  renderKanglongTransferSettings(payload);
   renderKanglongPlanSummary(payload);
   syncKanglongWorkflowButtons(payload, { disableExecute: true });
   return payload;
@@ -2079,6 +2255,7 @@ async function confirmKanglongPlan() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       plan_version: planVersion,
+      plan_input_hash: kanglongState.planInputHash || kanglongState.plan?.plan_input_hash || null,
       idempotency_key: newKanglongIdempotencyKey("confirm"),
       operator: "manual",
       confirmed_warning_codes: [],
@@ -2086,6 +2263,8 @@ async function confirmKanglongPlan() {
   });
   kanglongState.plan = payload;
   kanglongState.confirmedPlanVersion = kanglongPlanVersion(payload) || planVersion;
+  rememberKanglongHashesFromPayload(payload);
+  renderKanglongTransferSettings(payload);
   renderKanglongPlanSummary(payload);
   syncKanglongWorkflowButtons(payload);
   return payload;
@@ -2114,6 +2293,8 @@ async function refreshKanglongExecutionRun(runId) {
   const payload = await request(`/kanglong/simulation/run/${encodeURIComponent(runId)}`);
   if (kanglongRunId(payload) !== runId) return payload;
   kanglongState.plan = payload;
+  rememberKanglongHashesFromPayload(payload);
+  renderKanglongTransferSettings(payload);
   renderKanglongPlanSummary(payload);
   syncKanglongWorkflowButtons(payload);
   if (!isKanglongExecutionLiveStatus(payload.status)) {
@@ -2151,12 +2332,15 @@ async function executeKanglongPlan() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       plan_version: planVersion,
+      confirmed_plan_hash: kanglongState.confirmedPlanHash || kanglongState.plan?.confirmed_plan_hash || kanglongState.plan?.plan?.confirmed_plan_hash || null,
       idempotency_key: newKanglongIdempotencyKey("execute"),
       operator: "manual",
       confirmed_warning_codes: [],
     }),
   });
   kanglongState.plan = payload;
+  rememberKanglongHashesFromPayload(payload);
+  renderKanglongTransferSettings(payload);
   renderKanglongPlanSummary(payload);
   appendKanglongActionResult(payload);
   syncKanglongWorkflowButtons(payload);
@@ -2274,6 +2458,7 @@ async function restoreActiveKanglongRun() {
   const actions = kanglongAvailableActions(payload);
   const planVersion = kanglongPlanVersion(payload);
   kanglongState.plan = payload;
+  rememberKanglongHashesFromPayload(payload);
   kanglongState.confirmedPlanVersion = (
     payload.status === "plan_confirmed" || (actions.includes("execute") && planVersion)
   ) ? planVersion : "";
@@ -2281,6 +2466,7 @@ async function restoreActiveKanglongRun() {
   kanglongState.seenEventIds.clear();
   restoreKanglongTemplateModeFromActive(payload);
   restoreKanglongSelectionFromPayload(payload);
+  renderKanglongTransferSettings(payload);
   renderKanglongAccountPool(availableAccounts);
   if (kanglongExecutionLog) {
     setEmptyState(kanglongExecutionLog, "empty-state", copyOrDefault("console.kanglong.log.empty", "暂无执行日志"));
@@ -4056,6 +4242,25 @@ async function applyAppPage(page) {
   }
   const previousState = cloneExecutionFormState(executionPageFormStates[previousPage]);
   applyAppPageChrome(nextPage);
+  if (nextPage === "kanglong") {
+    refreshExecutionActionButtons();
+    renderCurrentPageExecutionStats();
+    renderExecutionSummaryBanner();
+    renderRiskBanner();
+    if (typeof renderKanglongAccountPool === "function") {
+      renderKanglongAccountPool(availableAccounts);
+      await restoreActiveKanglongRun();
+      try {
+        await refreshKanglongAccountSnapshots();
+      } catch (error) {
+        appendLog("error", "", undefined, {
+          messageCode: "runtime.kanglong.request_failed",
+          messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+        });
+      }
+    }
+    return true;
+  }
   let applied = false;
   try {
     applied = await applyExecutionFormState(executionPageFormStates[appPage]);
@@ -4091,17 +4296,6 @@ async function applyAppPage(page) {
     refreshSimulationHistory();
   } else if (appPage === "real") {
     maybeScheduleCurrentModePrecheck("page_switch");
-  } else if (appPage === "kanglong" && typeof renderKanglongAccountPool === "function") {
-    renderKanglongAccountPool(availableAccounts);
-    await restoreActiveKanglongRun();
-    try {
-      await refreshKanglongAccountSnapshots();
-    } catch (error) {
-      appendLog("error", "", undefined, {
-        messageCode: "runtime.kanglong.request_failed",
-        messageParams: { error: userVisibleErrorMessage(error, error?.message) },
-      });
-    }
   }
   return true;
 }
@@ -6763,12 +6957,17 @@ kanglongTemplateSaveApplyButton?.addEventListener("click", () => {
 });
 kanglongSymbol?.addEventListener("input", () => {
   invalidateKanglongPlan();
+  renderKanglongTransferSettings();
   renderKanglongAccountPool();
   if (appPage === "kanglong") refreshKanglongAccountSnapshotsSoon();
 });
 kanglongSide?.addEventListener("change", () => {
   invalidateKanglongPlan();
+  renderKanglongTransferSettings();
   renderKanglongAccountPool();
+});
+[kanglongTransferPercent, kanglongTransferRounds, kanglongTransferInterval].forEach((input) => {
+  input?.addEventListener("input", handleKanglongTransferSettingsChanged);
 });
 
 saveSimSettingsBtn?.addEventListener("click", async () => {

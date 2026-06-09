@@ -910,6 +910,29 @@ this.renderKanglongAccountRow = renderKanglongAccountRow;
 {
   const { elements, events, sandbox } = loadPageScopedFormStateHelpers();
 
+  elements.get("executionSymbol").value = "ETHUSDC";
+  sandbox.activeSymbol = "BTCUSDC";
+  sandbox.initializeExecutionPageFormStates();
+  sandbox.switchSymbolShouldSucceed = false;
+
+  await sandbox.setAppPage("kanglong");
+
+  assert.equal(sandbox.appPage, "kanglong", "Kanglong page should not roll back when execution-form symbol restore fails");
+  assert.equal(
+    events.some((event) => event.name === "switch"),
+    false,
+    `Kanglong page should not use real/simulation form symbol switching; events=${JSON.stringify(events)}`,
+  );
+  assert.equal(
+    events.some((event) => event.name === "log" && event.messageCode === "runtime.symbol_switch_failed"),
+    false,
+    `Kanglong page should not log a real/simulation symbol switch failure; events=${JSON.stringify(events)}`,
+  );
+}
+
+{
+  const { elements, events, sandbox } = loadPageScopedFormStateHelpers();
+
   elements.get("executionSymbol").value = "BTCUSDC";
   sandbox.initializeExecutionPageFormStates();
 
