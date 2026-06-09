@@ -38,7 +38,7 @@ This plan covers the implementation of the 2026-06-03 redesign spec:
 
 Create:
 
-- `paired_opener/simulation/matching.py`
+- `paired_opener/simulation_matching.py`
 - `paired_opener/kanglong/ledger.py`
 - `paired_opener/kanglong/executor.py`
 - `tests/test_simulation_matching.py`
@@ -136,42 +136,42 @@ Use these error codes exactly:
 
 ### Task 1.1: Characterize current simulation matcher behavior
 
-- [ ] Read `paired_opener/simulation.py` methods `_match_orderbook`, `_match_limit_orderbook`, `_match_orderbook_snapshot`, `_poll_passive_limit_fill`, `_passive_limit_price`, and `_limit_order_crosses`.
-- [ ] Record the current inputs and outputs for `MatchResult`: `filled_qty`, `avg_price`, `fee`, `residual_qty`, `depth_levels_consumed`, `slippage_bps`, `liquidity`, `wait_seconds_consumed`.
-- [ ] Confirm existing tests covering matching in `tests/test_simulation_service.py` and `tests/test_simulation_api.py`.
+- [x] Read `paired_opener/simulation.py` methods `_match_orderbook`, `_match_limit_orderbook`, `_match_orderbook_snapshot`, `_poll_passive_limit_fill`, `_passive_limit_price`, and `_limit_order_crosses`.
+- [x] Record the current inputs and outputs for `MatchResult`: `filled_qty`, `avg_price`, `fee`, `residual_qty`, `depth_levels_consumed`, `slippage_bps`, `liquidity`, `wait_seconds_consumed`.
+- [x] Confirm existing tests covering matching in `tests/test_simulation_service.py` and `tests/test_simulation_api.py`.
 
 ### Task 1.2: Add failing tests for extracted matcher
 
-- [ ] Create `tests/test_simulation_matching.py`.
-- [ ] Add `test_taker_match_consumes_orderbook_depth_with_weighted_average`.
-- [ ] Add `test_passive_limit_waits_across_snapshots_and_reports_residual`.
-- [ ] Add `test_passive_limit_returns_zero_fill_when_price_never_crosses`.
-- [ ] Add `test_stale_market_snapshot_raises_market_data_stale`.
-- [ ] Add `test_fee_is_calculated_from_frozen_fee_rate_and_notional`.
-- [ ] Run `pytest tests/test_simulation_matching.py -q` and verify these tests fail because `paired_opener.simulation.matching` does not exist yet.
+- [x] Create `tests/test_simulation_matching.py`.
+- [x] Add `test_taker_match_consumes_orderbook_depth_with_weighted_average`.
+- [x] Add `test_passive_limit_waits_across_snapshots_and_reports_residual`.
+- [x] Add `test_passive_limit_returns_zero_fill_when_price_never_crosses`.
+- [x] Add `test_stale_market_snapshot_raises_market_data_stale`.
+- [x] Add `test_fee_is_calculated_from_frozen_fee_rate_and_notional`.
+- [x] Run `python -m pytest tests/test_simulation_matching.py -q` and verify these tests fail because `paired_opener.simulation_matching` does not exist yet.
 
-### Task 1.3: Create `paired_opener/simulation/matching.py`
+### Task 1.3: Create `paired_opener/simulation_matching.py`
 
-- [ ] Add `OrderbookLevel` with `price: Decimal` and `qty: Decimal`.
-- [ ] Add `OrderbookSnapshot` with `symbol`, `bids`, `asks`, `ts_ms`, and optional `source`.
-- [ ] Add `MarketDataProvider` protocol with `get_orderbook(symbol: str) -> OrderbookSnapshot`.
-- [ ] Add `DeterministicMarketDataProvider` that reads an in-memory ordered snapshot list and advances on each call.
-- [ ] Add `OrderbookMatcher.match_market(...)` for taker fills.
-- [ ] Add `OrderbookMatcher.match_passive_limit(...)` for maker-style polling.
-- [ ] Return the existing `MatchResult` shape so `SimulationService` can delegate without response contract drift.
-- [ ] Quantize prices, quantities, notional, fees, and residuals through one helper in this module.
+- [x] Add `OrderbookLevel` with `price: Decimal` and `qty: Decimal`.
+- [x] Add `OrderbookSnapshot` with `symbol`, `bids`, `asks`, `event_time`, and optional `source`.
+- [x] Add `MarketDataProvider` protocol with `get_orderbook(symbol: str) -> OrderbookSnapshot`.
+- [x] Add `DeterministicMarketDataProvider` that reads an in-memory ordered snapshot list and advances on each call.
+- [x] Add `OrderbookMatcher.match_orderbook_snapshot(...)` for taker fills.
+- [x] Add `OrderbookMatcher.poll_passive_limit_fill(...)` for maker-style polling.
+- [x] Return the existing `MatchResult` shape so `SimulationService` can delegate without response contract drift.
+- [x] Quantize prices, quantities, notional, fees, and residuals through one helper in this module.
 
 ### Task 1.4: Delegate simulation desk to the shared matcher
 
-- [ ] Update `paired_opener/simulation.py` to import the shared matcher.
-- [ ] Replace private matching math in `_match_orderbook`, `_match_limit_orderbook`, and `_poll_passive_limit_fill` with calls into `OrderbookMatcher`.
-- [ ] Keep the existing public `SimulationService` API unchanged.
-- [ ] Run `pytest tests/test_simulation_matching.py tests/test_simulation_service.py tests/test_simulation_api.py -q`.
+- [x] Update `paired_opener/simulation.py` to import the shared matcher.
+- [x] Replace private matching math in `_match_orderbook_snapshot`, `_passive_limit_price`, `_limit_order_crosses`, and `_passive_fill_qty_from_snapshot` with calls into `OrderbookMatcher`.
+- [x] Keep the existing public `SimulationService` API unchanged.
+- [x] Run `python -m pytest tests/test_simulation_matching.py tests/test_simulation_service.py tests/test_simulation_api.py -q`.
 
 ### Task 1.5: Guard against matcher drift
 
-- [ ] Add regression assertions that old simulation desk payloads still include the same `avg_price`, `fee`, `residual_qty`, and `wait_seconds_consumed` field names.
-- [ ] Run `python -m compileall paired_opener`.
+- [x] Add regression assertions that old simulation desk payloads still include the same `avg_price`, `fee`, `residual_qty`, and `wait_seconds_consumed` field names.
+- [x] Run `python -m compileall paired_opener`.
 
 ---
 
@@ -492,7 +492,7 @@ Use these error codes exactly:
 
 ### Task 9.1: Run Python verification
 
-- [ ] Run `pytest tests/test_simulation_matching.py tests/test_simulation_service.py tests/test_simulation_api.py -q`.
+- [ ] Run `python -m pytest tests/test_simulation_matching.py tests/test_simulation_service.py tests/test_simulation_api.py -q`.
 - [ ] Run `pytest tests/test_kanglong_ledger.py tests/test_kanglong_storage.py tests/test_kanglong_executor.py tests/test_kanglong_workflow_contracts.py -q`.
 - [ ] Run `python -m compileall paired_opener`.
 

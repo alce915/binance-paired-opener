@@ -5,7 +5,6 @@ import csv
 import io
 import json
 import sqlite3
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
@@ -16,6 +15,7 @@ from paired_opener.domain import OrderSide, PositionSide, SessionKind, SingleClo
 from paired_opener.exchange import ExchangeGateway
 from paired_opener.rounding import normalize_qty
 from paired_opener.schemas import SimulationRunRequest
+from paired_opener.simulation_matching import MatchResult, OrderbookMatcher
 from paired_opener.storage import SqliteRepository
 
 
@@ -68,22 +68,6 @@ class SimulationRunStage:
 
 class SimulationLockReason:
     SIMULATION_RUNNING = "simulation_running"
-
-
-@dataclass(slots=True)
-class MatchResult:
-    requested_qty: Decimal
-    filled_qty: Decimal
-    avg_price: Decimal
-    notional: Decimal
-    fee: Decimal
-    residual_qty: Decimal
-    depth_levels_consumed: int
-    slippage_bps: Decimal
-    liquidity: str
-    side: OrderSide
-    position_side: PositionSide
-    wait_seconds_consumed: Decimal = Decimal("0")
 
 
 def _utc_now() -> datetime:
@@ -2488,6 +2472,13 @@ class SimulationService:
             return None
         return self._match_orderbook_snapshot(snapshot, order_side, position_side, target_qty, rules, liquidity=liquidity)
 
+    def _orderbook_matcher(self) -> OrderbookMatcher:
+        settings = self._get_settings()
+        return OrderbookMatcher(
+            maker_fee_rate=settings["maker_fee_rate"],
+            taker_fee_rate=settings["taker_fee_rate"],
+        )
+
     async def _match_limit_orderbook(
         self,
         symbol: str,
@@ -2536,73 +2527,14 @@ class SimulationService:
         liquidity: str,
         limit_price: Decimal | None = None,
     ) -> MatchResult:
-        levels_key = "asks" if order_side == OrderSide.BUY else "bids"
-        levels = snapshot.get(levels_key) or []
-        remaining = target_qty
-        filled = Decimal("0")
-        notional = Decimal("0")
-        consumed = 0
-        best_price = None
-        for raw_level in levels:
-            price = _to_decimal(raw_level.get("price"))
-            if limit_price is not None:
-                if order_side == OrderSide.BUY and price > limit_price:
-                    break
-                if order_side == OrderSide.SELL and price < limit_price:
-                    break
-            available_qty = normalize_qty(_to_decimal(raw_level.get("qty")), rules)
-            if available_qty <= Decimal("0"):
-                continue
-            if best_price is None:
-                best_price = price
-            fill_qty = min(remaining, available_qty)
-            if fill_qty <= Decimal("0"):
-                continue
-            filled += fill_qty
-            notional += fill_qty * price
-            remaining -= fill_qty
-            consumed += 1
-            if remaining <= Decimal("0"):
-                break
-        filled = normalize_qty(filled, rules)
-        remaining = normalize_qty(max(remaining, Decimal("0")), rules)
-        if filled <= Decimal("0"):
-            return MatchResult(
-                requested_qty=target_qty,
-                filled_qty=Decimal("0"),
-                avg_price=Decimal("0"),
-                notional=Decimal("0"),
-                fee=Decimal("0"),
-                residual_qty=target_qty,
-                depth_levels_consumed=0,
-                slippage_bps=Decimal("0"),
-                liquidity=liquidity,
-                side=order_side,
-                position_side=position_side,
-            )
-        avg_price = notional / filled
-        settings = self._get_settings()
-        fee_rate = settings["maker_fee_rate"] if liquidity == "maker" else settings["taker_fee_rate"]
-        fee = _money(notional * fee_rate)
-        if best_price and best_price > Decimal("0"):
-            if order_side == OrderSide.BUY:
-                slippage = ((avg_price - best_price) / best_price) * Decimal("10000")
-            else:
-                slippage = ((best_price - avg_price) / best_price) * Decimal("10000")
-        else:
-            slippage = Decimal("0")
-        return MatchResult(
-            requested_qty=target_qty,
-            filled_qty=filled,
-            avg_price=_money(avg_price).quantize(MONEY_SCALE).normalize(),
-            notional=_money(notional),
-            fee=fee,
-            residual_qty=remaining,
-            depth_levels_consumed=consumed,
-            slippage_bps=_money(slippage),
-            liquidity=liquidity,
-            side=order_side,
+        return self._orderbook_matcher().match_orderbook_snapshot(
+            snapshot,
+            order_side=order_side,
             position_side=position_side,
+            target_qty=target_qty,
+            rules=rules,
+            liquidity=liquidity,
+            limit_price=limit_price,
         )
 
     async def _poll_passive_limit_fill(
@@ -2679,21 +2611,10 @@ class SimulationService:
         )
 
     def _passive_limit_price(self, snapshot: dict[str, Any], order_side: OrderSide) -> Decimal:
-        levels = snapshot.get("bids") if order_side == OrderSide.BUY else snapshot.get("asks")
-        if not levels:
-            return Decimal("0")
-        return _to_decimal(levels[0].get("price"))
+        return self._orderbook_matcher().passive_limit_price(snapshot, order_side)
 
     def _limit_order_crosses(self, snapshot: dict[str, Any], order_side: OrderSide, limit_price: Decimal) -> bool:
-        opposite_levels = snapshot.get("asks") if order_side == OrderSide.BUY else snapshot.get("bids")
-        if not opposite_levels:
-            return False
-        opposite_best = _to_decimal(opposite_levels[0].get("price"))
-        if opposite_best <= Decimal("0"):
-            return False
-        if order_side == OrderSide.BUY:
-            return opposite_best <= limit_price
-        return opposite_best >= limit_price
+        return self._orderbook_matcher().limit_order_crosses(snapshot, order_side, limit_price)
 
     def _passive_fill_qty_from_snapshot(
         self,
@@ -2703,23 +2624,13 @@ class SimulationService:
         remaining: Decimal,
         rules: SymbolRules,
     ) -> Decimal:
-        fillable = Decimal("0")
-        opposite_levels = snapshot.get("asks") if order_side == OrderSide.BUY else snapshot.get("bids")
-        for raw_level in opposite_levels or []:
-            price = _to_decimal(raw_level.get("price"))
-            if order_side == OrderSide.BUY and price > limit_price:
-                break
-            if order_side == OrderSide.SELL and price < limit_price:
-                break
-            fillable += normalize_qty(_to_decimal(raw_level.get("qty")), rules)
-        if fillable <= Decimal("0"):
-            same_levels = snapshot.get("bids") if order_side == OrderSide.BUY else snapshot.get("asks")
-            same_best = _to_decimal((same_levels or [{}])[0].get("price"))
-            if order_side == OrderSide.BUY and same_best > Decimal("0") and same_best < limit_price:
-                fillable = remaining
-            elif order_side == OrderSide.SELL and same_best > limit_price:
-                fillable = remaining
-        return normalize_qty(min(remaining, fillable), rules)
+        return self._orderbook_matcher().passive_fill_qty_from_snapshot(
+            snapshot,
+            order_side,
+            limit_price,
+            remaining,
+            rules,
+        )
 
     async def _fresh_orderbook(self, symbol: str) -> dict[str, Any] | None:
         try:
