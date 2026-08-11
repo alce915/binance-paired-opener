@@ -35,6 +35,9 @@ class AccountConfig:
     name: str
     api_key: str
     api_secret: str
+    credential_type: str = "hmac"
+    account_mode: str = "portfolio_margin"
+    enabled: bool = True
     use_testnet: bool = False
     rest_base_url: str = ""
     ws_base_url: str = ""
@@ -78,6 +81,7 @@ class Settings(BaseSettings):
     binance_use_testnet: bool = False
     binance_accounts: str = ""
     binance_accounts_file: Path = CONFIG_DIR / "binance_accounts.json"
+    binance_accounts_secure_file: Path = CONFIG_DIR / "binance_accounts.secure.json"
     binance_rest_base_url: str = ""
     binance_ws_base_url: str = ""
     binance_recv_window_ms: int = 5_000
@@ -89,7 +93,11 @@ class Settings(BaseSettings):
     symbol_whitelist: list[str] = Field(default_factory=lambda: ["ETHUSDC", "BTCUSDC"])
     symbol_whitelist_file: Path = CONFIG_DIR / "symbol_whitelist.json"
     kanglong_symbol_configs_file: Path = CONFIG_DIR / "kanglong_symbol_configs.json"
+    kanglong_batch_defaults_file: Path = CONFIG_DIR / "kanglong_batch_defaults.json"
     kanglong_test_templates_file: Path = DATA_DIR / "kanglong_test_templates.json"
+    kanglong_capacity_fast_ttl_ms: int = 3_000
+    kanglong_capacity_slow_ttl_ms: int = 60_000
+    kanglong_capacity_private_concurrency: int = 4
     session_event_retention_days: int = 30
     session_event_retention_per_session: int = 2_000
     runtime_log_max_bytes: int = 20 * 1024 * 1024
@@ -180,9 +188,13 @@ class Settings(BaseSettings):
             return default
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-    def load_accounts(self, *, include_accounts_file: bool = False) -> None:
+    def load_accounts(self, *, include_accounts_file: bool = False, allow_empty: bool = False) -> None:
         env_values = self._load_env_values()
         accounts = self._load_accounts_from_file() if include_accounts_file else []
+        if not accounts and allow_empty and not (self.binance_api_key and self.binance_api_secret):
+            self.accounts = {}
+            self.active_account_id = ""
+            return
         if not accounts:
             configured_accounts = env_values.get("BINANCE_ACCOUNTS", self.binance_accounts)
             account_ids = [item.strip().lower() for item in configured_accounts.split(",") if item.strip()]

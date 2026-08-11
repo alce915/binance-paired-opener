@@ -72,6 +72,39 @@ const kanglongTemplateEditor = document.getElementById("kanglongTemplateEditor")
 const kanglongTemplatePreview = document.getElementById("kanglongTemplatePreview");
 const kanglongTemplateSaveButton = document.getElementById("kanglongTemplateSaveButton");
 const kanglongTemplateSaveApplyButton = document.getElementById("kanglongTemplateSaveApplyButton");
+const kanglongAccountManagerButton = document.getElementById("kanglongAccountManagerButton");
+const kanglongAccountManagerModal = document.getElementById("kanglongAccountManagerModal");
+const kanglongAccountManagerClose = document.getElementById("kanglongAccountManagerClose");
+const kanglongCredentialGuide = document.getElementById("kanglongCredentialGuide");
+const kanglongCredentialList = document.getElementById("kanglongCredentialList");
+const kanglongCredentialFile = document.getElementById("kanglongCredentialFile");
+const kanglongCredentialImportMode = document.getElementById("kanglongCredentialImportMode");
+const kanglongCredentialPreviewButton = document.getElementById("kanglongCredentialPreviewButton");
+const kanglongCredentialCommitButton = document.getElementById("kanglongCredentialCommitButton");
+const kanglongCredentialImportPreview = document.getElementById("kanglongCredentialImportPreview");
+const kanglongCredentialAccountId = document.getElementById("kanglongCredentialAccountId");
+const kanglongCredentialName = document.getElementById("kanglongCredentialName");
+const kanglongCredentialApiKey = document.getElementById("kanglongCredentialApiKey");
+const kanglongCredentialApiSecret = document.getElementById("kanglongCredentialApiSecret");
+const kanglongCredentialCreateButton = document.getElementById("kanglongCredentialCreateButton");
+const kanglongBatchOperation = document.getElementById("kanglongBatchOperation");
+const kanglongBatchSourceField = document.getElementById("kanglongBatchSourceField");
+const kanglongBatchSourceRun = document.getElementById("kanglongBatchSourceRun");
+const kanglongBatchSymbol = document.getElementById("kanglongBatchSymbol");
+const kanglongBatchSide = document.getElementById("kanglongBatchSide");
+const kanglongBatchLeverage = document.getElementById("kanglongBatchLeverage");
+const kanglongBatchPerLegNotional = document.getElementById("kanglongBatchPerLegNotional");
+const kanglongBatchRounds = document.getElementById("kanglongBatchRounds");
+const kanglongBatchInterval = document.getElementById("kanglongBatchInterval");
+const kanglongBatchAccountSelector = document.getElementById("kanglongBatchAccountSelector");
+const kanglongBatchSaveDefaults = document.getElementById("kanglongBatchSaveDefaults");
+const kanglongBatchCreatePlan = document.getElementById("kanglongBatchCreatePlan");
+const kanglongBatchConfirm = document.getElementById("kanglongBatchConfirm");
+const kanglongBatchExecute = document.getElementById("kanglongBatchExecute");
+const kanglongBatchCapacityPreview = document.getElementById("kanglongBatchCapacityPreview");
+const kanglongBatchQueue = document.getElementById("kanglongBatchQueue");
+const kanglongBatchRunActions = document.getElementById("kanglongBatchRunActions");
+const kanglongBatchCostReport = document.getElementById("kanglongBatchCostReport");
 const executionSummaryBanner = document.getElementById("executionSummaryBanner");
 const executionSummaryText = document.getElementById("executionSummaryText");
 const executionRiskBanner = document.getElementById("executionRiskBanner");
@@ -102,6 +135,18 @@ const modePanels = {
 };
 const DEFAULT_SYMBOL = "ETHUSDC";
 const KANGLONG_PLAN_ENDPOINT = "/kanglong/simulation/plan";
+const KANGLONG_BATCH_PLAN_ENDPOINT = "/kanglong/batch-simulation/plan";
+const KANGLONG_BATCH_CAPACITY_ENDPOINT = "/kanglong/batch-simulation/capacity-preview";
+const KANGLONG_BATCH_DEFAULTS_ENDPOINT = "/config/kanglong-batch-defaults";
+const KANGLONG_BATCH_DEFAULTS = Object.freeze({
+  operation: "open",
+  symbol: "ETHUSDC",
+  preferredSide: "LONG",
+  leverage: 100,
+  perLegNotional: "250000",
+  roundCount: 30,
+  roundIntervalSeconds: 3,
+});
 const KANGLONG_ACCOUNT_SOURCE_RUNTIME = "runtime";
 const KANGLONG_ACCOUNT_SOURCE_TEST_TEMPLATE = "test_template";
 const KANGLONG_TEMPLATE_MAX_BATCH_SUBACCOUNTS = 50;
@@ -151,6 +196,23 @@ const kanglongState = {
   templatePreviewError: null,
   activeTemplateRunLock: null,
   realAccountPoolSnapshot: null,
+};
+const kanglongBatchState = {
+  initialized: false,
+  accounts: [],
+  selectedAccountIds: new Set(),
+  credentialRevision: "",
+  migrationRequired: false,
+  importedCandidate: null,
+  importPreview: null,
+  previewSeq: 0,
+  previewTimer: null,
+  previewAbortController: null,
+  capacityPreview: null,
+  currentInputHash: "",
+  run: null,
+  poller: null,
+  pendingBatchActions: new Map(),
 };
 let kanglongActiveRunRestored = false;
 let activeKanglongExecutionPoller = null;
@@ -928,7 +990,7 @@ function resolveLogMessage(source = {}, fallback = "") {
     const messageCode = source.messageCode || source.message_code;
     const messageParams = source.messageParams || source.message_params || {};
     if (messageCode) {
-      const rendered = formatCopy(messageCode, messageParams);
+      const rendered = formatCopy(messageCode, normalizeLogMessageParams(messageCode, messageParams));
       if (rendered !== messageCode) {
         return rendered;
       }
@@ -941,6 +1003,55 @@ function resolveLogMessage(source = {}, fallback = "") {
     }
   }
   return safeFallback;
+}
+
+function kanglongAccountLabelForId(accountId) {
+  const rawAccountId = String(accountId || "").trim();
+  if (!rawAccountId) return "";
+  const normalizedAccountId = kanglongAccountId(rawAccountId);
+  const report = kanglongState.plan?.report && typeof kanglongState.plan.report === "object" ? kanglongState.plan.report : {};
+  const syntheticState = report.synthetic_account_state && typeof report.synthetic_account_state === "object" ? report.synthetic_account_state : {};
+  const accountSnapshot = report.account_snapshot && typeof report.account_snapshot === "object" ? report.account_snapshot : {};
+  const accountLists = [
+    availableAccounts,
+    kanglongState.templatePreview?.accounts,
+    syntheticState.accounts,
+    accountSnapshot.accounts,
+  ];
+  for (const accounts of accountLists) {
+    if (!Array.isArray(accounts)) continue;
+    const account = accounts.find((item) => kanglongAccountId(item?.account_id || item?.id) === normalizedAccountId);
+    if (!account) continue;
+    const label = String(
+      account.name
+      || account.account_name
+      || account.label
+      || account.template_account_id
+      || account.templateAccountId
+      || "",
+    ).trim();
+    if (label && !isKanglongInternalAccountId(label)) return label;
+  }
+  return isKanglongInternalAccountId(rawAccountId) ? "" : rawAccountId;
+}
+
+function isKanglongInternalAccountId(value) {
+  return /^(tpl:|sub:|main:)/i.test(String(value || "").trim());
+}
+
+function normalizeLogMessageParams(messageCode, params = {}) {
+  if (messageCode !== "events.kanglong.trade_executed") return params;
+  const accountId = params.account_id || params.accountId || "";
+  const rawAccountLabel = String(params.account_label || params.accountLabel || "").trim();
+  const fallbackLabel = kanglongAccountLabelForId(accountId);
+  const accountLabel = !isKanglongInternalAccountId(rawAccountLabel) ? rawAccountLabel : "";
+  const visibleAccount = accountLabel || fallbackLabel || (!isKanglongInternalAccountId(accountId) ? String(accountId || "") : "");
+  return {
+    ...params,
+    account_id: visibleAccount,
+    account_label: visibleAccount,
+    accountLabel: visibleAccount,
+  };
 }
 
 function nowTime() {
@@ -989,6 +1100,686 @@ function request(path, options = {}) {
       return text;
     }
   });
+}
+
+function kanglongManagementHeaders(extra = {}) {
+  const token = String(APP_CONFIG.localManagementToken || "");
+  return {
+    ...extra,
+    ...(token ? { "X-Local-Management-Token": token } : {}),
+  };
+}
+
+function kanglongManagementRequest(path, options = {}) {
+  return request(path, {
+    ...options,
+    headers: kanglongManagementHeaders(options.headers || {}),
+  });
+}
+
+function clearKanglongCredentialSecrets() {
+  [kanglongCredentialApiKey, kanglongCredentialApiSecret].forEach((input) => {
+    if (input) input.value = "";
+  });
+  if (kanglongCredentialFile) kanglongCredentialFile.value = "";
+  kanglongBatchState.importedCandidate = null;
+}
+
+function invalidateKanglongCredentialPreview() {
+  kanglongBatchState.importPreview = null;
+  if (kanglongCredentialCommitButton) kanglongCredentialCommitButton.disabled = true;
+  if (kanglongCredentialImportPreview) kanglongCredentialImportPreview.textContent = "";
+}
+
+function renderKanglongCredentialGuide() {
+  if (!kanglongCredentialGuide) return;
+  if (kanglongBatchState.migrationRequired) {
+    kanglongCredentialGuide.textContent = copyOrDefault(
+      "console.kanglong.credentials.migration_required",
+      "检测到旧配置中的掩码账号。请导入 HMAC 凭据完成迁移；系统不会回显 Secret。",
+    );
+    return;
+  }
+  kanglongCredentialGuide.textContent = kanglongBatchState.accounts.length
+    ? copyOrDefault("console.kanglong.credentials.security_note", "API Secret 仅在本机内存中短暂使用，页面不会回显或持久化。")
+    : copyOrDefault("console.kanglong.credentials.empty_guide", "尚未配置真实行情账号。请导入 HMAC API Key 后再创建批次模拟。 ");
+}
+
+async function reorderKanglongCredentials(accountId, offset) {
+  const ids = kanglongBatchState.accounts.map((account) => account.account_id);
+  const index = ids.indexOf(accountId);
+  const destination = index + offset;
+  if (index < 0 || destination < 0 || destination >= ids.length) return;
+  [ids[index], ids[destination]] = [ids[destination], ids[index]];
+  await kanglongManagementRequest("/config/account-credentials/order", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account_ids: ids }),
+  });
+  await loadKanglongCredentials();
+}
+
+async function mutateKanglongCredential(accountId, action) {
+  if (action === "delete" && !window.confirm(copyOrDefault("console.kanglong.credentials.delete_confirm", "确认删除此账号吗？"))) return;
+  const path = action === "verify"
+    ? `/config/account-credentials/${encodeURIComponent(accountId)}/verify`
+    : `/config/account-credentials/${encodeURIComponent(accountId)}`;
+  await kanglongManagementRequest(path, { method: action === "verify" ? "POST" : "DELETE" });
+  await loadKanglongCredentials();
+}
+
+function renderKanglongCredentialList() {
+  if (!kanglongCredentialList) return;
+  kanglongCredentialList.replaceChildren();
+  if (!kanglongBatchState.accounts.length) {
+    setEmptyState(kanglongCredentialList, "empty-state", copyOrDefault("console.kanglong.credentials.empty", "暂无已保存账号"));
+    return;
+  }
+  kanglongBatchState.accounts.forEach((account, index) => {
+    const row = document.createElement("div");
+    row.className = "kanglong-credential-row";
+    const summary = document.createElement("div");
+    summary.textContent = `${index + 1}. ${account.name} · ${account.api_key_masked}`;
+    row.appendChild(summary);
+    const actions = document.createElement("div");
+    actions.className = "kanglong-manager-actions";
+    [
+      ["↑", () => reorderKanglongCredentials(account.account_id, -1), index === 0],
+      ["↓", () => reorderKanglongCredentials(account.account_id, 1), index === kanglongBatchState.accounts.length - 1],
+      [copyOrDefault("console.kanglong.credentials.verify", "验证"), () => mutateKanglongCredential(account.account_id, "verify"), false],
+      [copyOrDefault("console.kanglong.credentials.delete", "删除"), () => mutateKanglongCredential(account.account_id, "delete"), false],
+    ].forEach(([label, handler, disabled]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "inline-btn secondary";
+      button.textContent = label;
+      button.disabled = disabled;
+      button.addEventListener("click", () => Promise.resolve(handler()).catch(reportKanglongBatchError));
+      actions.appendChild(button);
+    });
+    row.appendChild(actions);
+    kanglongCredentialList.appendChild(row);
+  });
+}
+
+function renderKanglongBatchAccountSelector() {
+  if (!kanglongBatchAccountSelector) return;
+  kanglongBatchAccountSelector.replaceChildren();
+  kanglongBatchState.accounts.forEach((account, index) => {
+    const label = document.createElement("label");
+    label.className = "kanglong-credential-row";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = kanglongBatchState.selectedAccountIds.has(account.account_id);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) kanglongBatchState.selectedAccountIds.add(account.account_id);
+      else kanglongBatchState.selectedAccountIds.delete(account.account_id);
+      invalidateKanglongBatchPlan();
+      scheduleKanglongCapacityPreview();
+    });
+    label.append(checkbox, document.createTextNode(` ${index + 1}. ${account.name} · ${account.api_key_masked}`));
+    kanglongBatchAccountSelector.appendChild(label);
+  });
+  if (!kanglongBatchState.accounts.length) {
+    setEmptyState(kanglongBatchAccountSelector, "empty-state", copyOrDefault("console.kanglong.credentials.empty_guide", "请先配置 API 账号。"));
+  }
+}
+
+async function loadKanglongCredentials() {
+  try {
+    const payload = await kanglongManagementRequest("/config/account-credentials");
+    kanglongBatchState.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+    kanglongBatchState.credentialRevision = payload.credential_revision || "";
+    kanglongBatchState.migrationRequired = Boolean(payload.migration_required);
+    const validIds = new Set(kanglongBatchState.accounts.filter((account) => account.enabled).map((account) => account.account_id));
+    if (!kanglongBatchState.selectedAccountIds.size) {
+      kanglongBatchState.selectedAccountIds = validIds;
+    } else {
+      kanglongBatchState.selectedAccountIds = new Set(
+        Array.from(kanglongBatchState.selectedAccountIds).filter((accountId) => validIds.has(accountId)),
+      );
+    }
+    renderKanglongCredentialGuide();
+    renderKanglongCredentialList();
+    renderKanglongBatchAccountSelector();
+    return payload;
+  } catch (error) {
+    if (error?.code === "account_credentials_not_configured") {
+      kanglongBatchState.accounts = [];
+      renderKanglongCredentialGuide();
+      renderKanglongCredentialList();
+      renderKanglongBatchAccountSelector();
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function readKanglongCredentialImportFile() {
+  invalidateKanglongCredentialPreview();
+  const file = kanglongCredentialFile?.files?.[0];
+  if (!file) return;
+  if (file.size > 256 * 1024) throw new Error(copyOrDefault("console.kanglong.credentials.too_large", "文件不能超过 256 KiB"));
+  const parsed = JSON.parse(await file.text());
+  const accounts = Array.isArray(parsed) ? parsed : parsed.accounts;
+  if (!Array.isArray(accounts) || accounts.length === 0 || accounts.length > 100) {
+    throw new Error(copyOrDefault("console.kanglong.credentials.invalid_count", "账号数量必须为 1 到 100 个"));
+  }
+  accounts.forEach((account) => {
+    if (account?.credential_type !== "hmac") {
+      throw new Error(copyOrDefault("console.kanglong.credentials.hmac_only", "仅支持 HMAC API 凭据"));
+    }
+  });
+  kanglongBatchState.importedCandidate = { accounts };
+  if (kanglongCredentialPreviewButton) kanglongCredentialPreviewButton.disabled = false;
+}
+
+async function previewKanglongCredentialImport() {
+  const candidate = kanglongBatchState.importedCandidate;
+  if (!candidate) return;
+  const mode = kanglongCredentialImportMode?.value === "replace" ? "replace" : "merge";
+  if (mode === "replace" && !window.confirm(copyOrDefault("console.kanglong.credentials.replace_preview_confirm", "替换模式会删除文件外账号，确认预览吗？"))) return;
+  const payload = await kanglongManagementRequest("/config/account-credentials/import/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...candidate, mode }),
+  });
+  kanglongBatchState.importPreview = payload;
+  if (kanglongCredentialCommitButton) kanglongCredentialCommitButton.disabled = false;
+  if (kanglongCredentialImportPreview) {
+    const changes = payload.changes || {};
+    kanglongCredentialImportPreview.textContent = copyOrDefault(
+      "console.kanglong.credentials.preview_summary",
+      "新增 {added}；更新 {updated}；保留 {unchanged}；删除 {removed}。最终顺序：{order}",
+      {
+        added: (changes.added_account_ids || []).length,
+        updated: (changes.updated_account_ids || []).length,
+        unchanged: (changes.unchanged_account_ids || []).length,
+        removed: (changes.removed_account_ids || []).length,
+        order: (payload.final_accounts || []).map((account) => account.name).join(" → "),
+      },
+    );
+  }
+}
+
+async function commitKanglongCredentialImport() {
+  const preview = kanglongBatchState.importPreview;
+  if (!preview) return;
+  if (kanglongCredentialImportMode?.value === "replace" && !window.confirm(copyOrDefault("console.kanglong.credentials.replace_commit_confirm", "再次确认：使用预览结果替换全部账号？"))) return;
+  try {
+    await kanglongManagementRequest("/config/account-credentials/import/commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preview_token: preview.preview_token }),
+    });
+    invalidateKanglongCredentialPreview();
+    await loadKanglongCredentials();
+  } catch (error) {
+    if (error?.code === "credential_revision_conflict") {
+      invalidateKanglongCredentialPreview();
+      await loadKanglongCredentials();
+    }
+    throw error;
+  } finally {
+    clearKanglongCredentialSecrets();
+    if (kanglongCredentialPreviewButton) kanglongCredentialPreviewButton.disabled = true;
+  }
+}
+
+async function createKanglongCredential() {
+  const payload = {
+    account_id: String(kanglongCredentialAccountId?.value || "").trim(),
+    name: String(kanglongCredentialName?.value || "").trim(),
+    api_key: String(kanglongCredentialApiKey?.value || "").trim(),
+    api_secret: String(kanglongCredentialApiSecret?.value || "").trim(),
+    credential_type: "hmac",
+    account_mode: "portfolio_margin",
+    enabled: true,
+  };
+  try {
+    await kanglongManagementRequest("/config/account-credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (kanglongCredentialAccountId) kanglongCredentialAccountId.value = "";
+    if (kanglongCredentialName) kanglongCredentialName.value = "";
+    await loadKanglongCredentials();
+  } finally {
+    clearKanglongCredentialSecrets();
+  }
+}
+
+function readKanglongBatchInput() {
+  const operation = kanglongBatchOperation?.value === "close" ? "close" : "open";
+  return {
+    operation,
+    symbol: String(kanglongBatchSymbol?.value || KANGLONG_BATCH_DEFAULTS.symbol).trim().toUpperCase(),
+    preferred_side: kanglongBatchSide?.value === "SHORT" ? "SHORT" : "LONG",
+    leverage: Number(kanglongBatchLeverage?.value || KANGLONG_BATCH_DEFAULTS.leverage),
+    per_leg_notional: String(kanglongBatchPerLegNotional?.value || KANGLONG_BATCH_DEFAULTS.perLegNotional).trim(),
+    account_ids: kanglongBatchState.accounts
+      .map((account) => account.account_id)
+      .filter((accountId) => kanglongBatchState.selectedAccountIds.has(accountId)),
+    source_open_run_id: operation === "close" ? String(kanglongBatchSourceRun?.value || "").trim() : null,
+    round_count: Number(kanglongBatchRounds?.value || KANGLONG_BATCH_DEFAULTS.roundCount),
+    round_interval_seconds: Number(kanglongBatchInterval?.value || KANGLONG_BATCH_DEFAULTS.roundIntervalSeconds),
+  };
+}
+
+function kanglongBatchInputHash(input) {
+  const raw = JSON.stringify(input);
+  let hash = 2166136261;
+  for (let index = 0; index < raw.length; index += 1) {
+    hash ^= raw.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `ui-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function invalidateKanglongBatchPlan() {
+  kanglongBatchState.run = null;
+  if (kanglongBatchConfirm) kanglongBatchConfirm.disabled = true;
+  if (kanglongBatchExecute) kanglongBatchExecute.disabled = true;
+  if (kanglongBatchQueue) kanglongBatchQueue.replaceChildren();
+  if (kanglongBatchRunActions) kanglongBatchRunActions.replaceChildren();
+  if (kanglongBatchCostReport) kanglongBatchCostReport.replaceChildren();
+}
+
+function formatKanglongBatchNumber(value, digits = 2) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return number.toLocaleString(APP_LOCALE, { maximumFractionDigits: digits });
+}
+
+function renderKanglongCapacityPreview(payload = kanglongBatchState.capacityPreview) {
+  if (!kanglongBatchCapacityPreview) return;
+  kanglongBatchCapacityPreview.replaceChildren();
+  if (readKanglongBatchInput().operation === "close") {
+    const note = document.createElement("div");
+    note.className = "kanglong-batch-notice";
+    note.textContent = copyOrDefault("console.kanglong.batch.close_capacity_note", "平仓不使用开仓容量阻断；计划生成后展示来源批次各腿剩余量。 ");
+    kanglongBatchCapacityPreview.appendChild(note);
+    return;
+  }
+  if (!payload) return;
+  const batch = document.createElement("div");
+  batch.className = "kanglong-batch-notice";
+  batch.textContent = payload.batch_capacity_known
+    ? copyOrDefault("console.kanglong.batch.capacity_batch", "批次：请求 {requested} USD / 保守估算可开 {capacity} USD = {percent}%；最高占用账号：{account}", {
+      requested: formatKanglongBatchNumber(payload.batch_requested_gross_notional),
+      capacity: formatKanglongBatchNumber(payload.batch_conservative_openable_notional),
+      percent: formatKanglongBatchNumber(payload.batch_estimated_usage_percent),
+      account: payload.bottleneck_account_id || "--",
+    })
+    : copyOrDefault("console.kanglong.batch.capacity_unknown", "容量未知：至少一个必需快照分量已过期或缺失。 ");
+  kanglongBatchCapacityPreview.appendChild(batch);
+  (payload.accounts || []).forEach((account, index) => {
+    const row = document.createElement("div");
+    row.className = "kanglong-capacity-account";
+    row.dataset.testid = "kanglong-batch-capacity-account-row";
+    const headline = document.createElement("div");
+    headline.textContent = account.capacity_known
+      ? copyOrDefault("console.kanglong.batch.capacity_account", "账号 {index}：请求 {requested} USD / 保守估算可开 {capacity} USD = {percent}%，限制项：{factor}", {
+        index: String(index + 1).padStart(2, "0"),
+        requested: formatKanglongBatchNumber(account.capacity_requested_gross_notional),
+        capacity: formatKanglongBatchNumber(account.conservative_openable_notional),
+        percent: formatKanglongBatchNumber(account.estimated_capacity_usage_percent),
+        factor: account.limiting_factor || "--",
+      })
+      : `${account.account_name || account.account_id}：${copyOrDefault("console.kanglong.batch.capacity_unknown", "容量未知")}`;
+    row.appendChild(headline);
+    const leverage = document.createElement("div");
+    leverage.textContent = copyOrDefault("console.kanglong.batch.leverage_detail", "请求/当前/有效杠杆：{requested}X / {current}X / {effective}X", {
+      requested: account.requested_leverage ?? "--",
+      current: account.current_symbol_leverage ?? "--",
+      effective: account.effective_capacity_leverage ?? "--",
+    });
+    row.appendChild(leverage);
+    if (Number(account.current_symbol_leverage) < Number(account.requested_leverage)) {
+      const warning = document.createElement("div");
+      warning.className = "alert warn";
+      warning.textContent = copyOrDefault("console.kanglong.batch.current_leverage_used", "容量按当前有效杠杆计算。 ");
+      row.appendChild(warning);
+    }
+    const exposure = document.createElement("div");
+    exposure.textContent = copyOrDefault("console.kanglong.batch.exposure_detail", "当前/投影敞口：{existing} / {projected} USD；档位上限：{bracket}；系数：{coef}；当前最大名义值：{maximum}", {
+      existing: formatKanglongBatchNumber(account.existing_symbol_exposure),
+      projected: formatKanglongBatchNumber(account.projected_symbol_exposure),
+      bracket: formatKanglongBatchNumber(account.selected_bracket_effective_cap),
+      coef: account.bracket_notional_coef ?? "--",
+      maximum: formatKanglongBatchNumber(account.current_symbol_max_notional_value),
+    });
+    row.appendChild(exposure);
+    const timestamps = document.createElement("div");
+    timestamps.textContent = `assembled_at: ${account.assembled_at || "--"} · oldest_component_at: ${account.oldest_component_at || "--"}`;
+    row.appendChild(timestamps);
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = copyOrDefault("console.kanglong.batch.snapshot_details", "查看快照分量");
+    details.appendChild(summary);
+    Object.entries(account.snapshot_components || {}).forEach(([name, component]) => {
+      const line = document.createElement("div");
+      line.textContent = `${name}: ${component.valid ? "fresh" : "stale"} · ${component.source || "--"} · ${component.observed_at || "--"} · ${component.age_ms ?? "--"}ms`;
+      details.appendChild(line);
+    });
+    row.appendChild(details);
+    kanglongBatchCapacityPreview.appendChild(row);
+  });
+}
+
+async function refreshKanglongCapacityPreview() {
+  const input = readKanglongBatchInput();
+  if (input.operation === "close") {
+    if (kanglongBatchState.previewAbortController) kanglongBatchState.previewAbortController.abort();
+    kanglongBatchState.capacityPreview = null;
+    renderKanglongCapacityPreview();
+    return null;
+  }
+  if (!input.account_ids.length) {
+    kanglongBatchState.capacityPreview = null;
+    renderKanglongCapacityPreview();
+    return null;
+  }
+  if (kanglongBatchState.previewAbortController) kanglongBatchState.previewAbortController.abort();
+  const controller = new AbortController();
+  kanglongBatchState.previewAbortController = controller;
+  const requestSeq = ++kanglongBatchState.previewSeq;
+  const inputHash = kanglongBatchInputHash(input);
+  kanglongBatchState.currentInputHash = inputHash;
+  try {
+    const payload = await kanglongManagementRequest(KANGLONG_BATCH_CAPACITY_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...input, request_seq: requestSeq, input_hash: inputHash }),
+      signal: controller.signal,
+    });
+    if (payload.request_seq !== requestSeq || payload.input_hash !== kanglongBatchState.currentInputHash) return null;
+    kanglongBatchState.capacityPreview = payload;
+    renderKanglongCapacityPreview(payload);
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError") return null;
+    throw error;
+  } finally {
+    if (kanglongBatchState.previewAbortController === controller) kanglongBatchState.previewAbortController = null;
+  }
+}
+
+function scheduleKanglongCapacityPreview() {
+  if (kanglongBatchState.previewAbortController) {
+    kanglongBatchState.previewAbortController.abort();
+    kanglongBatchState.previewAbortController = null;
+  }
+  invalidateKanglongBatchPlan();
+  kanglongBatchState.capacityPreview = null;
+  kanglongBatchState.currentInputHash = kanglongBatchInputHash(readKanglongBatchInput());
+  renderKanglongCapacityPreview();
+  if (kanglongBatchState.previewTimer) clearTimeout(kanglongBatchState.previewTimer);
+  if (readKanglongBatchInput().operation === "close") return;
+  kanglongBatchState.previewTimer = setTimeout(() => {
+    refreshKanglongCapacityPreview().catch(reportKanglongBatchError);
+  }, 300);
+}
+
+function applyKanglongBatchDefaults(defaults = KANGLONG_BATCH_DEFAULTS) {
+  if (kanglongBatchSymbol) kanglongBatchSymbol.value = defaults.symbol || KANGLONG_BATCH_DEFAULTS.symbol;
+  if (kanglongBatchSide) kanglongBatchSide.value = defaults.preferred_side || defaults.preferredSide || KANGLONG_BATCH_DEFAULTS.preferredSide;
+  if (kanglongBatchLeverage) kanglongBatchLeverage.value = defaults.leverage ?? KANGLONG_BATCH_DEFAULTS.leverage;
+  if (kanglongBatchPerLegNotional) kanglongBatchPerLegNotional.value = defaults.per_leg_notional || defaults.perLegNotional || KANGLONG_BATCH_DEFAULTS.perLegNotional;
+  if (kanglongBatchRounds) kanglongBatchRounds.value = defaults.round_count ?? defaults.roundCount ?? KANGLONG_BATCH_DEFAULTS.roundCount;
+  if (kanglongBatchInterval) kanglongBatchInterval.value = defaults.round_interval_seconds ?? defaults.roundIntervalSeconds ?? KANGLONG_BATCH_DEFAULTS.roundIntervalSeconds;
+}
+
+async function loadKanglongBatchDefaults() {
+  const defaults = await kanglongManagementRequest(KANGLONG_BATCH_DEFAULTS_ENDPOINT);
+  applyKanglongBatchDefaults(defaults);
+  return defaults;
+}
+
+async function saveKanglongBatchDefaults() {
+  const input = readKanglongBatchInput();
+  return kanglongManagementRequest(KANGLONG_BATCH_DEFAULTS_ENDPOINT, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      symbol: input.symbol,
+      preferred_side: input.preferred_side,
+      leverage: input.leverage,
+      per_leg_notional: input.per_leg_notional,
+      round_count: input.round_count,
+      round_interval_seconds: input.round_interval_seconds,
+    }),
+  });
+}
+
+function newKanglongBatchIdempotencyKey(action) {
+  const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `batch-${action}-${random}`;
+}
+
+async function requestKanglongBatchMutation(actionKey, path, payload) {
+  let pending = kanglongBatchState.pendingBatchActions.get(actionKey);
+  if (!pending) {
+    pending = { path, payload: { ...payload, idempotency_key: newKanglongBatchIdempotencyKey(actionKey) } };
+    kanglongBatchState.pendingBatchActions.set(actionKey, pending);
+  }
+  const send = () => kanglongManagementRequest(pending.path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(pending.payload),
+  });
+  try {
+    let response;
+    try {
+      response = await send();
+    } catch (error) {
+      if (!(error instanceof TypeError) && error?.name !== "AbortError") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      response = await send();
+    }
+    kanglongBatchState.pendingBatchActions.delete(actionKey);
+    return response;
+  } catch (error) {
+    if (!(error instanceof TypeError) && error?.name !== "AbortError") {
+      kanglongBatchState.pendingBatchActions.delete(actionKey);
+    }
+    throw error;
+  }
+}
+
+function kanglongBatchPlan(run = kanglongBatchState.run) {
+  return run?.plan && typeof run.plan === "object" ? run.plan : {};
+}
+
+function renderKanglongBatchCostReport(run = kanglongBatchState.run) {
+  if (!kanglongBatchCostReport) return;
+  kanglongBatchCostReport.replaceChildren();
+  const costs = run?.report?.batch_costs || {};
+  if (!Object.keys(costs).length) {
+    setEmptyState(kanglongBatchCostReport, "empty-state", copyOrDefault("console.kanglong.batch.cost_empty", "执行后按账号、腿和轮次展示手续费与磨损。"));
+    return;
+  }
+  const summary = document.createElement("div");
+  summary.className = "kanglong-batch-notice";
+  summary.textContent = copyOrDefault("console.kanglong.batch.cost_summary", "手续费 {fee}；不利磨损 {wear}；价格改善 {improvement}；点差/冲击/时序/配平 {spread}/{impact}/{timing}/{alignment}", {
+    fee: formatKanglongBatchNumber(costs.total_fee_cost, 8),
+    wear: formatKanglongBatchNumber(costs.total_adverse_wear, 8),
+    improvement: formatKanglongBatchNumber(costs.total_price_improvement, 8),
+    spread: formatKanglongBatchNumber(costs.spread_cost, 8),
+    impact: formatKanglongBatchNumber(costs.market_impact_cost, 8),
+    timing: formatKanglongBatchNumber(costs.timing_drift_cost, 8),
+    alignment: formatKanglongBatchNumber(costs.alignment_cost, 8),
+  });
+  kanglongBatchCostReport.appendChild(summary);
+  Object.entries(costs.accounts || {}).forEach(([accountId, account]) => {
+    const row = document.createElement("div");
+    row.className = "kanglong-queue-row";
+    row.textContent = `${accountId} · fee ${formatKanglongBatchNumber(account.fee_cost, 8)} · wear ${formatKanglongBatchNumber(account.total_adverse_wear, 8)} · improvement ${formatKanglongBatchNumber(account.price_improvement, 8)}`;
+    kanglongBatchCostReport.appendChild(row);
+  });
+}
+
+function renderKanglongCloseBalances(plan) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "kanglong-batch-notice";
+  wrapper.textContent = copyOrDefault("console.kanglong.batch.close_remaining_title", "来源批次各账号可平余额（本次计划不超过以下数量）");
+  (plan.accounts || []).forEach((account) => {
+    const line = document.createElement("div");
+    line.textContent = `${account.account_id}: LONG ${account.source_long_remaining_qty || "0"} / SHORT ${account.source_short_remaining_qty || "0"}; max LONG ${account.target_long_qty || "0"} / SHORT ${account.target_short_qty || "0"}`;
+    wrapper.appendChild(line);
+  });
+  return wrapper;
+}
+
+function renderKanglongBatchRun(run = kanglongBatchState.run) {
+  if (!run || !kanglongBatchQueue) return;
+  kanglongBatchQueue.replaceChildren();
+  const plan = kanglongBatchPlan(run);
+  const header = document.createElement("div");
+  header.className = "kanglong-batch-notice";
+  header.textContent = `${run.run_id} · ${formatKanglongStatus(run.status)} · ${plan.symbol || "--"} · ${plan.preferred_side || "--"}`;
+  kanglongBatchQueue.appendChild(header);
+  if (plan.operation === "close") kanglongBatchQueue.appendChild(renderKanglongCloseBalances(plan));
+  (run.accounts || plan.accounts || []).forEach((account) => {
+    const row = document.createElement("div");
+    row.className = "kanglong-queue-row";
+    const status = account.status || "waiting";
+    const reason = account.reason || account.blocked_reason || "";
+    row.textContent = `${Number(account.sequence ?? 0) + 1}. ${account.account_id} · ${formatKanglongStatus(status)}${reason ? ` · ${formatReason(reason, {}, reason)}` : ""}`;
+    kanglongBatchQueue.appendChild(row);
+  });
+  const actions = Array.isArray(run.available_actions) ? run.available_actions : [];
+  if (kanglongBatchConfirm) kanglongBatchConfirm.disabled = !actions.includes("confirm");
+  if (kanglongBatchExecute) kanglongBatchExecute.disabled = !actions.includes("execute");
+  if (kanglongBatchRunActions) {
+    kanglongBatchRunActions.replaceChildren();
+    actions
+      .filter((action) => ["pause", "resume", "stop", "refresh_plan", "recover"].includes(action))
+      .filter((action) => action !== "recover" || run.status === "needs_abort_recover")
+      .forEach((action) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "secondary";
+        button.textContent = copyOrDefault(`console.kanglong.batch.action.${action}`, action);
+        button.addEventListener("click", () => controlKanglongBatchRun(action).catch(reportKanglongBatchError));
+        kanglongBatchRunActions.appendChild(button);
+      });
+  }
+  renderKanglongBatchCostReport(run);
+}
+
+function setKanglongBatchRun(run) {
+  kanglongBatchState.run = run;
+  renderKanglongBatchRun(run);
+  const live = ["execution_starting", "running", "pause_pending", "stop_pending", "retry_wait"].includes(run?.status);
+  if (live) startKanglongBatchPoller();
+  else stopKanglongBatchPoller();
+  return run;
+}
+
+async function createKanglongBatchPlan() {
+  const input = readKanglongBatchInput();
+  if (!input.account_ids.length) throw new Error(copyOrDefault("console.kanglong.batch.accounts_required", "请选择至少一个账号"));
+  if (input.operation === "close" && !input.source_open_run_id) throw new Error(copyOrDefault("console.kanglong.batch.source_required", "平仓必须填写来源开仓 Run ID"));
+  if (input.operation === "open") {
+    const preview = kanglongBatchState.capacityPreview;
+    const currentHash = kanglongBatchInputHash(input);
+    if (!preview || preview.input_hash !== currentHash || !preview.batch_capacity_known || preview.batch_blocked) {
+      throw new Error(copyOrDefault("console.kanglong.batch.capacity_required", "请等待最新容量预览通过后再生成计划"));
+    }
+  }
+  const run = await kanglongManagementRequest(KANGLONG_BATCH_PLAN_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  return setKanglongBatchRun(run);
+}
+
+async function confirmKanglongBatchPlan(confirmedWarningCodes = []) {
+  const run = kanglongBatchState.run;
+  if (!run) return null;
+  const actionKey = `confirm:${run.run_id}:${confirmedWarningCodes.join(",")}`;
+  try {
+    const response = await requestKanglongBatchMutation(
+      actionKey,
+      `${KANGLONG_BATCH_PLAN_ENDPOINT}/${encodeURIComponent(run.run_id)}/confirm`,
+      { plan_version: run.plan_version, operator: "manual", confirmed_warning_codes: confirmedWarningCodes },
+    );
+    return setKanglongBatchRun(response);
+  } catch (error) {
+    const warnings = error?.detail?.warning_codes;
+    if (!confirmedWarningCodes.length && Array.isArray(warnings) && warnings.length
+      && window.confirm(copyOrDefault("console.kanglong.batch.warning_confirm", "计划存在容量警告，确认继续吗？"))) {
+      return confirmKanglongBatchPlan(warnings);
+    }
+    throw error;
+  }
+}
+
+async function executeKanglongBatchPlan() {
+  const run = kanglongBatchState.run;
+  if (!run) return null;
+  const response = await requestKanglongBatchMutation(
+    `execute:${run.run_id}`,
+    `${KANGLONG_BATCH_PLAN_ENDPOINT}/${encodeURIComponent(run.run_id)}/execute`,
+    { plan_version: run.plan_version, operator: "manual", confirmed_warning_codes: [] },
+  );
+  return setKanglongBatchRun(response);
+}
+
+async function controlKanglongBatchRun(action) {
+  const run = kanglongBatchState.run;
+  if (!run || !(run.available_actions || []).includes(action)) return null;
+  if (action === "recover" && run.status !== "needs_abort_recover") return null;
+  const response = await requestKanglongBatchMutation(
+    `${action}:${run.run_id}:${run.action_version}`,
+    `/kanglong/batch-simulation/run/${encodeURIComponent(run.run_id)}/${encodeURIComponent(action)}`,
+    {
+      plan_version: run.plan_version,
+      expected_action_version: Number(run.action_version || 0),
+      operator: "manual",
+    },
+  );
+  return setKanglongBatchRun(response);
+}
+
+async function refreshKanglongBatchRun() {
+  const runId = kanglongBatchState.run?.run_id;
+  if (!runId) return null;
+  const response = await request(`/kanglong/batch-simulation/run/${encodeURIComponent(runId)}`);
+  if (kanglongBatchState.run?.run_id !== runId) return null;
+  return setKanglongBatchRun(response);
+}
+
+function stopKanglongBatchPoller() {
+  if (kanglongBatchState.poller) clearInterval(kanglongBatchState.poller);
+  kanglongBatchState.poller = null;
+}
+
+function startKanglongBatchPoller() {
+  if (kanglongBatchState.poller) return;
+  kanglongBatchState.poller = setInterval(() => refreshKanglongBatchRun().catch(reportKanglongBatchError), 1000);
+}
+
+async function restoreKanglongBatchRun() {
+  const payload = await request("/kanglong/batch-simulation/open-runs");
+  const runs = Array.isArray(payload.runs) ? payload.runs : [];
+  if (runs.length) setKanglongBatchRun(runs[0]);
+  return runs;
+}
+
+function reportKanglongBatchError(error) {
+  appendLog("error", "", undefined, {
+    messageCode: "runtime.kanglong.request_failed",
+    messageParams: { error: userVisibleErrorMessage(error, error?.message) },
+  });
+}
+
+async function initializeKanglongBatchUi() {
+  await Promise.all([loadKanglongCredentials(), loadKanglongBatchDefaults(), restoreKanglongBatchRun()]);
+  await refreshKanglongCapacityPreview();
 }
 
 function fetchKanglongTestTemplates() {
@@ -4259,6 +5050,14 @@ async function applyAppPage(page) {
         });
       }
     }
+    if (typeof kanglongBatchState !== "undefined" && !kanglongBatchState.initialized) {
+      try {
+        await initializeKanglongBatchUi();
+        kanglongBatchState.initialized = true;
+      } catch (error) {
+        reportKanglongBatchError(error);
+      }
+    }
     return true;
   }
   let applied = false;
@@ -6955,6 +7754,45 @@ kanglongTemplateSaveApplyButton?.addEventListener("click", () => {
     messageParams: { error: userVisibleErrorMessage(error, error?.message) },
   }));
 });
+kanglongAccountManagerButton?.addEventListener("click", () => {
+  kanglongAccountManagerModal?.classList.remove("hidden");
+  loadKanglongCredentials().catch(reportKanglongBatchError);
+});
+kanglongAccountManagerClose?.addEventListener("click", () => {
+  clearKanglongCredentialSecrets();
+  invalidateKanglongCredentialPreview();
+  kanglongAccountManagerModal?.classList.add("hidden");
+});
+kanglongCredentialFile?.addEventListener("change", () => {
+  readKanglongCredentialImportFile().catch((error) => {
+    clearKanglongCredentialSecrets();
+    if (kanglongCredentialPreviewButton) kanglongCredentialPreviewButton.disabled = true;
+    reportKanglongBatchError(error);
+  });
+});
+kanglongCredentialImportMode?.addEventListener("change", invalidateKanglongCredentialPreview);
+kanglongCredentialPreviewButton?.addEventListener("click", () => previewKanglongCredentialImport().catch(reportKanglongBatchError));
+kanglongCredentialCommitButton?.addEventListener("click", () => commitKanglongCredentialImport().catch(reportKanglongBatchError));
+kanglongCredentialCreateButton?.addEventListener("click", () => createKanglongCredential().catch(reportKanglongBatchError));
+kanglongBatchOperation?.addEventListener("change", () => {
+  if (kanglongBatchSourceField) kanglongBatchSourceField.hidden = kanglongBatchOperation.value !== "close";
+  scheduleKanglongCapacityPreview();
+});
+[
+  kanglongBatchSourceRun,
+  kanglongBatchSymbol,
+  kanglongBatchSide,
+  kanglongBatchLeverage,
+  kanglongBatchPerLegNotional,
+  kanglongBatchRounds,
+  kanglongBatchInterval,
+].forEach((input) => {
+  input?.addEventListener(input?.tagName === "SELECT" ? "change" : "input", scheduleKanglongCapacityPreview);
+});
+kanglongBatchSaveDefaults?.addEventListener("click", () => saveKanglongBatchDefaults().catch(reportKanglongBatchError));
+kanglongBatchCreatePlan?.addEventListener("click", () => createKanglongBatchPlan().catch(reportKanglongBatchError));
+kanglongBatchConfirm?.addEventListener("click", () => confirmKanglongBatchPlan().catch(reportKanglongBatchError));
+kanglongBatchExecute?.addEventListener("click", () => executeKanglongBatchPlan().catch(reportKanglongBatchError));
 kanglongSymbol?.addEventListener("input", () => {
   invalidateKanglongPlan();
   renderKanglongTransferSettings();

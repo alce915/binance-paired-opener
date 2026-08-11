@@ -8,6 +8,11 @@ __pycache__/
 .env.*
 config/active_account.json
 config/binance_accounts.json
+config/binance_accounts.secure.json
+config/binance_accounts.secure.json.tmp
+config/binance_accounts.secure.json.tmp.*
+config/kanglong_batch_defaults.json
+config/kanglong_batch_defaults.json.tmp.*
 *.db
 .pytest_cache/
 *.egg-info/
@@ -36,6 +41,7 @@ pytest-cache-files-*/
 tmp_pytest*/
 tmp_direct_verify/
 tmp_storage_check/
+data/
 data/pytest-temp/
 *.sqlite3
 

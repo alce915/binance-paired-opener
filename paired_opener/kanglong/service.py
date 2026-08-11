@@ -258,6 +258,74 @@ def _chain_config_account_labels(
     return labels
 
 
+def _account_label_from_payload(account: dict[str, Any]) -> str | None:
+    label = str(
+        account.get("name")
+        or account.get("account_name")
+        or account.get("label")
+        or account.get("template_account_id")
+        or account.get("templateAccountId")
+        or ""
+    ).strip()
+    if not label or _is_internal_account_id(label):
+        return None
+    return label
+
+
+def _is_internal_account_id(value: Any) -> bool:
+    return str(value or "").strip().lower().startswith(("tpl:", "sub:", "main:"))
+
+
+def _visible_account_label(label: Any, account_id: Any = "") -> str:
+    candidate = str(label or "").strip()
+    if candidate and not _is_internal_account_id(candidate):
+        return candidate
+    fallback = str(account_id or "").strip()
+    if fallback and not _is_internal_account_id(fallback):
+        return fallback
+    return ""
+
+
+def _execution_account_labels(report: dict[str, Any]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+
+    def add_accounts(accounts: Any) -> None:
+        if not isinstance(accounts, list):
+            return
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            account_id = str(account.get("account_id") or account.get("id") or "").strip()
+            if not account_id:
+                continue
+            label = _account_label_from_payload(account)
+            if label:
+                labels[account_id] = label
+
+    synthetic_state = report.get("synthetic_account_state")
+    if isinstance(synthetic_state, dict):
+        add_accounts(synthetic_state.get("accounts"))
+
+    account_snapshot = report.get("account_snapshot")
+    if isinstance(account_snapshot, dict):
+        add_accounts(account_snapshot.get("accounts"))
+
+    chain_config = report.get("chain_config")
+    chain_items = chain_config.get("items") if isinstance(chain_config, dict) else []
+    for item in chain_items or []:
+        if not isinstance(item, dict):
+            continue
+        from_account_id = str(item.get("from_account_id") or "").strip()
+        from_account_label = _visible_account_label(item.get("from_account_label"))
+        if from_account_id and from_account_label:
+            labels.setdefault(from_account_id, from_account_label)
+        to_account_id = str(item.get("to_account_id") or "").strip()
+        to_account_label = _visible_account_label(item.get("to_account_label"))
+        if to_account_id and to_account_label:
+            labels.setdefault(to_account_id, to_account_label)
+    return labels
+
+
 def _chain_config_payload(
     *,
     symbol: str,
@@ -430,10 +498,15 @@ def _kanglong_trade_events(
     *,
     group: KanglongGroupPlan,
     plan_version: str,
+    account_labels: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    labels = account_labels or {}
     for event in result.events:
         payload = event.to_payload()
+        account_label = _visible_account_label(labels.get(event.account_id), event.account_id)
+        from_account_label = _visible_account_label(labels.get(group.from_account_id), group.from_account_id)
+        to_account_label = _visible_account_label(labels.get(group.to_account_id), group.to_account_id)
         action_label = "平仓" if event.action_type == "single_close" else "开仓"
         payload.update(
             {
@@ -443,8 +516,11 @@ def _kanglong_trade_events(
                     "round_id": _round_index_from_round_id(event.round_id),
                     "action_label": action_label,
                     "account_id": event.account_id,
+                    "account_label": account_label,
                     "from_account_id": group.from_account_id,
+                    "from_account_label": from_account_label,
                     "to_account_id": group.to_account_id,
+                    "to_account_label": to_account_label,
                     "symbol": event.symbol,
                     "side": event.position_side.value,
                     "filled_qty": decimal_text(event.filled_qty),
@@ -454,7 +530,10 @@ def _kanglong_trade_events(
                 },
                 "plan_version": plan_version,
                 "from_account_id": group.from_account_id,
+                "from_account_label": from_account_label,
                 "to_account_id": group.to_account_id,
+                "to_account_label": to_account_label,
+                "account_label": account_label,
             }
         )
         rows.append(
@@ -1447,10 +1526,12 @@ class KanglongSimulationService:
                 "groups_completed": group_index,
                 "group_count": len(groups),
             }
+            account_labels = _execution_account_labels(report)
             trade_events = _kanglong_trade_events(
                 result,
                 group=group_plan,
                 plan_version=plan_version,
+                account_labels=account_labels,
             )
             round_events = _round_process_events_from_result(
                 result,

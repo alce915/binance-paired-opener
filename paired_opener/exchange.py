@@ -1,10 +1,18 @@
 ﻿from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
 from paired_opener.domain import ExchangeOrder, OrderSide, PositionSide, Quote, SymbolRules
+
+
+@dataclass(frozen=True, slots=True)
+class RateLimitObservation:
+    http_status: int
+    used_weight_by_window: dict[str, int]
+    retry_after_seconds: Decimal | None = None
 
 
 class ExchangeGateway(ABC):
@@ -56,6 +64,20 @@ class ExchangeGateway(ABC):
 
     async def get_open_orders_strict(self, symbol: str) -> list[dict[str, Any]]:
         return await self.get_open_orders(symbol)
+
+    async def get_portfolio_margin_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def get_commission_rates(self, symbol: str) -> dict[str, Decimal]:
+        raise NotImplementedError
+
+    async def get_portfolio_margin_precheck(
+        self,
+        symbol: str,
+        requested_leverage: int,
+        additional_gross_notional: Decimal,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
 
     @abstractmethod
     async def place_limit_order(

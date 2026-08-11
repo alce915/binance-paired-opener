@@ -79,5 +79,12 @@
   "kanglong.trade_executed": { "key": "events.kanglong.trade_executed", "level": "success" },
   "kanglong.round_completed": { "key": "events.kanglong.round_completed", "level": "success" },
   "quote_stale": { "key": "events.quote_stale", "level": "warn" },
-  "extension_round_conflict_detected": { "key": "events.extension_round_conflict_detected", "level": "warn" }
+  "extension_round_conflict_detected": { "key": "events.extension_round_conflict_detected", "level": "warn" },
+  "kanglong_batch_plan_confirmed": { "key": "events.kanglong.batch_plan_confirmed", "level": "success" },
+  "kanglong_batch_execution_starting": { "key": "events.kanglong.batch_execution_starting", "level": "info" },
+  "kanglong_batch_pause_requested": { "key": "events.kanglong.batch_pause_requested", "level": "warn" },
+  "kanglong_batch_resume_requested": { "key": "events.kanglong.batch_resume_requested", "level": "info" },
+  "kanglong_batch_stop_requested": { "key": "events.kanglong.batch_stop_requested", "level": "warn" },
+  "kanglong_batch_recover_requested": { "key": "events.kanglong.batch_recover_requested", "level": "warn" },
+  "kanglong_batch_plan_refreshed": { "key": "events.kanglong.batch_plan_refreshed", "level": "info" }
 }

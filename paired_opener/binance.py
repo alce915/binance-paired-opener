@@ -7,7 +7,7 @@ import json
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 import httpx
@@ -24,12 +24,23 @@ from paired_opener.domain import (
     Quote,
     SymbolRules,
 )
-from paired_opener.exchange import ExchangeGateway
+from paired_opener.exchange import ExchangeGateway, RateLimitObservation
+
+
+ORDER_BOOK_STREAM_DEPTH = 20
+_REST_DEPTH_LIMITS = (5, 10, 20, 50, 100, 500, 1000)
 
 
 class BinanceFuturesGateway(ExchangeGateway):
-    def __init__(self, settings: Settings, account: AccountConfig | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        account: AccountConfig | None = None,
+        *,
+        rate_limit_observer: Callable[[RateLimitObservation], None] | None = None,
+    ) -> None:
         self._settings = settings
+        self._rate_limit_observer = rate_limit_observer
         if account is not None:
             self._account = account
         elif settings.accounts:
@@ -91,6 +102,7 @@ class BinanceFuturesGateway(ExchangeGateway):
 
     async def _public_request(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
         response = await self._client.request(method, path, params=params)
+        self._observe_rate_limit(response)
         response.raise_for_status()
         return response.json()
 
@@ -113,11 +125,43 @@ class BinanceFuturesGateway(ExchangeGateway):
         ).hexdigest()
         client = self._papi_client if use_papi else self._client
         response = await client.request(method, f"{path}?{query}&signature={signature}")
+        self._observe_rate_limit(response)
         response.raise_for_status()
         return response.json()
 
+    def _observe_rate_limit(self, response: httpx.Response) -> None:
+        if self._rate_limit_observer is None:
+            return
+        used_weight: dict[str, int] = {}
+        for name, value in response.headers.items():
+            normalized = name.lower()
+            prefix = "x-mbx-used-weight-"
+            if not normalized.startswith(prefix):
+                continue
+            try:
+                used_weight[normalized[len(prefix):]] = int(value)
+            except ValueError:
+                continue
+        retry_after: Decimal | None = None
+        raw_retry_after = response.headers.get("Retry-After")
+        if raw_retry_after is not None:
+            try:
+                retry_after = Decimal(raw_retry_after)
+            except Exception:
+                retry_after = None
+        observation = RateLimitObservation(
+            http_status=response.status_code,
+            used_weight_by_window=used_weight,
+            retry_after_seconds=retry_after,
+        )
+        try:
+            self._rate_limit_observer(observation)
+        except Exception:
+            return
+
     async def _start_listen_key(self) -> str:
         response = await self._client.post("/fapi/v1/listenKey")
+        self._observe_rate_limit(response)
         response.raise_for_status()
         payload = response.json()
         return payload["listenKey"]
@@ -126,6 +170,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         if self._listen_key is None:
             return
         response = await self._client.put("/fapi/v1/listenKey", params={"listenKey": self._listen_key})
+        self._observe_rate_limit(response)
         response.raise_for_status()
 
     async def _ensure_user_stream(self) -> None:
@@ -269,7 +314,7 @@ class BinanceFuturesGateway(ExchangeGateway):
         }
 
     async def _run_depth_stream(self, symbol: str) -> None:
-        stream = f"{self._account.effective_websocket_base_url}/{symbol.lower()}@depth5@100ms"
+        stream = f"{self._account.effective_websocket_base_url}/{symbol.lower()}@depth{ORDER_BOOK_STREAM_DEPTH}@100ms"
         while True:
             try:
                 async with websockets.connect(stream, ping_interval=20, ping_timeout=20) as websocket:
@@ -322,28 +367,43 @@ class BinanceFuturesGateway(ExchangeGateway):
 
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
         normalized_symbol = symbol.upper()
+        requested_levels = max(1, int(limit))
+        if requested_levels > _REST_DEPTH_LIMITS[-1]:
+            raise ExchangeStateError("Requested order-book depth exceeds Binance limit")
         await self._ensure_depth_stream(normalized_symbol)
         cached = self._depth_cache.get(normalized_symbol)
-        if cached is None:
+        cached_levels = 0 if cached is None else min(len(cached.get("bids", [])), len(cached.get("asks", [])))
+        if cached is None or cached_levels < requested_levels:
             return await self.refresh_order_book(normalized_symbol, limit=limit)
         return {
             "symbol": normalized_symbol,
             "lastUpdateId": cached.get("lastUpdateId"),
-            "bids": list(cached.get("bids", []))[:limit],
-            "asks": list(cached.get("asks", []))[:limit],
+            "bids": list(cached.get("bids", []))[:requested_levels],
+            "asks": list(cached.get("asks", []))[:requested_levels],
             "event_time": cached.get("event_time", datetime.now(UTC)),
         }
 
     async def refresh_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
         normalized_symbol = symbol.upper()
-        payload = await self._public_request("GET", "/fapi/v1/depth", {"symbol": normalized_symbol, "limit": max(limit, 5)})
+        requested_levels = max(1, int(limit))
+        rest_limit = next((candidate for candidate in _REST_DEPTH_LIMITS if candidate >= requested_levels), None)
+        if rest_limit is None:
+            raise ExchangeStateError("Requested order-book depth exceeds Binance limit")
+        payload = await self._public_request(
+            "GET",
+            "/fapi/v1/depth",
+            {"symbol": normalized_symbol, "limit": rest_limit},
+        )
         cached = self._parse_order_book_payload(normalized_symbol, payload)
+        available_levels = min(len(cached.get("bids", [])), len(cached.get("asks", [])))
+        if available_levels < requested_levels:
+            raise ExchangeStateError("Binance order-book response has insufficient depth")
         self._depth_cache[normalized_symbol] = cached
         return {
             "symbol": normalized_symbol,
             "lastUpdateId": cached.get("lastUpdateId"),
-            "bids": list(cached.get("bids", []))[:limit],
-            "asks": list(cached.get("asks", []))[:limit],
+            "bids": list(cached.get("bids", []))[:requested_levels],
+            "asks": list(cached.get("asks", []))[:requested_levels],
             "event_time": cached.get("event_time", datetime.now(UTC)),
         }
 
@@ -391,6 +451,177 @@ class BinanceFuturesGateway(ExchangeGateway):
             orders = [item for item in payload if isinstance(item, dict)]
         self._open_orders_cache[target] = (self._monotonic(), orders)
         return list(orders)
+
+    async def get_portfolio_margin_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        target = symbol.upper()
+        payload = await self._signed_request(
+            "GET",
+            "/papi/v1/um/openOrders",
+            {"symbol": target},
+            use_papi=True,
+        )
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    async def get_commission_rates(self, symbol: str) -> dict[str, Decimal]:
+        payload = await self._signed_request(
+            "GET",
+            "/papi/v1/um/commissionRate",
+            {"symbol": symbol.upper()},
+            use_papi=True,
+        )
+        if not isinstance(payload, dict):
+            raise ExchangeStateError("Binance commission-rate response is invalid")
+        return {
+            "maker": Decimal(str(payload["makerCommissionRate"])),
+            "taker": Decimal(str(payload["takerCommissionRate"])),
+        }
+
+    async def get_portfolio_margin_precheck(
+        self,
+        symbol: str,
+        requested_leverage: int,
+        additional_gross_notional: Decimal,
+    ) -> dict[str, Any]:
+        target = symbol.upper()
+        if requested_leverage <= 0 or additional_gross_notional < 0:
+            raise ValueError("requested leverage and notional must be positive")
+        (
+            account_payload,
+            hedge_payload,
+            symbol_config_payload,
+            bracket_payload,
+            positions_payload,
+            open_orders,
+            commission_rates,
+        ) = await asyncio.gather(
+            self._signed_request("GET", "/papi/v1/account", use_papi=True),
+            self._signed_request("GET", "/papi/v1/um/positionSide/dual", use_papi=True),
+            self._signed_request("GET", "/papi/v1/um/symbolConfig", {"symbol": target}, use_papi=True),
+            self._signed_request("GET", "/papi/v1/um/leverageBracket", {"symbol": target}, use_papi=True),
+            self._signed_request("GET", "/papi/v1/um/positionRisk", {"symbol": target}, use_papi=True),
+            self.get_portfolio_margin_open_orders(target),
+            self.get_commission_rates(target),
+        )
+        if not isinstance(account_payload, dict) or not isinstance(hedge_payload, dict):
+            raise ExchangeStateError("Binance portfolio-margin account response is invalid")
+        symbol_config = self._select_symbol_payload(symbol_config_payload, target)
+        bracket_root = self._select_symbol_payload(bracket_payload, target)
+        coefficient = Decimal(str(bracket_root.get("notionalCoef") or "1"))
+        if coefficient <= 0:
+            raise ExchangeStateError("Binance notional coefficient is invalid")
+        brackets = self._normalize_leverage_brackets(bracket_root.get("brackets"), coefficient)
+        positions = [item for item in positions_payload if isinstance(item, dict)] if isinstance(positions_payload, list) else []
+        existing_position_exposure = sum(
+            (
+                abs(Decimal(str(item.get("notional") or "0")))
+                for item in positions
+                if str(item.get("symbol") or "").upper() == target
+            ),
+            Decimal("0"),
+        )
+        existing_order_exposure = sum(
+            (self._open_order_notional(item) for item in open_orders),
+            Decimal("0"),
+        )
+        existing_exposure = existing_position_exposure + existing_order_exposure
+        projected_exposure = existing_exposure + Decimal(additional_gross_notional)
+        selected_bracket = self._select_projected_bracket(brackets, projected_exposure)
+        account_status = str(account_payload.get("accountStatus") or "")
+        hedge_mode = bool(hedge_payload.get("dualSidePosition"))
+        blockers: list[str] = []
+        if account_status != "NORMAL":
+            blockers.append("portfolio_margin_account_not_normal")
+        if not hedge_mode:
+            blockers.append("hedge_mode_required")
+        if requested_leverage > int(selected_bracket["max_allowed_leverage"]):
+            blockers.append("requested_leverage_exceeds_bracket")
+        current_max_notional = Decimal(str(symbol_config.get("maxNotionalValue") or "0"))
+        if current_max_notional > 0 and projected_exposure > current_max_notional:
+            blockers.append("symbol_max_notional_exceeded")
+        if projected_exposure > Decimal(selected_bracket["effective_cap"]):
+            blockers.append("leverage_bracket_notional_exceeded")
+        return {
+            "symbol": target,
+            "account_status": account_status,
+            "hedge_mode": hedge_mode,
+            "requested_leverage": int(requested_leverage),
+            "current_leverage": int(symbol_config.get("leverage") or 1),
+            "account_equity": Decimal(str(account_payload.get("accountEquity") or "0")),
+            "available_balance": Decimal(str(account_payload.get("totalAvailableBalance") or "0")),
+            "notional_coef": coefficient,
+            "brackets": brackets,
+            "selected_bracket": selected_bracket,
+            "current_symbol_max_notional_value": current_max_notional,
+            "existing_position_exposure": existing_position_exposure,
+            "existing_open_order_exposure": existing_order_exposure,
+            "existing_symbol_exposure": existing_exposure,
+            "additional_gross_notional": Decimal(additional_gross_notional),
+            "projected_symbol_exposure": projected_exposure,
+            "positions": positions,
+            "open_orders": open_orders,
+            "commission_rates": commission_rates,
+            "blocked_reasons": blockers,
+            "ok": not blockers,
+        }
+
+    @staticmethod
+    def _select_symbol_payload(payload: Any, symbol: str) -> dict[str, Any]:
+        candidates = payload if isinstance(payload, list) else [payload]
+        for item in candidates:
+            if isinstance(item, dict) and str(item.get("symbol") or symbol).upper() == symbol:
+                return item
+        raise ExchangeStateError(f"Portfolio-margin data for {symbol} is unavailable")
+
+    @staticmethod
+    def _normalize_leverage_brackets(payload: Any, coefficient: Decimal) -> list[dict[str, Any]]:
+        if not isinstance(payload, list) or not payload:
+            raise ExchangeStateError("Binance leverage brackets are unavailable")
+        normalized: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            floor = Decimal(str(item.get("notionalFloor") or "0"))
+            cap = Decimal(str(item.get("notionalCap") or "0"))
+            normalized.append(
+                {
+                    "bracket": int(item.get("bracket") or len(normalized) + 1),
+                    "max_allowed_leverage": int(item.get("initialLeverage") or 0),
+                    "notional_floor": floor,
+                    "notional_cap": cap,
+                    "notional_coef": coefficient,
+                    "effective_floor": floor * coefficient,
+                    "effective_cap": cap * coefficient,
+                    "maint_margin_ratio": Decimal(str(item.get("maintMarginRatio") or "0")),
+                }
+            )
+        if not normalized or any(item["effective_cap"] <= item["effective_floor"] for item in normalized):
+            raise ExchangeStateError("Binance leverage brackets are invalid")
+        normalized.sort(key=lambda item: (item["effective_floor"], item["effective_cap"]))
+        return normalized
+
+    @staticmethod
+    def _select_projected_bracket(
+        brackets: list[dict[str, Any]],
+        projected_exposure: Decimal,
+    ) -> dict[str, Any]:
+        for index, bracket in enumerate(brackets):
+            floor = Decimal(bracket["effective_floor"])
+            cap = Decimal(bracket["effective_cap"])
+            upper_inclusive = index == len(brackets) - 1
+            if projected_exposure >= floor and (projected_exposure < cap or upper_inclusive and projected_exposure <= cap):
+                return bracket
+        return brackets[-1]
+
+    @staticmethod
+    def _open_order_notional(order: dict[str, Any]) -> Decimal:
+        explicit = abs(Decimal(str(order.get("notional") or "0")))
+        if explicit > 0:
+            return explicit
+        original_qty = Decimal(str(order.get("origQty") or order.get("quantity") or "0"))
+        executed_qty = Decimal(str(order.get("executedQty") or "0"))
+        remaining_qty = max(abs(original_qty) - abs(executed_qty), Decimal("0"))
+        price = Decimal(str(order.get("price") or order.get("stopPrice") or order.get("avgPrice") or "0"))
+        return remaining_qty * abs(price)
 
     async def get_account_overview(self) -> dict[str, Any]:
         if not self._account.api_key or not self._account.api_secret:

@@ -31,6 +31,13 @@ class KanglongRunStatus(StrEnum):
     DRAFT_PLAN = "draft_plan"
     PLAN_CONFIRMED = "plan_confirmed"
     EXECUTION_STARTING = "execution_starting"
+    RUNNING = "running"
+    PAUSE_PENDING = "pause_pending"
+    PAUSED_BY_USER = "paused_by_user"
+    PAUSED_MARKET_UNSTABLE = "paused_market_unstable"
+    STOP_PENDING = "stop_pending"
+    STOPPED_BY_USER = "stopped_by_user"
+    COMPLETED_WITH_DUST_RESIDUAL = "completed_with_dust_residual"
     PRECHECK = "precheck"
     CHAIN_READY = "chain_ready"
     GROUP_READY = "group_ready"
@@ -80,22 +87,25 @@ def available_actions_for_status(status: str | KanglongRunStatus) -> list[str]:
         KanglongRunStatus.CHAIN_READY.value: ["confirm", "refresh_plan"],
         KanglongRunStatus.PLAN_CONFIRMED.value: ["execute", "refresh_plan"],
         KanglongRunStatus.EXECUTION_STARTING.value: ["view_report"],
-        "running": ["pause", "stop", "view_report"],
-        "pause_pending": ["stop", "view_report"],
-        "stop_pending": ["view_report"],
-        "paused_by_user": ["resume", "stop", "view_report"],
-        "paused_market_unstable": ["resume", "stop", "recover", "view_report"],
-        "paused_plan_stale": ["refresh_plan", "recover", "view_report"],
-        "stopped_by_user": ["view_report", "refresh_plan"],
+        KanglongRunStatus.RUNNING.value: ["pause", "stop", "view_report"],
+        KanglongRunStatus.PAUSE_PENDING.value: ["stop", "view_report"],
+        KanglongRunStatus.STOP_PENDING.value: ["view_report"],
+        KanglongRunStatus.PAUSED_BY_USER.value: ["resume", "stop", "view_report"],
+        KanglongRunStatus.PAUSED_MARKET_UNSTABLE.value: ["resume", "stop", "recover", "view_report"],
+        KanglongRunStatus.STOPPED_BY_USER.value: ["view_report", "refresh_plan"],
+        KanglongRunStatus.BLOCKED_PLAN_STALE.value: ["refresh_plan", "view_report"],
+        KanglongRunStatus.PAUSED_PLAN_RECHECK_CHANGED.value: ["refresh_plan", "stop", "view_report"],
         KanglongRunStatus.COMPLETED.value: ["view_report"],
-        "completed_with_dust_residual": ["view_report"],
+        KanglongRunStatus.COMPLETED_WITH_DUST_RESIDUAL.value: ["view_report"],
         KanglongRunStatus.NEEDS_ABORT_RECOVER.value: ["recover", "view_report"],
         KanglongRunStatus.ABORTED_RECOVERED.value: ["refresh_plan", "view_report"],
         "legacy_readonly": ["refresh_plan", "view_report"],
     }
+    if normalized in matrix:
+        return list(matrix[normalized])
     if normalized.startswith("blocked_"):
         return ["refresh_plan"]
-    return list(matrix.get(normalized, []))
+    return []
 
 
 def _position_side(value: PositionSide | str) -> PositionSide:

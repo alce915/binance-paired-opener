@@ -106,7 +106,7 @@
       .kanglong-toolbar {
         display: grid;
         gap: 12px;
-        grid-template-columns: minmax(160px, 1fr) minmax(140px, 0.7fr) repeat(3, minmax(128px, auto));
+        grid-template-columns: minmax(160px, 1fr) minmax(140px, 0.7fr) repeat(4, minmax(128px, auto));
         align-items: end;
       }
       .kanglong-toolbar button { min-height: 46px; }
@@ -117,6 +117,49 @@
       }
       .kanglong-transfer-settings {
         overflow: visible;
+      }
+      .kanglong-batch-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(150px, 1fr));
+        gap: 12px;
+        padding: 12px 20px;
+      }
+      .kanglong-batch-actions,
+      .kanglong-manager-actions,
+      .kanglong-run-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 0 20px 16px;
+      }
+      .kanglong-batch-notice {
+        margin: 12px 20px;
+        padding: 10px 12px;
+        border: 1px solid #b7d7cc;
+        border-radius: 8px;
+        background: #eef9f5;
+        color: #245b4b;
+      }
+      .kanglong-capacity-account,
+      .kanglong-credential-row,
+      .kanglong-queue-row {
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        margin: 8px 20px;
+      }
+      .kanglong-capacity-account details { margin-top: 6px; }
+      .kanglong-manager-modal { width: min(980px, calc(100vw - 24px)); }
+      .kanglong-manager-grid {
+        display: grid;
+        grid-template-columns: minmax(260px, 0.8fr) minmax(420px, 1.2fr);
+        gap: 16px;
+        padding: 0 20px 20px;
+      }
+      .kanglong-import-preview {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        min-height: 60px;
       }
       .kanglong-transfer-grid {
         display: grid;
@@ -959,6 +1002,8 @@
       @media (max-width: 860px) {
         .kanglong-layout,
         .kanglong-toolbar,
+        .kanglong-batch-grid,
+        .kanglong-manager-grid,
         .kanglong-template-grid,
         .kanglong-template-field-grid,
         .kanglong-template-sub-row { grid-template-columns: 1fr; }
@@ -1016,7 +1061,42 @@
           <button id="kanglongDetectPlanBtn" type="button" data-testid="kanglong-detect-link-button" data-i18n="console.kanglong.actions.detect"></button>
           <button id="kanglongConfirmPlanBtn" type="button" data-testid="kanglong-confirm-link-button" data-i18n="console.kanglong.actions.confirm" disabled></button>
           <button id="kanglongExecutePlanBtn" type="button" data-testid="kanglong-execute-button" data-i18n="console.kanglong.actions.execute" disabled></button>
+          <button id="kanglongAccountManagerButton" class="secondary" type="button" data-testid="kanglong-account-manager" data-i18n="console.kanglong.credentials.manage">管理真实 API 账号</button>
         </div>
+        <section class="card" data-testid="kanglong-batch-form">
+          <div class="card-header">
+            <h2 class="card-title" data-i18n="console.kanglong.batch.title">一次性多账号开平仓</h2>
+            <span class="badge warn" data-i18n="console.kanglong.batch.simulation_only">真实行情驱动的模拟，不会真实下单</span>
+          </div>
+          <div class="kanglong-batch-notice" data-i18n="console.kanglong.batch.capacity_disclaimer">容量为当前快照的保守估算，不代表 Binance 保证额度。</div>
+          <div class="kanglong-batch-grid" data-testid="kanglong-batch-defaults">
+            <div class="field"><label for="kanglongBatchOperation" data-i18n="console.kanglong.batch.operation">操作</label><select id="kanglongBatchOperation"><option value="open" data-i18n="console.kanglong.batch.open">开仓</option><option value="close" data-i18n="console.kanglong.batch.close">平仓</option></select></div>
+            <div class="field" id="kanglongBatchSourceField" hidden><label for="kanglongBatchSourceRun" data-i18n="console.kanglong.batch.source_run">来源开仓 Run ID</label><input id="kanglongBatchSourceRun" autocomplete="off" /></div>
+            <div class="field"><label for="kanglongBatchSymbol" data-i18n="runtime.symbol">交易对</label><input id="kanglongBatchSymbol" value="ETHUSDC" /></div>
+            <div class="field"><label for="kanglongBatchSide" data-i18n="console.kanglong.selected_side">方向</label><select id="kanglongBatchSide"><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></div>
+            <div class="field"><label for="kanglongBatchLeverage" data-i18n="console.kanglong.batch.leverage">请求杠杆</label><input id="kanglongBatchLeverage" type="number" min="1" max="125" value="100" /></div>
+            <div class="field"><label for="kanglongBatchPerLegNotional" data-i18n="console.kanglong.batch.per_leg_notional">每腿名义价值（USD）</label><input id="kanglongBatchPerLegNotional" inputmode="decimal" value="250000" /></div>
+            <div class="field"><label for="kanglongBatchRounds" data-i18n="console.kanglong.batch.rounds">轮次</label><input id="kanglongBatchRounds" type="number" min="1" max="500" value="30" /></div>
+            <div class="field"><label for="kanglongBatchInterval" data-i18n="console.kanglong.batch.interval">轮次间隔（秒）</label><input id="kanglongBatchInterval" type="number" min="0" max="3600" value="3" /></div>
+          </div>
+          <div id="kanglongBatchAccountSelector" class="kanglong-compact-list"></div>
+          <div class="kanglong-batch-actions">
+            <button id="kanglongBatchSaveDefaults" class="secondary" type="button" data-i18n="console.kanglong.batch.save_defaults">保存为默认参数</button>
+            <button id="kanglongBatchCreatePlan" type="button" data-i18n="console.kanglong.batch.create_plan">生成批次计划</button>
+            <button id="kanglongBatchConfirm" class="secondary" type="button" data-i18n="console.kanglong.actions.confirm" disabled>确认</button>
+            <button id="kanglongBatchExecute" class="success" type="button" data-i18n="console.kanglong.actions.execute" disabled>执行模拟</button>
+          </div>
+          <div id="kanglongBatchCapacityPreview" data-testid="kanglong-batch-capacity-preview" aria-live="polite"></div>
+        </section>
+        <section class="card" data-testid="kanglong-batch-queue">
+          <h2 class="card-title" data-i18n="console.kanglong.batch.queue">批次队列与状态</h2>
+          <div id="kanglongBatchQueue"></div>
+          <div id="kanglongBatchRunActions" class="kanglong-run-actions"></div>
+        </section>
+        <section class="card" data-testid="kanglong-batch-cost-report">
+          <h2 class="card-title" data-i18n="console.kanglong.batch.cost_report">手续费与磨损</h2>
+          <div id="kanglongBatchCostReport"></div>
+        </section>
         <div class="kanglong-layout">
           <section class="card kanglong-account-section">
             <div class="card-header">
@@ -1097,6 +1177,39 @@
             <button id="kanglongTemplateSaveButton" class="secondary" type="button" data-i18n="console.kanglong.test_template.save">保存模板</button>
             <button id="kanglongTemplateSaveApplyButton" class="success" type="button" data-i18n="console.kanglong.test_template.save_and_apply">保存并应用</button>
           </footer>
+        </div>
+      </div>
+
+      <div id="kanglongAccountManagerModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="kanglongAccountManagerTitle">
+        <div class="modal-panel kanglong-manager-modal">
+          <header class="modal-header">
+            <h2 id="kanglongAccountManagerTitle" data-i18n="console.kanglong.credentials.title">真实 API 账号管理</h2>
+            <button id="kanglongAccountManagerClose" class="icon-button" type="button" data-i18n-aria-label="console.kanglong.test_template.close" aria-label="关闭">×</button>
+          </header>
+          <div id="kanglongCredentialGuide" class="kanglong-batch-notice"></div>
+          <div class="kanglong-manager-grid">
+            <section>
+              <h3 data-i18n="console.kanglong.credentials.saved_accounts">已保存账号</h3>
+              <div id="kanglongCredentialList"></div>
+            </section>
+            <section data-testid="kanglong-account-import">
+              <h3 data-i18n="console.kanglong.credentials.import">导入 JSON（HMAC）</h3>
+              <div class="field"><label for="kanglongCredentialFile" data-i18n="console.kanglong.credentials.file">JSON 文件</label><input id="kanglongCredentialFile" type="file" accept="application/json,.json" /></div>
+              <div class="field"><label for="kanglongCredentialImportMode" data-i18n="console.kanglong.credentials.mode">导入方式</label><select id="kanglongCredentialImportMode"><option value="merge" data-i18n="console.kanglong.credentials.merge">合并</option><option value="replace" data-i18n="console.kanglong.credentials.replace">替换全部</option></select></div>
+              <div class="kanglong-manager-actions">
+                <button id="kanglongCredentialPreviewButton" type="button" data-testid="kanglong-account-import-preview" disabled data-i18n="console.kanglong.credentials.preview">预览变更</button>
+                <button id="kanglongCredentialCommitButton" class="success" type="button" data-testid="kanglong-account-import-commit" disabled data-i18n="console.kanglong.credentials.commit">确认导入</button>
+              </div>
+              <div id="kanglongCredentialImportPreview" class="kanglong-import-preview" aria-live="polite"></div>
+              <hr />
+              <h3 data-i18n="console.kanglong.credentials.manual">手动新增 HMAC 账号</h3>
+              <div class="field"><label for="kanglongCredentialAccountId">Account ID</label><input id="kanglongCredentialAccountId" autocomplete="off" /></div>
+              <div class="field"><label for="kanglongCredentialName" data-i18n="console.kanglong.credentials.name">名称</label><input id="kanglongCredentialName" autocomplete="off" /></div>
+              <div class="field"><label for="kanglongCredentialApiKey">API Key</label><input id="kanglongCredentialApiKey" autocomplete="off" /></div>
+              <div class="field"><label for="kanglongCredentialApiSecret">API Secret</label><input id="kanglongCredentialApiSecret" type="password" autocomplete="new-password" /></div>
+              <button id="kanglongCredentialCreateButton" type="button" data-i18n="console.kanglong.credentials.create">新增并验证</button>
+            </section>
+          </div>
         </div>
       </div>
 

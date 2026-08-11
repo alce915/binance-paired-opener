@@ -2,9 +2,9 @@
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app_i18n.runtime import CONTRACT_VERSION, DEFAULT_ACCOUNT_NAME
 from paired_opener.config import DEFAULT_LEVERAGE, DEFAULT_ROUND_COUNT, DEFAULT_TRADING_SYMBOL
@@ -117,6 +117,119 @@ class SimulationRunRequest(ExecutionPolicyFields):
 SimulationRequest = SimulationRunRequest
 
 
+class AccountCredentialSummary(BaseModel):
+    account_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    name: str = Field(..., min_length=1, max_length=100)
+    api_key_masked: str
+    has_api_secret: bool
+    account_mode: Literal["portfolio_margin"] = "portfolio_margin"
+    enabled: bool = True
+    order: int = Field(..., ge=0)
+
+
+class AccountCredentialCreateRequest(BaseModel):
+    account_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    name: str = Field(..., min_length=1, max_length=100)
+    api_key: str = Field(..., min_length=8, max_length=256)
+    api_secret: str = Field(..., min_length=8, max_length=256)
+    credential_type: Literal["hmac"] = "hmac"
+    account_mode: Literal["portfolio_margin"] = "portfolio_margin"
+    enabled: bool = True
+
+
+class AccountCredentialUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    api_key: str | None = Field(default=None, min_length=8, max_length=256)
+    api_secret: str | None = Field(default=None, min_length=8, max_length=256)
+    enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def require_at_least_one_change(self) -> "AccountCredentialUpdateRequest":
+        if not self.model_fields_set:
+            raise ValueError("at least one field must be supplied")
+        return self
+
+
+class AccountCredentialImportPreviewRequest(BaseModel):
+    accounts: list[AccountCredentialCreateRequest] = Field(..., min_length=1, max_length=100)
+    mode: Literal["merge", "replace"] = "merge"
+
+    @model_validator(mode="after")
+    def require_unique_account_ids(self) -> "AccountCredentialImportPreviewRequest":
+        account_ids = [account.account_id for account in self.accounts]
+        if len(account_ids) != len(set(account_ids)):
+            raise ValueError("duplicate account_id")
+        return self
+
+
+class AccountCredentialImportCommitRequest(BaseModel):
+    preview_token: str = Field(..., min_length=32, max_length=128)
+
+
+class AccountCredentialImportChanges(BaseModel):
+    added_account_ids: list[str]
+    updated_account_ids: list[str]
+    unchanged_account_ids: list[str]
+    removed_account_ids: list[str]
+
+
+class AccountCredentialImportPreviewResponse(BaseModel):
+    preview_token: str
+    credential_revision: str
+    expires_at: datetime
+    final_accounts: list[AccountCredentialSummary]
+    changes: AccountCredentialImportChanges
+
+
+class AccountCredentialOrderRequest(BaseModel):
+    account_ids: list[str] = Field(..., min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def require_unique_account_ids(self) -> "AccountCredentialOrderRequest":
+        if len(self.account_ids) != len(set(self.account_ids)):
+            raise ValueError("duplicate account_id")
+        return self
+
+
+class KanglongBatchPlanRequest(BaseModel):
+    operation: Literal["open", "close"]
+    symbol: str = Field(..., min_length=1, max_length=32)
+    preferred_side: PositionSide
+    leverage: int = Field(default=100, ge=1, le=125)
+    per_leg_notional: Decimal = Field(default=Decimal("250000"), gt=0)
+    account_ids: list[str] = Field(..., min_length=1, max_length=100)
+    source_open_run_id: str | None = None
+    round_count: int = Field(default=30, ge=1, le=500)
+    round_interval_seconds: int = Field(default=3, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def validate_batch_request(self) -> "KanglongBatchPlanRequest":
+        if self.operation == "close" and not self.source_open_run_id:
+            raise ValueError("source_open_run_id is required for close")
+        if len(self.account_ids) != len(set(self.account_ids)):
+            raise ValueError("duplicate account_id")
+        return self
+
+
+class KanglongBatchCapacityPreviewRequest(BaseModel):
+    operation: Literal["open"] = "open"
+    symbol: str = Field(..., min_length=1, max_length=32)
+    preferred_side: PositionSide
+    leverage: int = Field(default=100, ge=1, le=125)
+    per_leg_notional: Decimal = Field(default=Decimal("250000"), gt=0)
+    account_ids: list[str] = Field(..., min_length=1, max_length=100)
+    round_count: int = Field(default=30, ge=1, le=500)
+    round_interval_seconds: int = Field(default=3, ge=0, le=3600)
+    request_seq: int = Field(..., ge=0)
+    input_hash: str = Field(..., min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def require_unique_account_ids(self) -> "KanglongBatchCapacityPreviewRequest":
+        if len(self.account_ids) != len(set(self.account_ids)):
+            raise ValueError("duplicate account_id")
+        return self
+
+
 class KanglongSimulationRunRequest(BaseModel):
     mode: str = Field(default="simulation", pattern="^simulation$")
     symbol: str = Field(default=DEFAULT_TRADING_SYMBOL)
@@ -193,6 +306,27 @@ class KanglongRecoverRequest(BaseModel):
     idempotency_key: str = Field(..., min_length=8, max_length=128)
     operator: str = Field(default="manual")
     release_reason: str = Field(..., min_length=3, max_length=500)
+
+
+class KanglongBatchRecoverRequest(BaseModel):
+    plan_version: str
+    expected_action_version: int = Field(..., ge=0)
+    idempotency_key: str = Field(..., min_length=8, max_length=128)
+    operator: str = Field(default="manual")
+    release_reason: str = Field(..., min_length=3, max_length=500)
+
+
+class KanglongBatchRunResponse(BaseModel):
+    contract_version: str = CONTRACT_VERSION
+    run_id: str
+    status: str
+    plan_version: str
+    action_version: int = Field(default=0, ge=0)
+    available_actions: list[str] = Field(default_factory=list)
+    report: dict[str, Any] = Field(default_factory=dict)
+    plan: dict[str, Any] = Field(default_factory=dict)
+    accounts: list[dict[str, Any]] = Field(default_factory=list)
+    latest_event_id: int = 0
 
 
 class KanglongPlanResponse(BaseModel):

@@ -1,0 +1,444 @@
+openapi: 3.1.0
+info:
+  title: Kanglong Batch Simulation API
+  version: 1.0.0
+  description: Real-market-driven simulation only; no order write endpoint is permitted.
+paths:
+  /config/kanglong-batch-defaults:
+    get:
+      operationId: getKanglongBatchDefaults
+      security: [{localManagementToken: []}]
+      responses:
+        "200": {description: Current defaults for new batch forms}
+    put:
+      operationId: updateKanglongBatchDefaults
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KanglongBatchDefaults"}
+      responses:
+        "200": {description: Defaults saved atomically}
+  /kanglong/batch-simulation/capacity-preview:
+    post:
+      operationId: previewKanglongBatchCapacity
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KanglongBatchCapacityPreviewRequest"}
+      responses:
+        "200": {description: Conservative capacity estimate using timestamped components}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /config/account-credentials:
+    get:
+      operationId: listAccountCredentials
+      security: [{localManagementToken: []}]
+      responses:
+        "200": {description: Masked account credential summaries}
+    post:
+      operationId: createAccountCredential
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountCredentialCreateRequest"}
+      responses:
+        "200": {description: Credential created}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+  /config/account-credentials/import/preview:
+    post:
+      operationId: previewAccountCredentialImport
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountCredentialImportPreviewRequest"}
+      responses:
+        "200":
+          description: Validated preview; secrets are never returned
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AccountCredentialImportPreviewResponse"}
+        "413": {description: Body exceeds 256 KiB before JSON parsing}
+        "422": {$ref: "#/components/responses/ValidationError"}
+  /config/account-credentials/import/commit:
+    post:
+      operationId: commitAccountCredentialImport
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountCredentialImportCommitRequest"}
+      responses:
+        "200": {description: Import committed atomically}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /config/account-credentials/{account_id}:
+    parameters:
+      - in: path
+        name: account_id
+        required: true
+        schema: {type: string}
+    put:
+      operationId: updateAccountCredential
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountCredentialUpdateRequest"}
+      responses:
+        "200": {description: Credential updated}
+        "409": {$ref: "#/components/responses/Conflict"}
+    delete:
+      operationId: deleteAccountCredential
+      security: [{localManagementToken: []}]
+      responses:
+        "200": {description: Credential deleted}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /config/account-credentials/order:
+    put:
+      operationId: reorderAccountCredentials
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountCredentialOrderRequest"}
+      responses:
+        "200": {description: Credentials reordered}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /config/account-credentials/{account_id}/verify:
+    post:
+      operationId: verifyAccountCredential
+      security: [{localManagementToken: []}]
+      parameters:
+        - in: path
+          name: account_id
+          required: true
+          schema: {type: string}
+      responses:
+        "200": {description: Read-only portfolio-margin verification result}
+  /kanglong/batch-simulation/plan:
+    post:
+      operationId: createKanglongBatchPlan
+      security: [{localManagementToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KanglongBatchPlanRequest"}
+      responses:
+        "200":
+          description: Frozen batch plan
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/KanglongBatchRunResponse"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /kanglong/batch-simulation/plan/{run_id}/confirm:
+    post:
+      operationId: confirmKanglongBatchPlan
+      security: [{localManagementToken: []}]
+      parameters: [{$ref: "#/components/parameters/RunId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KanglongActionRequest"}
+      responses:
+        "200": {$ref: "#/components/responses/BatchRun"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /kanglong/batch-simulation/plan/{run_id}/execute:
+    post:
+      operationId: executeKanglongBatchPlan
+      security: [{localManagementToken: []}]
+      parameters: [{$ref: "#/components/parameters/RunId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KanglongActionRequest"}
+      responses:
+        "200": {$ref: "#/components/responses/BatchRun"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /kanglong/batch-simulation/run/{run_id}/{action}:
+    post:
+      operationId: controlKanglongBatchRun
+      security: [{localManagementToken: []}]
+      parameters:
+        - {$ref: "#/components/parameters/RunId"}
+        - in: path
+          name: action
+          required: true
+          schema: {type: string, enum: [pause, resume, stop, recover, refresh_plan]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - {$ref: "#/components/schemas/KanglongControlRequest"}
+                - {$ref: "#/components/schemas/KanglongBatchRecoverRequest"}
+      responses:
+        "200": {$ref: "#/components/responses/BatchRun"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /kanglong/batch-simulation/run/{run_id}:
+    get:
+      operationId: getKanglongBatchRun
+      parameters: [{$ref: "#/components/parameters/RunId"}]
+      responses:
+        "200": {$ref: "#/components/responses/BatchRun"}
+  /kanglong/batch-simulation/run/{run_id}/events:
+    get:
+      operationId: listKanglongBatchEvents
+      parameters: [{$ref: "#/components/parameters/RunId"}]
+      responses:
+        "200": {description: Incremental event list}
+  /kanglong/batch-simulation/open-runs:
+    get:
+      operationId: listOpenKanglongBatchRuns
+      responses:
+        "200": {description: Non-terminal batch runs}
+components:
+  securitySchemes:
+    localManagementToken:
+      type: apiKey
+      in: header
+      name: X-Local-Management-Token
+  parameters:
+    RunId:
+      in: path
+      name: run_id
+      required: true
+      schema: {type: string}
+  responses:
+    BatchRun:
+      description: Current batch run state
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/KanglongBatchRunResponse"}
+    Conflict:
+      description: The requested mutation cannot safely proceed; inspect detail.code.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [detail]
+            properties:
+              detail:
+                type: object
+                required: [code]
+                properties:
+                  code:
+                    type: string
+                    enum:
+                      - idempotency_key_conflict
+                      - plan_version_conflict
+                      - action_version_conflict
+                      - account_credentials_locked_by_active_batch
+                      - credential_revision_conflict
+                      - credential_preview_invalid
+                      - account_credential_already_exists
+                      - kanglong_action_status_conflict
+                      - kanglong_batch_lock_conflict
+                      - kanglong_close_source_changed
+                      - kanglong_stale_fencing_token
+                      - blocked_plan_stale
+                      - kanglong_batch_warning_confirmation_required
+                      - kanglong_batch_capacity_blocked
+                      - kanglong_batch_refresh_unsafe
+                additionalProperties: true
+    ValidationError:
+      description: Validation error, including credential_type_not_supported
+  schemas:
+    KanglongBatchDefaults:
+      type: object
+      required: [symbol, preferred_side, leverage, per_leg_notional, round_count, round_interval_seconds]
+      properties:
+        symbol: {type: string, default: ETHUSDC}
+        preferred_side: {type: string, enum: [LONG, SHORT], default: LONG}
+        leverage: {type: integer, minimum: 1, maximum: 125, default: 100}
+        per_leg_notional: {type: string, format: decimal, exclusiveMinimum: 0, default: "250000"}
+        round_count: {type: integer, minimum: 1, maximum: 500, default: 30}
+        round_interval_seconds: {type: integer, minimum: 0, maximum: 3600, default: 3}
+    KanglongBatchCapacityPreviewRequest:
+      allOf:
+        - {$ref: "#/components/schemas/KanglongBatchPlanRequest"}
+        - type: object
+          required: [request_seq, input_hash]
+          properties:
+            operation: {type: string, const: open}
+            request_seq: {type: integer, minimum: 0}
+            input_hash: {type: string, minLength: 8, maxLength: 128}
+    AccountCredentialSummary:
+      type: object
+      required: [account_id, name, api_key_masked, has_api_secret, account_mode, enabled, order]
+      properties:
+        account_id: {type: string, minLength: 1, maxLength: 64, pattern: "^[a-zA-Z0-9_-]+$"}
+        name: {type: string, minLength: 1, maxLength: 100}
+        api_key_masked: {type: string}
+        has_api_secret: {type: boolean}
+        account_mode: {type: string, const: portfolio_margin}
+        enabled: {type: boolean}
+        order: {type: integer, minimum: 0}
+    AccountCredentialCreateRequest:
+      type: object
+      required: [account_id, name, api_key, api_secret]
+      properties:
+        account_id: {type: string, minLength: 1, maxLength: 64, pattern: "^[a-zA-Z0-9_-]+$"}
+        name: {type: string, minLength: 1, maxLength: 100}
+        api_key: {type: string, minLength: 8, maxLength: 256}
+        api_secret: {type: string, minLength: 8, maxLength: 256, writeOnly: true}
+        credential_type: {type: string, const: hmac, default: hmac}
+        account_mode: {type: string, const: portfolio_margin, default: portfolio_margin}
+        enabled: {type: boolean, default: true}
+    AccountCredentialUpdateRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        api_key: {type: string, minLength: 8, maxLength: 256}
+        api_secret: {type: string, minLength: 8, maxLength: 256, writeOnly: true}
+        enabled: {type: boolean}
+    AccountCredentialImportPreviewRequest:
+      type: object
+      required: [accounts]
+      properties:
+        accounts:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: {$ref: "#/components/schemas/AccountCredentialCreateRequest"}
+        mode: {type: string, enum: [merge, replace], default: merge}
+    AccountCredentialImportCommitRequest:
+      type: object
+      required: [preview_token]
+      properties:
+        preview_token: {type: string, minLength: 32, maxLength: 128}
+    AccountCredentialImportChanges:
+      type: object
+      required: [added_account_ids, updated_account_ids, unchanged_account_ids, removed_account_ids]
+      properties:
+        added_account_ids: {type: array, items: {type: string}}
+        updated_account_ids: {type: array, items: {type: string}}
+        unchanged_account_ids: {type: array, items: {type: string}}
+        removed_account_ids: {type: array, items: {type: string}}
+    AccountCredentialImportPreviewResponse:
+      type: object
+      required: [preview_token, credential_revision, expires_at, final_accounts, changes]
+      properties:
+        preview_token: {type: string}
+        credential_revision: {type: string}
+        expires_at: {type: string, format: date-time}
+        final_accounts:
+          type: array
+          items: {$ref: "#/components/schemas/AccountCredentialSummary"}
+        changes: {$ref: "#/components/schemas/AccountCredentialImportChanges"}
+    AccountCredentialOrderRequest:
+      type: object
+      required: [account_ids]
+      properties:
+        account_ids: {type: array, minItems: 1, maxItems: 100, items: {type: string}}
+    KanglongBatchPlanRequest:
+      type: object
+      required: [operation, symbol, preferred_side, account_ids]
+      properties:
+        operation: {type: string, enum: [open, close]}
+        symbol: {type: string}
+        preferred_side: {type: string, enum: [LONG, SHORT]}
+        leverage: {type: integer, minimum: 1, maximum: 125, default: 100}
+        per_leg_notional: {type: string, format: decimal, exclusiveMinimum: 0, default: "250000"}
+        account_ids: {type: array, minItems: 1, maxItems: 100, items: {type: string}}
+        source_open_run_id: {type: [string, "null"]}
+        round_count: {type: integer, minimum: 1, maximum: 500, default: 30}
+        round_interval_seconds: {type: integer, minimum: 0, maximum: 3600, default: 3}
+    KanglongActionRequest:
+      type: object
+      required: [plan_version, idempotency_key]
+      properties:
+        plan_version: {type: string}
+        plan_input_hash: {type: [string, "null"]}
+        confirmed_plan_hash: {type: [string, "null"]}
+        idempotency_key: {type: string, minLength: 8, maxLength: 128}
+        operator: {type: string, default: manual}
+        confirmed_warning_codes: {type: array, items: {type: string}, default: []}
+    KanglongControlRequest:
+      allOf:
+        - {$ref: "#/components/schemas/KanglongActionRequest"}
+        - type: object
+          required: [expected_action_version]
+          properties:
+            expected_action_version: {type: integer, minimum: 0}
+            operator: {type: string, default: manual}
+    KanglongBatchRecoverRequest:
+      allOf:
+        - {$ref: "#/components/schemas/KanglongControlRequest"}
+        - type: object
+          required: [release_reason]
+          properties:
+            release_reason: {type: string, minLength: 3, maxLength: 500}
+    KanglongBatchRunResponse:
+      type: object
+      required: [run_id, status, plan_version]
+      properties:
+        run_id: {type: string}
+        status:
+          type: string
+          enum: [draft_plan, chain_ready, plan_confirmed, execution_starting, running, pause_pending, paused_by_user, paused_market_unstable, stop_pending, stopped_by_user, completed, completed_with_dust_residual, blocked_plan_stale, paused_plan_recheck_changed, needs_abort_recover]
+        plan_version: {type: string}
+        action_version: {type: integer, minimum: 0}
+        available_actions: {type: array, items: {type: string}}
+        report: {type: object}
+        plan: {$ref: "#/components/schemas/KanglongBatchPlan"}
+    KanglongBatchAccountPlan:
+      type: object
+      required: [account_id, sequence, target_long_qty, target_short_qty, source_long_remaining_qty, source_short_remaining_qty, reference_mid_price, capacity_snapshot_id, market_snapshot_id]
+      properties:
+        account_id: {type: string}
+        sequence: {type: integer, minimum: 0}
+        target_long_qty: {type: string, format: decimal}
+        target_short_qty: {type: string, format: decimal}
+        source_long_remaining_qty: {type: string, format: decimal}
+        source_short_remaining_qty: {type: string, format: decimal}
+        source_ledger_hash: {type: [string, "null"]}
+        source_checkpoint_id: {type: [integer, "null"]}
+        maker_fee_rate: {type: string, format: decimal}
+        taker_fee_rate: {type: string, format: decimal}
+        bracket_max_allowed_leverage: {type: integer}
+        bracket_notional_coef: {type: string, format: decimal}
+        selected_bracket_effective_cap: {type: string, format: decimal}
+        current_symbol_leverage: {type: integer}
+        current_symbol_max_notional_value: {type: string, format: decimal}
+        effective_capacity_leverage: {type: integer}
+        reference_mid_price: {type: string, format: decimal}
+        capacity_snapshot_id: {type: string}
+        market_snapshot_id: {type: string}
+    KanglongBatchPlan:
+      type: object
+      required: [run_id, operation, symbol, preferred_side, requested_leverage, per_leg_notional, accounts, credential_revision, lock_scopes, completed_prefix_length, input_hash, plan_version]
+      properties:
+        run_id: {type: string}
+        operation: {type: string, enum: [open, close]}
+        symbol: {type: string}
+        preferred_side: {type: string, enum: [LONG, SHORT]}
+        requested_leverage: {type: integer}
+        per_leg_notional: {type: string, format: decimal}
+        accounts: {type: array, items: {$ref: "#/components/schemas/KanglongBatchAccountPlan"}}
+        source_open_run_id: {type: [string, "null"]}
+        credential_revision: {type: string}
+        lock_scopes: {type: array, items: {type: string}}
+        completed_prefix_length: {type: integer, minimum: 0}
+        input_hash: {type: string}
+        plan_version: {type: string}
+        round_count: {type: integer}
+        round_interval_seconds: {type: integer}
+        blocked: {type: boolean}
+        blocked_reasons: {type: array, items: {type: string}}
+        open_capacity_check_applied: {type: boolean}
+        warning_codes: {type: array, items: {type: string}}

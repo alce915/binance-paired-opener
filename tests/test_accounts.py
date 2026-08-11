@@ -2,16 +2,32 @@
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from paired_opener.account_runtime import AccountRuntimeManager
+from paired_opener.account_credentials import AccountCredentialStore, VerifiedCredentialCandidate
+from paired_opener.account_runtime import AccountCredentialCommitCoordinator
 from paired_opener import config as config_module
 from paired_opener.config import Settings
 from paired_opener.domain import OpenSession, SessionSpec, SessionStatus, TrendBias
 from paired_opener.storage import SqliteRepository
+
+
+class FakeManagedRuntime:
+    def __init__(self, account) -> None:
+        self.account = account
+        self.is_closed = False
+        self.verified = False
+
+    async def verify_read_only_access(self) -> None:
+        self.verified = True
+
+    async def aclose(self) -> None:
+        self.is_closed = True
 
 
 def _write_multi_account_env(root: Path) -> None:
@@ -224,5 +240,153 @@ async def test_runtime_manager_switch_account_does_not_wait_for_cleanup(tmp_path
     finally:
         release.set()
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_swap_closes_replaced_runtime_before_return(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, active_account_file=tmp_path / "active.json")
+    settings.accounts = {
+        "a1": config_module.AccountConfig("a1", "旧账号", "KEY-123456", "SECRET-123456")
+    }
+    settings.active_account_id = "a1"
+    repository = SqliteRepository(tmp_path / "runtime-swap.db")
+    manager = AccountRuntimeManager(settings, repository, runtime_factory=FakeManagedRuntime)
+    old = manager.current("a1")
+    prepared = await manager.prepare_accounts(
+        [config_module.AccountConfig("a1", "新账号", "KEY-654321", "SECRET-654321")]
+    )
+    replaced = manager.commit_accounts(prepared)
+    await manager.close_replaced(replaced)
+    assert old.is_closed is True
+    assert manager.current("a1").account.name == "新账号"
+    await manager.aclose()
+    repository.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_manager_shutdown_closes_current_runtime(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, active_account_file=tmp_path / "active.json")
+    settings.accounts = {
+        "a1": config_module.AccountConfig("a1", "账号", "KEY-123456", "SECRET-123456")
+    }
+    settings.active_account_id = "a1"
+    repository = SqliteRepository(tmp_path / "runtime-close.db")
+    manager = AccountRuntimeManager(settings, repository, runtime_factory=FakeManagedRuntime)
+    current = manager.current("a1")
+    await manager.aclose()
+    assert current.is_closed is True
+    repository.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_prepare_failure_closes_all_candidates(tmp_path: Path) -> None:
+    created: list[FakeManagedRuntime] = []
+
+    class RejectingRuntime(FakeManagedRuntime):
+        async def verify_read_only_access(self) -> None:
+            if self.account.account_id == "a2":
+                raise RuntimeError("verification failed")
+            await super().verify_read_only_access()
+
+    def factory(account):
+        runtime = RejectingRuntime(account)
+        created.append(runtime)
+        return runtime
+
+    settings = Settings(_env_file=None, active_account_file=tmp_path / "active.json")
+    settings.accounts = {}
+    settings.active_account_id = ""
+    repository = SqliteRepository(tmp_path / "runtime-prepare-failure.db")
+    manager = AccountRuntimeManager(settings, repository, runtime_factory=factory)
+    accounts = [
+        config_module.AccountConfig("a1", "账号 1", "KEY-123456", "SECRET-123456"),
+        config_module.AccountConfig("a2", "账号 2", "KEY-234567", "SECRET-234567"),
+    ]
+    with pytest.raises(RuntimeError, match="verification failed"):
+        await manager.prepare_accounts(accounts)
+    assert created and all(runtime.is_closed for runtime in created)
+    await manager.aclose()
+    repository.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_commit_finishes_runtime_cleanup_without_file_runtime_split(tmp_path: Path) -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    created = 0
+
+    class BlockingOldRuntime(FakeManagedRuntime):
+        async def aclose(self) -> None:
+            close_started.set()
+            await release_close.wait()
+            await super().aclose()
+
+    def factory(account):
+        nonlocal created
+        created += 1
+        if created == 1:
+            return BlockingOldRuntime(account)
+        return FakeManagedRuntime(account)
+
+    class FakeProtector:
+        def protect(self, value: bytes) -> bytes:
+            return b"protected:" + value[::-1]
+
+        def unprotect(self, value: bytes) -> bytes:
+            return value[10:][::-1]
+
+    class AllowMutation:
+        def ensure_mutation_allowed(self) -> None:
+            return None
+
+    old_account = config_module.AccountConfig("a1", "旧账号", "KEY-123456", "SECRET-123456")
+    new_account = config_module.AccountConfig("a1", "新账号", "KEY-654321", "SECRET-654321")
+    settings = Settings(_env_file=None, active_account_file=tmp_path / "active.json")
+    settings.accounts = {"a1": old_account}
+    settings.active_account_id = "a1"
+    repository = SqliteRepository(tmp_path / "runtime-cancel.db")
+    manager = AccountRuntimeManager(settings, repository, runtime_factory=factory)
+    old_runtime = manager.current("a1")
+    store = AccountCredentialStore(
+        tmp_path / "accounts.secure.json",
+        FakeProtector(),
+        permission_hardener=lambda _path: None,
+    )
+    initial_write = store.prepare([old_account])
+    store.commit(initial_write, expected_revision=store.current_revision())
+    revision = store.current_revision()
+    prepared_runtime = await manager.prepare_accounts([new_account])
+    prepared_write = store.prepare([new_account])
+    candidate = VerifiedCredentialCandidate(
+        accounts=(new_account,),
+        credential_revision=revision,
+        content_hash="candidate-hash",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        preview_token="",
+        changes={
+            "added_account_ids": [],
+            "updated_account_ids": ["a1"],
+            "unchanged_account_ids": [],
+            "removed_account_ids": [],
+        },
+    )
+    coordinator = AccountCredentialCommitCoordinator(store, manager, AllowMutation())
+    task = asyncio.create_task(
+        coordinator.commit(
+            candidate=candidate,
+            prepared_write=prepared_write,
+            prepared_runtime=prepared_runtime,
+        )
+    )
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    task.cancel()
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert old_runtime.is_closed is True
+    assert manager.current("a1").account.name == "新账号"
+    assert store.load()[0].name == "新账号"
+    await manager.aclose()
+    repository.close()
 
 

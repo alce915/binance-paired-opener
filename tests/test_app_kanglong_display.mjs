@@ -61,6 +61,15 @@ assert.ok(
     && indexSource.indexOf('id="kanglongTransferSettings"') < indexSource.indexOf('id="kanglongPlanSummary"'),
   "transfer settings should render between the account pool and link detection summary",
 );
+assert.equal(
+  (appSource.match(/function kanglongAccountLabel\(/g) || []).length,
+  1,
+  "app.js should not define duplicate kanglongAccountLabel functions because later declarations override earlier label fallback logic",
+);
+assert.ok(
+  appSource.includes("function kanglongAccountLabelForId("),
+  "app.js should keep the account-id log label resolver separate from the account-card label helper",
+);
 
 for (const symbol of [
   "kanglongState",
@@ -161,7 +170,7 @@ for (const [key, expected] of Object.entries({
   "console.kanglong.plan.capacity.margin_capacity_qty": "可用保证金上限",
   "console.kanglong.plan.capacity.liquidation_buffer_qty": "爆仓缓冲上限",
   "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
-  "events.kanglong.trade_executed": "亢龙第 {group_id} 组第 {round_id} 轮{action_label}：{account_id} {symbol} {side} 成交 {filled_qty}，均价 {avg_price}，手续费 {fee}，状态 {status}",
+  "events.kanglong.trade_executed": "亢龙第 {group_id} 组第 {round_id} 轮{action_label}：{account_label} {symbol} {side} 成交 {filled_qty}，均价 {avg_price}，手续费 {fee}，状态 {status}",
   "runtime.kanglong.status.plan_confirmed": "链路已确认",
   "runtime.kanglong.status.blocked_plan_stale": "检测链路已过期",
   "runtime.kanglong.status.idempotency_conflict": "重复请求冲突",
@@ -261,7 +270,7 @@ function makeKanglongHarness(requestImpl) {
       "console.kanglong.logs.filter.cost": "成本事件",
       "console.kanglong.logs.filter.ledger": "账本事件",
       "events.kanglong.group_simulated": "亢龙第 {group_id} 组模拟完成",
-      "events.kanglong.trade_executed": "亢龙第 {group_id} 组第 {round_id} 轮{action_label}：{account_id} {symbol} {side} 成交 {filled_qty}，均价 {avg_price}，手续费 {fee}，状态 {status}",
+      "events.kanglong.trade_executed": "亢龙第 {group_id} 组第 {round_id} 轮{action_label}：{account_label} {symbol} {side} 成交 {filled_qty}，均价 {avg_price}，手续费 {fee}，状态 {status}",
       "runtime.kanglong.status.plan_confirmed": "链路已确认",
       "runtime.kanglong.status.chain_ready": "链路可确认",
       "runtime.kanglong.status.blocked_plan_stale": "检测链路已过期",
@@ -382,12 +391,53 @@ function makeKanglongHarness(requestImpl) {
         return value === undefined || value === null ? "{" + name + "}" : String(value);
       });
     }
+    function kanglongAccountLabelForId(accountId) {
+      const rawAccountId = String(accountId || "").trim();
+      if (!rawAccountId) return "";
+      const normalizedAccountId = kanglongAccountId(rawAccountId);
+      const report = kanglongState.plan?.report && typeof kanglongState.plan.report === "object" ? kanglongState.plan.report : {};
+      const syntheticState = report.synthetic_account_state && typeof report.synthetic_account_state === "object" ? report.synthetic_account_state : {};
+      const accountSnapshot = report.account_snapshot && typeof report.account_snapshot === "object" ? report.account_snapshot : {};
+      const accountLists = [
+        availableAccounts,
+        kanglongState.templatePreview?.accounts,
+        syntheticState.accounts,
+        accountSnapshot.accounts,
+      ];
+      for (const accounts of accountLists) {
+        if (!Array.isArray(accounts)) continue;
+        const account = accounts.find((item) => kanglongAccountId(item?.account_id || item?.id) === normalizedAccountId);
+        if (!account) continue;
+        const label = String(
+          account.name
+          || account.account_name
+          || account.label
+          || account.template_account_id
+          || account.templateAccountId
+          || "",
+        ).trim();
+        if (label && !label.startsWith("tpl:")) return label;
+      }
+      return rawAccountId;
+    }
+    function isKanglongInternalAccountId(value) {
+      return /^(tpl:|sub:|main:)/i.test(String(value || "").trim());
+    }
+    function normalizeLogMessageParams(messageCode, params = {}) {
+      if (messageCode !== "events.kanglong.trade_executed") return params;
+      const accountId = params.account_id || params.accountId || "";
+      const rawAccountLabel = String(params.account_label || params.accountLabel || "").trim();
+      const fallbackLabel = kanglongAccountLabelForId(accountId);
+      const accountLabel = !isKanglongInternalAccountId(rawAccountLabel) ? rawAccountLabel : "";
+      const visibleAccount = accountLabel || fallbackLabel || (!isKanglongInternalAccountId(accountId) ? String(accountId || "") : "");
+      return { ...params, account_id: visibleAccount, account_label: visibleAccount, accountLabel: visibleAccount };
+    }
     function resolveLogMessage(source = {}, fallback = "") {
       const safeFallback = fallback || source.fallbackMessage || copyOrDefault("runtime.execution_message_unavailable", "日志信息暂不可用");
       const messageCode = source.messageCode || source.message_code;
       const messageParams = source.messageParams || source.message_params || {};
       if (messageCode) {
-        const rendered = copyOrDefault(messageCode, messageCode, messageParams);
+        const rendered = copyOrDefault(messageCode, messageCode, normalizeLogMessageParams(messageCode, messageParams));
         if (rendered !== messageCode) return rendered;
       }
       if (source.trustedMessage === true && source.message) return String(source.message);
@@ -1051,6 +1101,40 @@ for (const [status, label] of Object.entries(kanglongStatusLabels)) {
   const labeledText = api.executionLog.textContent;
   assert.ok(labeledText.includes("测试子账号 1"), "execution logs should prefer frozen account labels");
   assert.doesNotMatch(labeledText, /tpl:tpl_eth_drop_001:sub:sub-1/, "execution logs should not expose synthetic template account ids");
+}
+
+{
+  const api = makeKanglongHarness(async () => ({}));
+  api.state.accountSource = "test_template";
+  api.state.templatePreview = {
+    accounts: [
+      { account_id: "tpl:tpl_287ad970d67d:main", name: "测试主账号" },
+      { account_id: "tpl:tpl_287ad970d67d:sub:sub-1", name: "jiage4" },
+    ],
+  };
+  api.appendKanglongExecutionEvent({
+    event_id: 10,
+    event_type: "kanglong_trade_executed",
+    payload: {
+      message_key: "events.kanglong.trade_executed",
+      message_params: {
+        group_id: "group-0001",
+        round_id: "1",
+        action_label: "开仓",
+        account_id: "tpl:tpl_287ad970d67d:sub:sub-1",
+        account_label: "tpl:tpl_287ad970d67d:sub:sub-1",
+        symbol: "ETHUSDC",
+        side: "LONG",
+        filled_qty: "1.00",
+        avg_price: "3100.00",
+        fee: "1.55",
+        status: "filled",
+      },
+    },
+  });
+  const renderedText = api.executionLog.textContent;
+  assert.ok(renderedText.includes("jiage4 ETHUSDC LONG"), "template trade log should render the account display name");
+  assert.equal(renderedText.includes("tpl:tpl_287ad970d67d:sub:sub-1"), false, "template trade log should not expose raw template account IDs");
 }
 
 {

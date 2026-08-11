@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -9,8 +10,19 @@ from fastapi import HTTPException
 from paired_opener import api as api_module
 from paired_opener.domain import PositionSide, SymbolRules
 from paired_opener.kanglong.config import KanglongSymbolConfig
-from paired_opener.kanglong.models import KanglongRunStatus, TransferExecutionSettings, available_actions_for_status
-from paired_opener.kanglong.service import KanglongSimulationService, _apply_group_result_to_synthetic_accounts
+from paired_opener.kanglong.models import (
+    KanglongEvent,
+    KanglongEventStatus,
+    KanglongGroupPlan,
+    KanglongRunStatus,
+    TransferExecutionSettings,
+    available_actions_for_status,
+)
+from paired_opener.kanglong.service import (
+    KanglongSimulationService,
+    _apply_group_result_to_synthetic_accounts,
+    _kanglong_trade_events,
+)
 from paired_opener.schemas import (
     KanglongActionRequest,
     KanglongEventsResponse,
@@ -132,6 +144,51 @@ def test_transfer_execution_settings_lock_mode_side_and_leverage() -> None:
             per_round_qty=Decimal("0.125"),
             order_side=PositionSide.SHORT,
         )
+
+
+def test_trade_event_payload_does_not_promote_raw_template_id_to_account_label() -> None:
+    group = KanglongGroupPlan(
+        group_id="group-0001",
+        from_account_id="tpl:tpl_eth_drop_001:sub:sub-1",
+        to_account_id="tpl:tpl_eth_drop_001:main",
+        symbol="ETHUSDC",
+        side=PositionSide.LONG,
+        target_qty=Decimal("1"),
+        round_qtys=[Decimal("1")],
+    )
+    event = KanglongEvent(
+        run_id="run-label-fallback",
+        group_id=group.group_id,
+        round_id="group-0001-round-0001",
+        mode="simulation",
+        account_id=group.from_account_id,
+        symbol=group.symbol,
+        position_side=PositionSide.LONG,
+        action_type="single_close",
+        leg_id="close-1",
+        paired_leg_id="open-1",
+        round_match_id="match-1",
+        planned_qty=Decimal("1"),
+        submitted_qty=Decimal("1"),
+        filled_qty=Decimal("1"),
+        matched_qty=Decimal("1"),
+        close_residual_qty=Decimal("0"),
+        open_residual_qty=Decimal("0"),
+        avg_price=Decimal("3100"),
+        status=KanglongEventStatus.FILLED,
+        fee=Decimal("1.55"),
+    )
+
+    rows = _kanglong_trade_events(
+        SimpleNamespace(events=[event]),
+        group=group,
+        plan_version="plan-label-fallback",
+        account_labels={},
+    )
+
+    message_params = rows[0]["payload"]["message_params"]
+    assert message_params["account_id"] == "tpl:tpl_eth_drop_001:sub:sub-1"
+    assert not message_params.get("account_label", "").startswith("tpl:")
 
 
 def _rules() -> SymbolRules:
@@ -939,6 +996,7 @@ def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
             fee_rate=Decimal("0.0005"),
         )
         stored = repository.get_kanglong_run("run-template-execute")
+        events = service.list_events("run-template-execute", after_event_id=0, limit=50)["events"]
     finally:
         repository.close()
 
@@ -955,6 +1013,9 @@ def test_service_execute_persists_synthetic_template_state(tmp_path) -> None:
     assert Decimal(sub["positions"][0]["qty"]) == Decimal("1.00")
     assert main["positions"][0]["position_side"] == "LONG"
     assert Decimal(main["positions"][0]["qty"]) == Decimal("0.00")
+    trade_event = next(event for event in events if event["event_type"] == "kanglong_trade_executed")
+    assert trade_event["payload"]["message_params"]["account_label"] == "Test Sub 1"
+    assert trade_event["payload"]["message_params"]["account_label"] != trade_event["payload"]["message_params"]["account_id"]
 
 
 def test_execute_plan_idempotency_reuses_completed_response_after_recheck_prices_are_gone(tmp_path) -> None:

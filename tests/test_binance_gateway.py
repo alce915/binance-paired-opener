@@ -8,8 +8,11 @@ import httpx
 import pytest
 
 from paired_opener.binance import BinanceFuturesGateway
+from paired_opener.classified_gateway import ClassifiedExchangeGateway
 from paired_opener.config import Settings
 from paired_opener.domain import ExchangeOrder, ExchangeOrderStatus, OrderSide, PositionSide, Quote
+from paired_opener.errors import TradingError
+from paired_opener.exchange import RateLimitObservation
 
 
 @pytest.mark.asyncio
@@ -287,3 +290,169 @@ async def test_gateway_treats_reconnecting_user_stream_as_unhealthy() -> None:
         await gateway.close()
 
     assert healthy is False
+
+
+def _portfolio_margin_payload(path: str):
+    if path == "/papi/v1/account":
+        return {
+            "accountStatus": "NORMAL",
+            "accountEquity": "100000",
+            "totalAvailableBalance": "50000",
+        }
+    if path == "/papi/v1/um/positionSide/dual":
+        return {"dualSidePosition": True}
+    if path == "/papi/v1/um/symbolConfig":
+        return [{"symbol": "ETHUSDC", "leverage": 100, "maxNotionalValue": "1500000"}]
+    if path == "/papi/v1/um/leverageBracket":
+        return [
+            {
+                "symbol": "ETHUSDC",
+                "notionalCoef": "1",
+                "brackets": [
+                    {"bracket": 1, "initialLeverage": 125, "notionalFloor": "0", "notionalCap": "1000000"},
+                    {"bracket": 2, "initialLeverage": 50, "notionalFloor": "1000000", "notionalCap": "2000000"},
+                ],
+            }
+        ]
+    if path == "/papi/v1/um/positionRisk":
+        return []
+    if path == "/papi/v1/um/openOrders":
+        return []
+    if path == "/papi/v1/um/commissionRate":
+        return {"makerCommissionRate": "0.0002", "takerCommissionRate": "0"}
+    raise AssertionError(f"unexpected path {path}")
+
+
+@pytest.mark.asyncio
+async def test_portfolio_margin_precheck_uses_only_read_endpoints() -> None:
+    gateway = BinanceFuturesGateway(
+        Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret")
+    )
+    calls: list[tuple[str, str, dict | None, bool]] = []
+
+    async def fake_signed_request(method, path, params=None, *, use_papi=False):
+        calls.append((method, path, params, use_papi))
+        return _portfolio_margin_payload(path)
+
+    gateway._signed_request = fake_signed_request  # type: ignore[method-assign]
+    try:
+        result = await gateway.get_portfolio_margin_precheck("ETHUSDC", 100, Decimal("500000"))
+    finally:
+        await gateway.close()
+
+    assert result["hedge_mode"] is True
+    assert result["projected_symbol_exposure"] == Decimal("500000")
+    assert result["selected_bracket"]["max_allowed_leverage"] >= 100
+    assert result["current_symbol_max_notional_value"] == Decimal("1500000")
+    assert all(method == "GET" and use_papi for method, _, _, use_papi in calls)
+    assert not any("/order" in path.lower() or path.endswith("/leverage") for _, path, _, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_commission_rates_are_account_specific() -> None:
+    gateway = BinanceFuturesGateway(
+        Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret")
+    )
+
+    async def fake_signed_request(method, path, params=None, *, use_papi=False):
+        assert (method, path, use_papi) == ("GET", "/papi/v1/um/commissionRate", True)
+        return _portfolio_margin_payload(path)
+
+    gateway._signed_request = fake_signed_request  # type: ignore[method-assign]
+    try:
+        rates = await gateway.get_commission_rates("ETHUSDC")
+    finally:
+        await gateway.close()
+    assert rates == {"maker": Decimal("0.0002"), "taker": Decimal("0")}
+
+
+@pytest.mark.asyncio
+async def test_notional_coefficient_is_applied_exactly_once_to_every_bracket() -> None:
+    gateway = BinanceFuturesGateway(
+        Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret")
+    )
+
+    async def fake_signed_request(method, path, params=None, *, use_papi=False):
+        payload = _portfolio_margin_payload(path)
+        if path == "/papi/v1/um/leverageBracket":
+            payload[0]["notionalCoef"] = "0.5"
+        return payload
+
+    gateway._signed_request = fake_signed_request  # type: ignore[method-assign]
+    try:
+        result = await gateway.get_portfolio_margin_precheck("ETHUSDC", 100, Decimal("400000"))
+    finally:
+        await gateway.close()
+    first = result["brackets"][0]
+    assert first["notional_cap"] == Decimal("1000000")
+    assert first["notional_coef"] == Decimal("0.5")
+    assert first["effective_cap"] == Decimal("500000")
+    assert result["selected_bracket"]["bracket"] == 1
+
+
+@pytest.mark.asyncio
+async def test_depth_cache_refreshes_when_fewer_than_requested_levels() -> None:
+    gateway = BinanceFuturesGateway(Settings(_env_file=None))
+    gateway._depth_cache["ETHUSDC"] = {
+        "bids": [{"price": Decimal("100"), "qty": Decimal("1")}] * 5,
+        "asks": [{"price": Decimal("101"), "qty": Decimal("1")}] * 5,
+    }
+    calls: list[dict] = []
+
+    async def no_stream(_symbol):
+        return None
+
+    async def fake_public_request(method, path, params=None):
+        calls.append(dict(params or {}))
+        return {
+            "lastUpdateId": 1,
+            "bids": [[str(100 - index), "1"] for index in range(20)],
+            "asks": [[str(101 + index), "1"] for index in range(20)],
+        }
+
+    gateway._ensure_depth_stream = no_stream  # type: ignore[method-assign]
+    gateway._public_request = fake_public_request  # type: ignore[method-assign]
+    try:
+        order_book = await gateway.get_order_book("ETHUSDC", limit=20)
+    finally:
+        await gateway.close()
+    assert len(order_book["bids"]) == len(order_book["asks"]) == 20
+    assert calls == [{"symbol": "ETHUSDC", "limit": 20}]
+
+
+@pytest.mark.asyncio
+async def test_gateway_reports_weight_and_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    observations: list[RateLimitObservation] = []
+    gateway = BinanceFuturesGateway(
+        Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret"),
+        rate_limit_observer=observations.append,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            request=request,
+            headers={"X-MBX-USED-WEIGHT-1M": "5900", "Retry-After": "2"},
+            json={"code": -1003, "msg": "Too many requests"},
+        )
+
+    await gateway._papi_client.aclose()
+    gateway._papi_client = httpx.AsyncClient(
+        base_url="https://papi.binance.com",
+        headers={"X-MBX-APIKEY": "test-key"},
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("paired_opener.classified_gateway.asyncio.sleep", no_sleep)
+    classified = ClassifiedExchangeGateway(gateway)
+    try:
+        with pytest.raises(TradingError) as exc_info:
+            await classified.get_commission_rates("ETHUSDC")
+    finally:
+        await classified.close()
+    assert observations[-1].used_weight_by_window["1m"] == 5900
+    assert observations[-1].retry_after_seconds == Decimal("2")
+    assert exc_info.value.context["retry_after_seconds"] == Decimal("2")

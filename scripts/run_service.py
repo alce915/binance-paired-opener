@@ -44,7 +44,14 @@ def main() -> int:
     try:
         import uvicorn
 
-        uvicorn.run("paired_opener.api:app", host=args.host, port=args.port)
+        from paired_opener.single_instance import require_single_worker
+
+        uvicorn.run(
+            "paired_opener.api:app",
+            host=args.host,
+            port=args.port,
+            workers=require_single_worker(),
+        )
         return 0
     except Exception:
         traceback.print_exc()

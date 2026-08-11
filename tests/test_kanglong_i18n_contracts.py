@@ -267,3 +267,33 @@ def test_all_kanglong_run_statuses_have_display_copy() -> None:
     ]
 
     assert missing == []
+
+
+def test_kanglong_batch_and_credential_ui_copy_is_complete() -> None:
+    catalog = load_messages()
+    required = {
+        "console.kanglong.credentials.manage",
+        "console.kanglong.credentials.empty_guide",
+        "console.kanglong.credentials.migration_required",
+        "console.kanglong.credentials.preview_summary",
+        "console.kanglong.batch.title",
+        "console.kanglong.batch.simulation_only",
+        "console.kanglong.batch.capacity_disclaimer",
+        "console.kanglong.batch.capacity_batch",
+        "console.kanglong.batch.capacity_account",
+        "console.kanglong.batch.capacity_unknown",
+        "console.kanglong.batch.current_leverage_used",
+        "console.kanglong.batch.close_capacity_note",
+        "console.kanglong.batch.cost_summary",
+        "events.kanglong.batch_plan_confirmed",
+        "events.kanglong.batch_execution_starting",
+        "reasons.kanglong.batch_capacity_blocked",
+        "reasons.kanglong.credential_revision_conflict",
+        "reasons.kanglong.action_version_conflict",
+    }
+    assert required.issubset(catalog)
+    assert event_registry()["kanglong_batch_plan_confirmed"]["key"] == "events.kanglong.batch_plan_confirmed"
+    assert event_registry()["kanglong_batch_execution_starting"]["key"] == "events.kanglong.batch_execution_starting"
+    assert reason_registry()["kanglong_batch_capacity_blocked"]["key"] == "reasons.kanglong.batch_capacity_blocked"
+    assert reason_registry()["credential_revision_conflict"]["key"] == "reasons.kanglong.credential_revision_conflict"
+    assert reason_registry()["action_version_conflict"]["key"] == "reasons.kanglong.action_version_conflict"

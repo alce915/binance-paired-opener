@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -19,6 +20,31 @@ from paired_opener.kanglong.ledger import (
     hash_ledger_state,
     ledger_entry_from_storage_payload,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class KanglongActionMutation:
+    expected_statuses: tuple[str, ...]
+    expected_plan_version: str
+    expected_action_version: int | None
+    next_status: str
+    available_actions: tuple[str, ...]
+    plan: dict[str, object] | None = None
+    progress: dict[str, object] | None = None
+    report: dict[str, object] | None = None
+    confirmed_at: str | None = None
+    result_grade: str | None = None
+    events: tuple[dict[str, object], ...] = ()
+    increment_action_version: bool = False
+    acquire_frozen_locks: bool = False
+    current_credential_revision: str | None = None
+    lock_ttl_ms: int = 60_000
+
+
+@dataclass(frozen=True, slots=True)
+class KanglongLeaseExpectation:
+    lease_token: str
+    fencing_token: str
 
 
 def _json_dumps(payload: Any) -> str:
@@ -84,7 +110,9 @@ class SqliteRepository:
         self._lock = threading.Lock()
         self._session_event_retention_days = max(int(session_event_retention_days), 0)
         self._session_event_retention_per_session = max(int(session_event_retention_per_session), 0)
+        self._test_failpoints: set[str] = set()
         self._initialize()
+        self.cleanup_expired_kanglong_idempotency()
 
     def _initialize(self) -> None:
         account_name_default = DEFAULT_ACCOUNT_NAME.replace("'", "''")
@@ -275,6 +303,17 @@ class SqliteRepository:
                     UNIQUE (run_id, checkpoint_id, sequence),
                     UNIQUE (run_id, operation_id, sequence)
                 );
+                CREATE TABLE IF NOT EXISTS kanglong_batch_accounts (
+                    run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    last_precheck_snapshot_at TEXT,
+                    PRIMARY KEY (run_id, account_id),
+                    UNIQUE (run_id, sequence)
+                );
                 """
             )
             self._ensure_column("sessions", "session_kind", "TEXT NOT NULL DEFAULT 'paired_open'")
@@ -324,6 +363,7 @@ class SqliteRepository:
             self._ensure_column("kanglong_runs", "available_actions_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column("kanglong_runs", "progress_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("kanglong_runs", "report_summary_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("kanglong_runs", "run_kind", "TEXT NOT NULL DEFAULT 'transfer'")
             self._ensure_column("kanglong_events", "checkpoint_id", "INTEGER")
             self._ensure_column("kanglong_locks", "worker_id", "TEXT")
             self._ensure_column("kanglong_locks", "lease_token", "TEXT")
@@ -356,14 +396,15 @@ class SqliteRepository:
             self._connection.execute(
                 """
                 INSERT INTO kanglong_runs (
-                    run_id, engine_version, symbol, main_account_id, subaccount_ids_json, status,
+                    run_id, run_kind, engine_version, symbol, main_account_id, subaccount_ids_json, status,
                     result_grade, request_json, plan_json, report_json, plan_version,
                     snapshot_bundle_id, confirmed_at, available_actions_json, progress_json,
                     report_summary_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["run_id"],
+                    payload.get("run_kind", "transfer"),
                     int(payload.get("engine_version", 2)),
                     payload["symbol"],
                     payload["main_account_id"],
@@ -384,6 +425,492 @@ class SqliteRepository:
                 ),
             )
 
+    def save_kanglong_batch_plan(self, plan: Any, *, status: str = "draft_plan") -> None:
+        from paired_opener.kanglong.batch_models import KanglongBatchPlan
+
+        if not isinstance(plan, KanglongBatchPlan):
+            plan = KanglongBatchPlan.from_payload(dict(plan))
+        if not plan.accounts:
+            raise ValueError("kanglong_batch_accounts_required")
+        account_ids = [account.account_id for account in plan.accounts]
+        if [account.sequence for account in plan.accounts] != list(range(len(plan.accounts))):
+            raise ValueError("kanglong_batch_sequence_invalid")
+        now = datetime.now(UTC).isoformat()
+        payload = plan.to_payload()
+        request = {
+            "mode": "simulation",
+            "operation": plan.operation,
+            "symbol": plan.symbol,
+            "preferred_side": plan.preferred_side.value,
+            "leverage": plan.requested_leverage,
+            "per_leg_notional": plan.per_leg_notional,
+            "account_ids": account_ids,
+            "source_open_run_id": plan.source_open_run_id,
+            "round_count": plan.round_count,
+            "round_interval_seconds": plan.round_interval_seconds,
+        }
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO kanglong_runs (
+                    run_id, run_kind, engine_version, symbol, main_account_id,
+                    subaccount_ids_json, status, request_json, plan_json, report_json,
+                    plan_version, available_actions_json, progress_json,
+                    report_summary_json, created_at, updated_at
+                ) VALUES (?, 'kanglong_batch', 2, ?, ?, ?, ?, ?, ?, '{}', ?, '[]', ?, '{}', ?, ?)
+                """,
+                (
+                    plan.run_id,
+                    plan.symbol,
+                    account_ids[0],
+                    _json_dumps(account_ids[1:]),
+                    status,
+                    _json_dumps(request),
+                    _json_dumps(payload),
+                    plan.plan_version,
+                    _json_dumps(
+                        {
+                            "action_version": 0,
+                            "current_account_sequence": plan.completed_prefix_length,
+                            "credential_revision": plan.credential_revision,
+                            "lock_scopes": list(plan.lock_scopes),
+                        }
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            for account in plan.accounts:
+                self._connection.execute(
+                    """
+                    INSERT INTO kanglong_batch_accounts (
+                        run_id, account_id, sequence, status,
+                        started_at, completed_at, last_precheck_snapshot_at
+                    ) VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+                    """,
+                    (
+                        plan.run_id,
+                        account.account_id,
+                        account.sequence,
+                        "completed" if account.sequence < plan.completed_prefix_length else "pending",
+                    ),
+                )
+
+    def save_batch_plan(self, plan: Any, *, status: str = "draft_plan") -> None:
+        self.save_kanglong_batch_plan(plan, status=status)
+
+    def get_kanglong_batch_plan(self, run_id: str) -> Any | None:
+        from paired_opener.kanglong.batch_models import KanglongBatchPlan
+
+        stored = self.get_kanglong_run(run_id)
+        if stored is None or stored.get("run_kind") != "kanglong_batch":
+            return None
+        return KanglongBatchPlan.from_payload(stored["plan"])
+
+    def get_kanglong_batch_source_availability(
+        self,
+        source_open_run_id: str,
+        account_ids: list[str],
+    ) -> dict[str, Any]:
+        source = self.get_kanglong_run(source_open_run_id)
+        if (
+            source is None
+            or source.get("run_kind") != "kanglong_batch"
+            or (source.get("plan") or {}).get("operation") != "open"
+        ):
+            raise ValueError("kanglong_source_open_run_not_found")
+        if source.get("status") not in {"completed", "completed_with_dust_residual"}:
+            raise ValueError("kanglong_source_open_run_not_completed")
+        source_plan = source.get("plan") or {}
+        canonical_ids = [str(item.get("account_id") or "") for item in source_plan.get("accounts") or []]
+        requested = set(account_ids)
+        if not requested or not requested.issubset(canonical_ids):
+            raise ValueError("kanglong_source_account_not_found")
+
+        opened: dict[tuple[str, str], Decimal] = {}
+        closed: dict[tuple[str, str], Decimal] = {}
+        source_entries = self.list_kanglong_ledger_entries(source_open_run_id)
+        for entry in source_entries:
+            payload = entry.get("payload") or {}
+            side = str(payload.get("position_side") or "").upper()
+            if entry.get("entry_type") != "open_position" or side not in {"LONG", "SHORT"}:
+                continue
+            key = (str(entry.get("account_id") or ""), side)
+            opened[key] = opened.get(key, Decimal("0")) + abs(Decimal(str(entry.get("qty_delta") or "0")))
+
+        rows = self._connection.execute(
+            "SELECT * FROM kanglong_ledger_entries WHERE entry_type = 'close_position' ORDER BY entry_id ASC"
+        ).fetchall()
+        for row in rows:
+            entry = dict(row)
+            entry["payload"] = _json_load(entry.pop("payload_json", "{}"), {})
+            payload = entry.get("payload") or {}
+            if str(payload.get("source_open_run_id") or "") != source_open_run_id:
+                continue
+            side = str(payload.get("position_side") or "").upper()
+            if side not in {"LONG", "SHORT"}:
+                continue
+            key = (str(entry.get("account_id") or ""), side)
+            closed[key] = closed.get(key, Decimal("0")) + abs(Decimal(str(entry.get("qty_delta") or "0")))
+
+        checkpoint = self.latest_kanglong_checkpoint(source_open_run_id)
+        result_accounts: list[dict[str, Any]] = []
+        for account_id in canonical_ids:
+            if account_id not in requested:
+                continue
+            long_remaining = max(opened.get((account_id, "LONG"), Decimal("0")) - closed.get((account_id, "LONG"), Decimal("0")), Decimal("0"))
+            short_remaining = max(opened.get((account_id, "SHORT"), Decimal("0")) - closed.get((account_id, "SHORT"), Decimal("0")), Decimal("0"))
+            result_accounts.append(
+                {
+                    "account_id": account_id,
+                    "source_long_remaining_qty": long_remaining,
+                    "source_short_remaining_qty": short_remaining,
+                    "target_long_qty": long_remaining,
+                    "target_short_qty": short_remaining,
+                    "source_ledger_hash": checkpoint.get("ledger_hash") if checkpoint else "genesis",
+                    "source_checkpoint_id": checkpoint.get("checkpoint_id") if checkpoint else 0,
+                }
+            )
+        return {
+            "source_open_run_id": source_open_run_id,
+            "symbol": source.get("symbol"),
+            "accounts": result_accounts,
+            "source_ledger_hash": checkpoint.get("ledger_hash") if checkpoint else "genesis",
+            "source_checkpoint_id": checkpoint.get("checkpoint_id") if checkpoint else 0,
+        }
+
+    def list_kanglong_batch_accounts(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM kanglong_batch_accounts
+            WHERE run_id = ?
+            ORDER BY sequence ASC
+            """,
+            (run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_batch_accounts(self, run_id: str) -> list[dict[str, Any]]:
+        return self.list_kanglong_batch_accounts(run_id)
+
+    def get_kanglong_batch_account(self, run_id: str, account_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM kanglong_batch_accounts
+            WHERE run_id = ? AND account_id = ?
+            """,
+            (run_id, account_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_active_kanglong_batch_account(self, run_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM kanglong_batch_accounts
+            WHERE run_id = ? AND status NOT IN ('completed', 'completed_with_dust', 'stopped')
+            ORDER BY sequence ASC LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def sum_kanglong_batch_leg_qty(self, run_id: str, account_id: str, position_side: str) -> Decimal:
+        total = Decimal("0")
+        for entry in self.list_kanglong_ledger_entries(run_id):
+            if str(entry.get("account_id") or "") != account_id:
+                continue
+            payload = entry.get("payload") or {}
+            if str(payload.get("position_side") or "").upper() != position_side.upper():
+                continue
+            if entry.get("entry_type") not in {"open_position", "close_position"}:
+                continue
+            total += abs(Decimal(str(entry.get("qty_delta") or "0")))
+        return total
+
+    def count_kanglong_operation_id(self, run_id: str, operation_id: str) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS value FROM kanglong_ledger_entries
+            WHERE run_id = ? AND operation_id = ?
+            """,
+            (run_id, operation_id),
+        ).fetchone()
+        return int(row["value"] if row is not None else 0)
+
+    def begin_kanglong_batch_execution(
+        self,
+        *,
+        run_id: str,
+        expected_plan_version: str,
+        current_credential_revision: str,
+        ttl_ms: int = 600_000,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        expires_at = (now + timedelta(milliseconds=max(int(ttl_ms), 1000))).isoformat()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM kanglong_runs WHERE run_id = ? AND run_kind = 'kanglong_batch'",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("kanglong_batch_run_not_found")
+            plan_payload = _json_load(row["plan_json"], {})
+            if row["plan_version"] != expected_plan_version:
+                return {"started": False, "code": "plan_version_conflict"}
+            if str(plan_payload.get("credential_revision") or "") != current_credential_revision:
+                self._mark_batch_plan_stale_locked(run_id, now_text)
+                return {"started": False, "code": "credential_revision_conflict"}
+
+            scopes = tuple(sorted({str(scope) for scope in plan_payload.get("lock_scopes") or [] if scope}))
+            self._connection.execute(
+                """
+                DELETE FROM kanglong_locks
+                WHERE expires_at <= ? AND (lease_token IS NULL OR lease_token = '')
+                """,
+                (now_text,),
+            )
+            for scope in scopes:
+                conflict = self._connection.execute(
+                    """
+                    SELECT * FROM kanglong_locks
+                    WHERE lock_scope = ? AND run_id != ? AND status = 'active'
+                    """,
+                    (scope, run_id),
+                ).fetchone()
+                if conflict is not None:
+                    return {
+                        "started": False,
+                        "code": "kanglong_batch_lock_conflict",
+                        "lock_scope": scope,
+                        "conflicting_run_id": conflict["run_id"],
+                    }
+
+            if plan_payload.get("operation") == "close":
+                availability = self.get_kanglong_batch_source_availability(
+                    str(plan_payload.get("source_open_run_id") or ""),
+                    [str(item.get("account_id") or "") for item in plan_payload.get("accounts") or []],
+                )
+                latest_by_id = {item["account_id"]: item for item in availability["accounts"]}
+                for frozen in plan_payload.get("accounts") or []:
+                    latest = latest_by_id.get(str(frozen.get("account_id") or ""))
+                    if latest is None or any(
+                        Decimal(str(latest[field])) != Decimal(str(frozen.get(field) or "0"))
+                        for field in ("source_long_remaining_qty", "source_short_remaining_qty")
+                    ) or str(latest.get("source_ledger_hash")) != str(frozen.get("source_ledger_hash")) \
+                        or int(latest.get("source_checkpoint_id") or 0) != int(frozen.get("source_checkpoint_id") or 0):
+                        self._mark_batch_plan_stale_locked(run_id, now_text)
+                        return {"started": False, "code": "kanglong_close_source_changed"}
+
+            for scope in scopes:
+                self._connection.execute(
+                    """
+                    INSERT INTO kanglong_locks (lock_scope, run_id, status, heartbeat_at, expires_at)
+                    VALUES (?, ?, 'active', ?, ?)
+                    ON CONFLICT(lock_scope) DO UPDATE SET
+                        run_id = excluded.run_id,
+                        status = excluded.status,
+                        heartbeat_at = excluded.heartbeat_at,
+                        expires_at = excluded.expires_at
+                    """,
+                    (scope, run_id, now_text, expires_at),
+                )
+            self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET status = 'execution_starting', updated_at = ?
+                WHERE run_id = ?
+                """,
+                (now_text, run_id),
+            )
+        return {"started": True, "status": "execution_starting", "lock_scopes": list(scopes)}
+
+    def _mark_batch_plan_stale_locked(self, run_id: str, now_text: str) -> None:
+        self._connection.execute(
+            """
+            UPDATE kanglong_runs
+            SET status = 'blocked_plan_stale',
+                available_actions_json = '["refresh_plan","view_report"]',
+                updated_at = ?
+            WHERE run_id = ?
+            """,
+            (now_text, run_id),
+        )
+        self._connection.execute(
+            """
+            DELETE FROM kanglong_locks
+            WHERE run_id = ? AND (lease_token IS NULL OR lease_token = '')
+            """,
+            (run_id,),
+        )
+
+    def reacquire_kanglong_batch_locks(self, run_id: str, *, ttl_ms: int) -> dict[str, Any]:
+        stored = self.get_kanglong_run(run_id)
+        if stored is None or stored.get("run_kind") != "kanglong_batch":
+            raise ValueError("kanglong_batch_run_not_found")
+        lock_scopes = tuple((stored.get("plan") or {}).get("lock_scopes") or ())
+        if not lock_scopes:
+            raise ValueError("kanglong_batch_frozen_lock_scopes_missing")
+        conflict = self.acquire_kanglong_locks(
+            run_id=run_id,
+            lock_scopes=lock_scopes,
+            ttl_ms=ttl_ms,
+        )
+        if conflict is not None:
+            return {
+                "acquired": False,
+                "code": "kanglong_batch_lock_conflict",
+                "lock_scope": conflict.get("lock_scope"),
+                "conflicting_run_id": conflict.get("run_id"),
+            }
+        return {"acquired": True, "lock_scopes": list(lock_scopes)}
+
+    def replace_kanglong_batch_plan(
+        self,
+        plan: Any,
+        *,
+        fencing_token: str,
+        account_statuses: dict[str, str] | None = None,
+    ) -> None:
+        from paired_opener.kanglong.batch_models import KanglongBatchPlan
+
+        if not isinstance(plan, KanglongBatchPlan):
+            plan = KanglongBatchPlan.from_payload(dict(plan))
+        with self._lock, self._connection:
+            self._require_current_kanglong_fence(plan.run_id, fencing_token)
+            existing = self._connection.execute(
+                "SELECT run_kind FROM kanglong_runs WHERE run_id = ?",
+                (plan.run_id,),
+            ).fetchone()
+            if existing is None or existing["run_kind"] != "kanglong_batch":
+                raise ValueError("kanglong_batch_run_not_found")
+            self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET plan_json = ?, plan_version = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (_json_dumps(plan.to_payload()), plan.plan_version, datetime.now(UTC).isoformat(), plan.run_id),
+            )
+            if account_statuses:
+                for account_id, status_value in account_statuses.items():
+                    self._connection.execute(
+                        """
+                        UPDATE kanglong_batch_accounts SET status = ?
+                        WHERE run_id = ? AND account_id = ?
+                        """,
+                        (status_value, plan.run_id, account_id),
+                    )
+
+    def update_kanglong_batch_account(
+        self,
+        *,
+        run_id: str,
+        account_id: str,
+        status: str,
+        fencing_token: str,
+        expected_status: str | None = None,
+        last_precheck_snapshot_at: str | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        completed_statuses = {"completed", "completed_with_dust"}
+        with self._lock, self._connection:
+            self._require_current_kanglong_fence(run_id, fencing_token)
+            row = self._connection.execute(
+                """
+                SELECT * FROM kanglong_batch_accounts
+                WHERE run_id = ? AND account_id = ?
+                """,
+                (run_id, account_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("kanglong_batch_account_not_found")
+            if expected_status is not None and row["status"] != expected_status:
+                raise ValueError("kanglong_batch_account_status_conflict")
+            if status != "pending" and int(row["sequence"]) > 0:
+                incomplete = self._connection.execute(
+                    """
+                    SELECT account_id FROM kanglong_batch_accounts
+                    WHERE run_id = ? AND sequence < ?
+                      AND status NOT IN ('completed', 'completed_with_dust')
+                    LIMIT 1
+                    """,
+                    (run_id, int(row["sequence"])),
+                ).fetchone()
+                if incomplete is not None:
+                    raise ValueError("kanglong_batch_cursor_out_of_order")
+            started_at = row["started_at"]
+            if status not in {"pending", "blocked_precheck"} and started_at is None:
+                started_at = now
+            completed_at = now if status in completed_statuses else row["completed_at"]
+            self._connection.execute(
+                """
+                UPDATE kanglong_batch_accounts
+                SET status = ?, started_at = ?, completed_at = ?,
+                    last_precheck_snapshot_at = COALESCE(?, last_precheck_snapshot_at)
+                WHERE run_id = ? AND account_id = ?
+                """,
+                (status, started_at, completed_at, last_precheck_snapshot_at, run_id, account_id),
+            )
+            updated = self._connection.execute(
+                """
+                SELECT * FROM kanglong_batch_accounts
+                WHERE run_id = ? AND account_id = ?
+                """,
+                (run_id, account_id),
+            ).fetchone()
+        return dict(updated)
+
+    def update_kanglong_batch_report(
+        self,
+        *,
+        run_id: str,
+        report: dict[str, Any],
+        report_summary: dict[str, Any],
+        fencing_token: str,
+    ) -> None:
+        with self._lock, self._connection:
+            self._require_current_kanglong_fence(run_id, fencing_token)
+            cursor = self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET report_json = ?, report_summary_json = ?, updated_at = ?
+                WHERE run_id = ? AND run_kind = 'kanglong_batch'
+                """,
+                (
+                    _json_dumps(report),
+                    _json_dumps(report_summary),
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("kanglong_batch_run_not_found")
+
+    def get_kanglong_lock(self, lock_scope: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM kanglong_locks WHERE lock_scope = ?",
+            (lock_scope,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _require_current_kanglong_fence(self, run_id: str, fencing_token: str) -> None:
+        row = self._connection.execute(
+            """
+            SELECT 1 FROM kanglong_locks
+            WHERE lock_scope = ? AND run_id = ? AND fencing_token = ?
+              AND status = 'active' AND expires_at > ?
+            """,
+            (
+                f"kanglong:run:{run_id}:lease",
+                run_id,
+                fencing_token,
+                datetime.now(UTC).isoformat(),
+            ),
+        ).fetchone()
+        if row is None:
+            raise ValueError("kanglong_stale_fencing_token")
+
     def get_kanglong_run(self, run_id: str) -> dict[str, Any] | None:
         row = self._connection.execute(
             "SELECT * FROM kanglong_runs WHERE run_id = ?",
@@ -393,21 +920,39 @@ class SqliteRepository:
             return None
         return self._deserialize_kanglong_run_row(row)
 
-    def get_active_kanglong_run(self) -> dict[str, Any] | None:
+    def get_active_kanglong_run(self, *, run_kind: str = "transfer") -> dict[str, Any] | None:
         placeholders = ", ".join("?" for _ in _ACTIVE_KANGLONG_RUN_STATUSES)
         row = self._connection.execute(
             f"""
             SELECT * FROM kanglong_runs
             WHERE status IN ({placeholders})
               AND engine_version >= 2
+              AND run_kind = ?
             ORDER BY updated_at DESC
             LIMIT 1
             """,
-            _ACTIVE_KANGLONG_RUN_STATUSES,
+            (*_ACTIVE_KANGLONG_RUN_STATUSES, run_kind),
         ).fetchone()
         if row is None:
             return None
         return self._deserialize_kanglong_run_row(row)
+
+    def list_active_kanglong_batch_runs(self) -> list[dict[str, Any]]:
+        placeholders = ", ".join("?" for _ in _ACTIVE_KANGLONG_RUN_STATUSES)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM kanglong_runs
+            WHERE status IN ({placeholders})
+              AND engine_version >= 2
+              AND run_kind = 'kanglong_batch'
+            ORDER BY created_at ASC, run_id ASC
+            """,
+            _ACTIVE_KANGLONG_RUN_STATUSES,
+        ).fetchall()
+        return [self._deserialize_kanglong_run_row(row) for row in rows]
+
+    def has_active_kanglong_batch_run(self) -> bool:
+        return bool(self.list_active_kanglong_batch_runs())
 
     def update_kanglong_run_request(self, run_id: str, request: dict[str, Any]) -> None:
         with self._lock, self._connection:
@@ -750,11 +1295,31 @@ class SqliteRepository:
         status: str | None = None,
         available_actions: list[str] | None = None,
         progress: dict[str, Any] | None = None,
+        report: dict[str, Any] | None = None,
         report_summary: dict[str, Any] | None = None,
         is_safe: bool = True,
+        lease_expectation: KanglongLeaseExpectation | None = None,
+        batch_account_transition: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connection:
+            if lease_expectation is not None:
+                self._require_current_kanglong_fence(run_id, lease_expectation.fencing_token)
+                lease = self._connection.execute(
+                    """
+                    SELECT lease_token FROM kanglong_locks
+                    WHERE lock_scope = ? AND run_id = ? AND fencing_token = ?
+                      AND status = 'active' AND expires_at > ?
+                    """,
+                    (
+                        f"kanglong:run:{run_id}:lease",
+                        run_id,
+                        lease_expectation.fencing_token,
+                        now,
+                    ),
+                ).fetchone()
+                if lease is None or lease["lease_token"] != lease_expectation.lease_token:
+                    raise ValueError("kanglong_stale_fencing_token")
             latest = self._connection.execute(
                 """
                 SELECT * FROM kanglong_run_checkpoints
@@ -894,10 +1459,16 @@ class SqliteRepository:
                 ),
             )
 
-            if status is not None or available_actions is not None or progress is not None or report_summary is not None:
+            if (
+                status is not None
+                or available_actions is not None
+                or progress is not None
+                or report is not None
+                or report_summary is not None
+            ):
                 current = self._connection.execute(
                     """
-                    SELECT status, available_actions_json, progress_json, report_summary_json
+                    SELECT status, available_actions_json, progress_json, report_json, report_summary_json
                     FROM kanglong_runs
                     WHERE run_id = ?
                     """,
@@ -910,6 +1481,7 @@ class SqliteRepository:
                         SET status = ?,
                             available_actions_json = ?,
                             progress_json = ?,
+                            report_json = ?,
                             report_summary_json = ?,
                             updated_at = ?
                         WHERE run_id = ?
@@ -918,11 +1490,48 @@ class SqliteRepository:
                             status if status is not None else current["status"],
                             _json_dumps(available_actions) if available_actions is not None else current["available_actions_json"],
                             _json_dumps(progress) if progress is not None else current["progress_json"],
+                            _json_dumps(report) if report is not None else current["report_json"],
                             _json_dumps(report_summary) if report_summary is not None else current["report_summary_json"],
                             now,
                             run_id,
                         ),
                     )
+            if batch_account_transition is not None:
+                account_id = str(batch_account_transition["account_id"])
+                next_account_status = str(batch_account_transition["status"])
+                expected_account_status = batch_account_transition.get("expected_status")
+                account_row = self._connection.execute(
+                    """
+                    SELECT * FROM kanglong_batch_accounts
+                    WHERE run_id = ? AND account_id = ?
+                    """,
+                    (run_id, account_id),
+                ).fetchone()
+                if account_row is None:
+                    raise ValueError("kanglong_batch_account_not_found")
+                if expected_account_status is not None and account_row["status"] != expected_account_status:
+                    raise ValueError("kanglong_batch_account_status_conflict")
+                completed_at = (
+                    now
+                    if next_account_status in {"completed", "completed_with_dust"}
+                    else account_row["completed_at"]
+                )
+                self._connection.execute(
+                    """
+                    UPDATE kanglong_batch_accounts
+                    SET status = ?, started_at = COALESCE(started_at, ?), completed_at = ?,
+                        last_precheck_snapshot_at = COALESCE(?, last_precheck_snapshot_at)
+                    WHERE run_id = ? AND account_id = ?
+                    """,
+                    (
+                        next_account_status,
+                        now,
+                        completed_at,
+                        batch_account_transition.get("last_precheck_snapshot_at"),
+                        run_id,
+                        account_id,
+                    ),
+                )
         return {
             "run_id": run_id,
             "checkpoint_id": int(checkpoint_id),
@@ -985,6 +1594,7 @@ class SqliteRepository:
                 UPDATE kanglong_locks
                 SET heartbeat_at = ?, expires_at = ?
                 WHERE run_id = ? AND status = 'active'
+                  AND (lease_token IS NULL OR lease_token = '')
                 """,
                 (now_text, expires_at, run_id),
             )
@@ -1055,6 +1665,16 @@ class SqliteRepository:
             "worker_epoch": worker_epoch,
             "lock_expires_at": expires_at,
         }
+
+    def has_live_kanglong_lease(self, run_id: str) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT 1 FROM kanglong_locks
+            WHERE lock_scope = ? AND run_id = ? AND status = 'active' AND expires_at > ?
+            """,
+            (f"kanglong:run:{run_id}:lease", run_id, datetime.now(UTC).isoformat()),
+        ).fetchone()
+        return row is not None
 
     def renew_kanglong_run_lease(
         self,
@@ -1204,10 +1824,254 @@ class SqliteRepository:
             )
         return {"conflict": False, "response": response}
 
+    def commit_kanglong_action(
+        self,
+        *,
+        run_id: str,
+        mutation: KanglongActionMutation,
+        idempotency_key: str,
+        request_hash: str,
+        response: dict[str, object],
+        lease_expectation: KanglongLeaseExpectation | None = None,
+    ) -> dict[str, object]:
+        with self._lock, self._connection:
+            now_dt = datetime.now(UTC)
+            now = now_dt.isoformat()
+            self._connection.execute(
+                "DELETE FROM kanglong_idempotency WHERE expires_at <= ?",
+                (now,),
+            )
+            existing = self._connection.execute(
+                "SELECT request_hash, response_json FROM kanglong_idempotency WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise ValueError("idempotency_key_conflict")
+                return _json_load(existing["response_json"], {})
+            row = self._connection.execute(
+                "SELECT * FROM kanglong_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("kanglong_run_not_found")
+            if row["plan_version"] != mutation.expected_plan_version:
+                raise ValueError("plan_version_conflict")
+            if row["status"] not in mutation.expected_statuses:
+                raise ValueError("kanglong_action_status_conflict")
+            stored_progress = _json_load(row["progress_json"], {})
+            current_action_version = int(stored_progress.get("action_version", 0))
+            if (
+                mutation.expected_action_version is not None
+                and current_action_version != mutation.expected_action_version
+            ):
+                raise ValueError("action_version_conflict")
+            if lease_expectation is not None:
+                lease = self._connection.execute(
+                    """
+                    SELECT lease_token, fencing_token FROM kanglong_locks
+                    WHERE lock_scope = ? AND run_id = ? AND status = 'active' AND expires_at > ?
+                    """,
+                    (f"kanglong:run:{run_id}:lease", run_id, now),
+                ).fetchone()
+                if (
+                    lease is None
+                    or lease["lease_token"] != lease_expectation.lease_token
+                    or lease["fencing_token"] != lease_expectation.fencing_token
+                ):
+                    raise ValueError("kanglong_stale_fencing_token")
+            if mutation.acquire_frozen_locks:
+                plan_for_locks = _json_load(row["plan_json"], {})
+                if (
+                    mutation.current_credential_revision is None
+                    or str(plan_for_locks.get("credential_revision") or "")
+                    != mutation.current_credential_revision
+                ):
+                    raise ValueError("credential_revision_conflict")
+                scopes = tuple(sorted({str(scope) for scope in plan_for_locks.get("lock_scopes") or [] if scope}))
+                self._connection.execute(
+                    """
+                    DELETE FROM kanglong_locks
+                    WHERE expires_at <= ? AND (lease_token IS NULL OR lease_token = '')
+                    """,
+                    (now,),
+                )
+                for scope in scopes:
+                    conflict = self._connection.execute(
+                        """
+                        SELECT run_id FROM kanglong_locks
+                        WHERE lock_scope = ? AND run_id != ? AND status = 'active'
+                        """,
+                        (scope, run_id),
+                    ).fetchone()
+                    if conflict is not None:
+                        raise ValueError("kanglong_batch_lock_conflict")
+                if plan_for_locks.get("operation") == "close":
+                    availability = self.get_kanglong_batch_source_availability(
+                        str(plan_for_locks.get("source_open_run_id") or ""),
+                        [str(item.get("account_id") or "") for item in plan_for_locks.get("accounts") or []],
+                    )
+                    current_by_id = {item["account_id"]: item for item in availability["accounts"]}
+                    for frozen in plan_for_locks.get("accounts") or []:
+                        account_id = str(frozen.get("account_id") or "")
+                        current = current_by_id.get(account_id)
+                        source_changed = current is None
+                        if current is not None:
+                            expected_long = max(
+                                Decimal(str(frozen.get("source_long_remaining_qty") or "0"))
+                                - self.sum_kanglong_batch_leg_qty(run_id, account_id, "LONG"),
+                                Decimal("0"),
+                            )
+                            expected_short = max(
+                                Decimal(str(frozen.get("source_short_remaining_qty") or "0"))
+                                - self.sum_kanglong_batch_leg_qty(run_id, account_id, "SHORT"),
+                                Decimal("0"),
+                            )
+                            source_changed = (
+                                Decimal(str(current["source_long_remaining_qty"])) != expected_long
+                                or Decimal(str(current["source_short_remaining_qty"])) != expected_short
+                            )
+                            source_changed = source_changed or (
+                                str(current.get("source_ledger_hash")) != str(frozen.get("source_ledger_hash"))
+                                or int(current.get("source_checkpoint_id") or 0)
+                                != int(frozen.get("source_checkpoint_id") or 0)
+                            )
+                        if source_changed:
+                            raise ValueError("kanglong_close_source_changed")
+                expires_at = (now_dt + timedelta(milliseconds=max(int(mutation.lock_ttl_ms), 1000))).isoformat()
+                for scope in scopes:
+                    self._connection.execute(
+                        """
+                        INSERT INTO kanglong_locks (lock_scope, run_id, status, heartbeat_at, expires_at)
+                        VALUES (?, ?, 'active', ?, ?)
+                        ON CONFLICT(lock_scope) DO UPDATE SET
+                            run_id = excluded.run_id, status = excluded.status,
+                            heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at
+                        """,
+                        (scope, run_id, now, expires_at),
+                    )
+            next_action_version = current_action_version + int(mutation.increment_action_version)
+            next_progress = dict(mutation.progress) if mutation.progress is not None else stored_progress
+            next_progress["action_version"] = next_action_version
+            plan = mutation.plan if mutation.plan is not None else _json_load(row["plan_json"], {})
+            report = mutation.report if mutation.report is not None else _json_load(row["report_json"], {})
+            confirmed_at = mutation.confirmed_at if mutation.confirmed_at is not None else row["confirmed_at"]
+            result_grade = mutation.result_grade if mutation.result_grade is not None else row["result_grade"]
+            next_plan_version = (
+                str(plan.get("plan_version"))
+                if isinstance(plan, dict) and plan.get("plan_version")
+                else row["plan_version"]
+            )
+            self._connection.execute(
+                """
+                UPDATE kanglong_runs
+                SET status = ?, available_actions_json = ?, plan_json = ?, progress_json = ?,
+                    plan_version = ?, report_json = ?, confirmed_at = ?, result_grade = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    mutation.next_status,
+                    _json_dumps(list(mutation.available_actions)),
+                    _json_dumps(plan),
+                    _json_dumps(next_progress),
+                    next_plan_version,
+                    _json_dumps(report),
+                    confirmed_at,
+                    result_grade,
+                    now,
+                    run_id,
+                ),
+            )
+            for event in mutation.events:
+                self._connection.execute(
+                    """
+                    INSERT INTO kanglong_events (
+                        run_id, group_id, round_id, event_type, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        event.get("group_id"),
+                        event.get("round_id"),
+                        event["event_type"],
+                        _json_dumps(event.get("payload") or {}),
+                        now,
+                    ),
+                )
+            if "after_run_update_before_idempotency_insert" in self._test_failpoints:
+                raise RuntimeError("injected crash: after_run_update_before_idempotency_insert")
+            latest_event_id = int(
+                self._connection.execute(
+                    "SELECT COALESCE(MAX(event_id), 0) AS value FROM kanglong_events WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()["value"]
+            )
+            stored_response: dict[str, object] = {
+                **response,
+                "status": mutation.next_status,
+                "action_version": next_action_version,
+                "latest_event_id": latest_event_id,
+            }
+            self._connection.execute(
+                """
+                INSERT INTO kanglong_idempotency (
+                    idempotency_key, request_hash, response_json, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    request_hash,
+                    _json_dumps(stored_response),
+                    now,
+                    (now_dt + timedelta(hours=24)).isoformat(),
+                ),
+            )
+            return stored_response
+
+    def cleanup_expired_kanglong_idempotency(self) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM kanglong_idempotency WHERE expires_at <= ?",
+                (now,),
+            )
+            return int(cursor.rowcount)
+
+    def count_kanglong_idempotency(self, key: str) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS value FROM kanglong_idempotency WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone()
+        return int(row["value"] if row is not None else 0)
+
+    def enable_failpoint(self, name: str) -> None:
+        self._test_failpoints.add(name)
+
+    def disable_failpoint(self, name: str | None = None) -> None:
+        if name is None:
+            self._test_failpoints.clear()
+        else:
+            self._test_failpoints.discard(name)
+
     def get_kanglong_idempotency(self, key: str, request_hash: str) -> dict[str, Any] | None:
         row = self._connection.execute(
             "SELECT * FROM kanglong_idempotency WHERE idempotency_key = ?",
             (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "conflict": row["request_hash"] != request_hash,
+            "response": _json_load(row["response_json"], {}),
+        }
+
+    def get_live_kanglong_idempotency(self, key: str, request_hash: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM kanglong_idempotency
+            WHERE idempotency_key = ? AND expires_at > ?
+            """,
+            (key, datetime.now(UTC).isoformat()),
         ).fetchone()
         if row is None:
             return None

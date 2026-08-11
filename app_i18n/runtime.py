@@ -19,9 +19,9 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_ACCOUNT_ID = "default"
 DEFAULT_ACCOUNT_NAME = "默认账户"
 
-_API_KEY_RE = re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)([^\s,;]+)")
-_SECRET_RE = re.compile(r"(?i)(api[_-]?secret\s*[:=]\s*)([^\s,;]+)")
-_TOKEN_RE = re.compile(r"(?i)(token\s*[:=]\s*)([^\s,;]+)")
+_API_KEY_RE = re.compile(r'''(?i)((?:["']?api[_-]?key["']?)\s*[:=]\s*["']?)([^"'\s,;}]+)''')
+_SECRET_RE = re.compile(r'''(?i)((?:["']?api[_-]?secret["']?)\s*[:=]\s*["']?)([^"'\s,;}]+)''')
+_TOKEN_RE = re.compile(r'''(?i)((?:["']?(?:token|signature)["']?)\s*[:=]\s*["']?)([^"'\s,;}]+)''')
 _LONG_IDENTIFIER_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{16,}(?![A-Za-z0-9])")
 
 

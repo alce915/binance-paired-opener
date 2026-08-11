@@ -49,6 +49,7 @@ class OrderbookSnapshot:
     asks: list[OrderbookLevel]
     event_time: datetime
     source: str = "deterministic"
+    update_id: int | None = None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any], *, source: str = "gateway") -> OrderbookSnapshot:
@@ -59,6 +60,7 @@ class OrderbookSnapshot:
             asks=[_level_from_mapping(level) for level in payload.get("asks") or []],
             event_time=event_time,
             source=source,
+            update_id=_update_id_from_payload(payload),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -67,6 +69,7 @@ class OrderbookSnapshot:
             "bids": [{"price": level.price, "qty": level.qty} for level in self.bids],
             "asks": [{"price": level.price, "qty": level.qty} for level in self.asks],
             "event_time": self.event_time,
+            "update_id": self.update_id,
         }
 
 
@@ -390,6 +393,15 @@ def _event_time_from_payload(payload: dict[str, Any]) -> datetime:
         event_dt = datetime.fromisoformat(raw_event_time.replace("Z", "+00:00"))
         return event_dt if event_dt.tzinfo else event_dt.replace(tzinfo=UTC)
     raise MarketDataStaleError("orderbook event time is missing")
+
+
+def _update_id_from_payload(payload: dict[str, Any]) -> int | None:
+    raw = payload.get("update_id")
+    if raw is None:
+        raw = payload.get("lastUpdateId")
+    if raw is None:
+        raw = payload.get("u")
+    return int(raw) if raw is not None else None
 
 
 async def _sleep_seconds(seconds: Decimal) -> None:

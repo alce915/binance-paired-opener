@@ -32,6 +32,10 @@ function loadErrorHelpers(fetchImpl) {
       "userVisibleErrorMessage",
     ),
     resolveLogMessage: extract(/function resolveLogMessage\(source = \{\}, fallback = ""\) \{[\s\S]*?\n\}/, "resolveLogMessage"),
+    normalizeLogMessageParams: extract(
+      /function normalizeLogMessageParams\(messageCode, params = \{\}\) \{[\s\S]*?\n\}/,
+      "normalizeLogMessageParams",
+    ),
     resolveActionAvailability: extract(
       /function resolveActionAvailability\(hintState = \{\}, runtimeState = \{\}\) \{[\s\S]*?\n\}/,
       "resolveActionAvailability",
@@ -73,6 +77,7 @@ ${sources.unknownErrorMessage}
 ${sources.formatReason}
 ${sources.resolveStructuredMessage}
 ${sources.userVisibleErrorMessage}
+${sources.normalizeLogMessageParams}
 ${sources.resolveLogMessage}
 ${sources.resolveActionAvailability}
 ${sources.request}

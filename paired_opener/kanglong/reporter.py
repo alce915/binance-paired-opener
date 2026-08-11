@@ -13,6 +13,7 @@ from paired_opener.kanglong.ledger import (
 from paired_opener.kanglong.models import KanglongEvent, ResidualLedgerEntry
 
 REPORT_VERSION = "kanglong_transfer_report_v1"
+BATCH_REPORT_VERSION = "kanglong_batch_report_v1"
 CONVERSION_UNAVAILABLE = "kanglong_conversion_unavailable"
 
 
@@ -213,6 +214,78 @@ def summarize_ledger_costs(
     return summary
 
 
+def summarize_batch_ledger_costs(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    accounts: dict[str, dict[str, Any]] = {}
+    total_fee = Decimal("0")
+    total_adverse = Decimal("0")
+    total_improvement = Decimal("0")
+    categories = {
+        "spread_cost": Decimal("0"),
+        "market_impact_cost": Decimal("0"),
+        "timing_drift_cost": Decimal("0"),
+        "alignment_cost": Decimal("0"),
+    }
+    for entry in entries:
+        payload = entry.get("payload") or {}
+        account_id = str(entry.get("account_id") or "unknown")
+        leg = str(payload.get("position_side") or "unknown")
+        round_index = str(payload.get("round_index") if payload.get("round_index") is not None else "unknown")
+        account = accounts.setdefault(
+            account_id,
+            {"fee_cost": Decimal("0"), "total_adverse_wear": Decimal("0"), "price_improvement": Decimal("0"), "legs": {}},
+        )
+        leg_payload = account["legs"].setdefault(
+            leg,
+            {"fee_cost": Decimal("0"), "total_adverse_wear": Decimal("0"), "price_improvement": Decimal("0"), "rounds": {}},
+        )
+        round_payload = leg_payload["rounds"].setdefault(
+            round_index,
+            {"fee_cost": Decimal("0"), "total_adverse_wear": Decimal("0"), "price_improvement": Decimal("0")},
+        )
+        if entry.get("entry_type") == "fee":
+            fee = abs(_decimal_value(entry.get("fee_amount") or entry.get("amount")))
+            total_fee += fee
+            account["fee_cost"] += fee
+            leg_payload["fee_cost"] += fee
+            round_payload["fee_cost"] += fee
+        elif entry.get("entry_type") == "price_wear":
+            adverse = max(_decimal_value(payload.get("adverse") or entry.get("price_wear") or entry.get("amount")), Decimal("0"))
+            category = str(payload.get("wear_category") or "spread_cost")
+            improvement = (
+                max(_decimal_value(payload.get("improvement")), Decimal("0"))
+                if category == "spread_cost"
+                else Decimal("0")
+            )
+            if category in categories:
+                categories[category] += adverse
+            total_adverse += adverse
+            total_improvement += improvement
+            account["total_adverse_wear"] += adverse
+            account["price_improvement"] += improvement
+            leg_payload["total_adverse_wear"] += adverse
+            leg_payload["price_improvement"] += improvement
+            round_payload["total_adverse_wear"] += adverse
+            round_payload["price_improvement"] += improvement
+
+    def encode(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return _decimal_text(value)
+        if isinstance(value, dict):
+            return {key: encode(item) for key, item in value.items()}
+        return value
+
+    return encode(
+        {
+            "report_version": BATCH_REPORT_VERSION,
+            "total_fee_cost": total_fee,
+            "total_adverse_wear": total_adverse,
+            "total_price_improvement": total_improvement,
+            **categories,
+            "accounts": accounts,
+        }
+    )
+
+
 def build_ledger_report(
     entries: list[dict[str, Any]],
     *,
@@ -232,6 +305,7 @@ def build_ledger_report(
         symbol=symbol,
         exchange_rate_snapshot=exchange_rate_snapshot,
     )
+    batch_costs = summarize_batch_ledger_costs(scoped_entries)
     generated_at_text = _generated_at_text(generated_at)
     report_summary = {
         "report_version": REPORT_VERSION,
@@ -250,6 +324,7 @@ def build_ledger_report(
         report_summary["warning_code"] = costs["warning_code"]
     return {
         "costs": costs,
+        "batch_costs": batch_costs,
         "ledger_report": {
             "report_version": REPORT_VERSION,
             "generated_from_checkpoint_id": costs.get("source_checkpoint_id"),

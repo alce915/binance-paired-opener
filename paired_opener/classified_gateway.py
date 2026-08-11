@@ -102,6 +102,13 @@ class ClassifiedExchangeGateway(ExchangeGateway):
         if isinstance(exc, httpx.HTTPStatusError):
             raw_code, raw_message = self._extract_http_error(exc)
             message_lower = (raw_message or "").lower()
+            response_context = {"operation": operation, **context}
+            retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
+            if retry_after is not None:
+                try:
+                    response_context["retry_after_seconds"] = Decimal(retry_after)
+                except Exception:
+                    pass
             if exc.response is not None and exc.response.status_code == 429 or str(raw_code) == "-1003" or "too many requests" in message_lower:
                 return self._error(
                     "Binance 接口限流，请稍后重试。",
@@ -111,7 +118,7 @@ class ClassifiedExchangeGateway(ExchangeGateway):
                     raw_code=raw_code,
                     raw_message=raw_message,
                     operator_action="降低请求频率，稍后重试。",
-                    context={"operation": operation, **context},
+                    context=response_context,
                 )
             if exc.response is not None and exc.response.status_code == 401 or str(raw_code) in {"-2014", "-1022"}:
                 return self._error(
@@ -267,6 +274,37 @@ class ClassifiedExchangeGateway(ExchangeGateway):
 
     async def get_open_orders_strict(self, symbol: str) -> list[dict[str, Any]]:
         return await self._call("get_open_orders_strict", lambda: self._delegate.get_open_orders_strict(symbol), symbol=symbol)
+
+    async def get_portfolio_margin_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        return await self._call(
+            "get_portfolio_margin_open_orders",
+            lambda: self._delegate.get_portfolio_margin_open_orders(symbol),
+            symbol=symbol,
+        )
+
+    async def get_commission_rates(self, symbol: str) -> dict[str, Decimal]:
+        return await self._call(
+            "get_commission_rates",
+            lambda: self._delegate.get_commission_rates(symbol),
+            symbol=symbol,
+        )
+
+    async def get_portfolio_margin_precheck(
+        self,
+        symbol: str,
+        requested_leverage: int,
+        additional_gross_notional: Decimal,
+    ) -> dict[str, Any]:
+        return await self._call(
+            "get_portfolio_margin_precheck",
+            lambda: self._delegate.get_portfolio_margin_precheck(
+                symbol,
+                requested_leverage,
+                additional_gross_notional,
+            ),
+            symbol=symbol,
+            requested_leverage=requested_leverage,
+        )
 
     async def place_limit_order(
         self,

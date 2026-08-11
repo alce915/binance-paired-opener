@@ -1,0 +1,24 @@
+{
+  "symbol": "ETHUSDC",
+  "description": "真实行情结构的确定性批次模拟盘口；仅供只读撮合测试",
+  "snapshots": [
+    {
+      "lastUpdateId": 1001,
+      "event_time": "2026-08-12T00:00:00+00:00",
+      "bids": [{"price": "3999.99", "qty": "100"}],
+      "asks": [{"price": "4000.01", "qty": "100"}]
+    },
+    {
+      "lastUpdateId": 1002,
+      "event_time": "2026-08-12T00:00:01+00:00",
+      "bids": [{"price": "4000.00", "qty": "100"}],
+      "asks": [{"price": "4000.02", "qty": "100"}]
+    },
+    {
+      "lastUpdateId": 1003,
+      "event_time": "2026-08-12T00:00:02+00:00",
+      "bids": [{"price": "3999.98", "qty": "100"}],
+      "asks": [{"price": "4000.00", "qty": "100"}]
+    }
+  ]
+}

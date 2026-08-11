@@ -162,5 +162,17 @@
   "blocked_plan_recheck_failed": {
     "key": "reasons.kanglong.blocked_plan_recheck_failed",
     "params": ["run_id", "reason_code"]
+  },
+  "kanglong_batch_capacity_blocked": {
+    "key": "reasons.kanglong.batch_capacity_blocked",
+    "params": []
+  },
+  "credential_revision_conflict": {
+    "key": "reasons.kanglong.credential_revision_conflict",
+    "params": []
+  },
+  "action_version_conflict": {
+    "key": "reasons.kanglong.action_version_conflict",
+    "params": []
   }
 }
