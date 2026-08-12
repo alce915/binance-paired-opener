@@ -98,6 +98,7 @@ def available_actions_for_status(status: str | KanglongRunStatus) -> list[str]:
         KanglongRunStatus.COMPLETED.value: ["view_report"],
         KanglongRunStatus.COMPLETED_WITH_DUST_RESIDUAL.value: ["view_report"],
         KanglongRunStatus.NEEDS_ABORT_RECOVER.value: ["recover", "view_report"],
+        KanglongRunStatus.ABORT_RECOVERING.value: ["view_report"],
         KanglongRunStatus.ABORTED_RECOVERED.value: ["refresh_plan", "view_report"],
         "legacy_readonly": ["refresh_plan", "view_report"],
     }

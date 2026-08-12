@@ -32,4 +32,8 @@ assert.ok(appSource.includes("snapshot_components"));
 assert.ok(appSource.includes("available_actions"), "control buttons must use backend-provided actions");
 assert.ok(appSource.includes("expected_action_version"));
 assert.ok(appSource.includes("pendingBatchActions"), "timed-out retries must retain their idempotency key and payload");
+assert.ok(appSource.includes("release_reason: releaseReason"), "recover must send the required release reason");
+assert.ok(appSource.includes("window.prompt"), "recover must ask the operator for a release reason");
+assert.ok(appSource.includes("isSameOriginRequest"), "management token injection must check the target origin");
+assert.ok(appSource.includes('method !== "GET" && method !== "HEAD"'), "mutating requests must receive local management auth");
 assert.ok(appSource.includes('"/sessions/open"') || appSource.includes("'/sessions/open'"), "existing trading UI must remain intact");

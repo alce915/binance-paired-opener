@@ -86,5 +86,7 @@
   "kanglong_batch_resume_requested": { "key": "events.kanglong.batch_resume_requested", "level": "info" },
   "kanglong_batch_stop_requested": { "key": "events.kanglong.batch_stop_requested", "level": "warn" },
   "kanglong_batch_recover_requested": { "key": "events.kanglong.batch_recover_requested", "level": "warn" },
+  "kanglong_batch_abort_recovering": { "key": "events.kanglong.batch_abort_recovering", "level": "warn" },
+  "kanglong_batch_aborted_recovered": { "key": "events.kanglong.batch_aborted_recovered", "level": "warn" },
   "kanglong_batch_plan_refreshed": { "key": "events.kanglong.batch_plan_refreshed", "level": "info" }
 }

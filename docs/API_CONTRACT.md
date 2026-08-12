@@ -6,7 +6,7 @@
 
 - 所有 JSON 使用 UTF-8；错误响应使用 `{"detail":{"code":"...","message":"..."}}`。
 - 所有配置及运行状态变更请求必须通过同源 `Origin` 和 `X-Local-Management-Token` 校验。
-- `/config/account-credentials/*` 还必须校验 loopback 客户端和 loopback `Host`。
+- 本机管理校验同时包含 loopback 客户端、loopback `Host`、同源 `Origin` 和管理 token；真实交易及真实会话控制接口不得只依赖浏览器同源策略。
 - 首页通过 `Cache-Control: no-store` 的 HTML bootstrap 提供本次进程的管理 token。token 只保存在页面内存，不进入 Cookie、URL、日志或持久化浏览器存储。
 - 凭据导入请求在 JSON 解析前限制为 `256 KiB`，并由请求模型再次限制最多 `100` 个账号。
 - 第一阶段仅接受 `credential_type="hmac"`；其他类型返回 `422 credential_type_not_supported`。
@@ -40,7 +40,25 @@ POST   /config/account-credentials/{account_id}/verify
 
 活动批次期间，删除、更新、重新排序及导入提交返回 `409 account_credentials_locked_by_active_batch`。
 
+## 真实交易会话安全边界
+
+以下接口会创建真实订单执行链路或改变真实会话执行状态，必须通过本机管理校验：
+
+```text
+POST /sessions/open
+POST /sessions/close
+POST /sessions/single-open
+POST /sessions/single-close
+POST /sessions/{session_id}/pause
+POST /sessions/{session_id}/resume
+POST /sessions/{session_id}/abort
+```
+
+会话查询、行情查询及 `POST /sessions/precheck` 不产生订单，也不改变真实会话状态，本阶段不扩大鉴权范围。鉴权失败统一返回 `403 local_management_forbidden`，且不得进入交易服务。
+
 ## 亢龙多账号批次模拟
+
+第一阶段的容量、计划和撮合执行只能取得独立的只读 gateway capability，允许的交易所能力限于交易规则、报价、订单簿和 Portfolio Margin 预检。该 capability 不暴露下单、改单、撤单、设置杠杆、设置保证金模式或设置持仓模式方法；批次链路不得取得完整实盘 gateway。
 
 ### 路由
 
@@ -99,7 +117,7 @@ GET    /kanglong/batch-simulation/open-runs
 计划确认及执行启动前必须比较当前凭据 revision。变化时返回
 `409 credential_revision_conflict` 并把尚未成交的计划置为 `blocked_plan_stale`。
 
-批次确认和执行复用 `KanglongActionRequest`，必须包含 `plan_version` 和 `idempotency_key`。暂停、继续和停止复用 `KanglongControlRequest`，还必须包含 `expected_action_version`。批次恢复使用 `KanglongBatchRecoverRequest`，包含 `plan_version`、`expected_action_version`、`idempotency_key` 和 `release_reason`，不改变现有移仓 `KanglongRecoverRequest`。
+批次确认和执行复用 `KanglongActionRequest`，必须包含 `plan_version` 和 `idempotency_key`。暂停、继续和停止复用 `KanglongControlRequest`，还必须包含 `expected_action_version`。批次恢复使用 `KanglongBatchRecoverRequest`，包含 `plan_version`、`expected_action_version`、`idempotency_key` 和 `release_reason`，不改变现有移仓 `KanglongRecoverRequest`。批次恢复是对不安全执行链的人工终止确认：必须把 `operator`、`release_reason`、原状态和恢复时间原子写入事件、进度及报告，最终进入 `aborted_recovered` 并释放批次锁；不得直接返回 `execution_starting` 继续推进未配平操作。该状态对批次是终态，只允许查看报告；如需再次执行，必须创建新批次计划。
 
 动作版本保存在 `progress_json.action_version`。相同 idempotency key 与相同请求 hash 返回首次响应且不重复副作用；同 key 不同请求返回 `409 idempotency_key_conflict`；旧计划版本返回 `409 plan_version_conflict`；旧动作版本返回 `409 action_version_conflict`。幂等记录保留 24 小时，过期后可清理并重新使用 key。
 
@@ -124,8 +142,12 @@ completed_with_dust_residual
 | `blocked_plan_stale` | `refresh_plan`, `view_report` |
 | `paused_plan_recheck_changed` | `refresh_plan`, `stop`, `view_report` |
 | `needs_abort_recover` | `recover`, `view_report` |
+| `abort_recovering` | `view_report` |
+| `aborted_recovered` | `view_report` |
 
 禁止返回历史 raw 状态 `paused_plan_stale`。账号级 `blocked_precheck`、`retry_wait`、`paused`、`needs_recovery` 保存在 `kanglong_batch_accounts`，不作为批次 run status。
+
+当 418/429 或其他可重试错误要求等待超过 worker 内短等待上限时，账号进入 `retry_wait`，批次 `progress.next_wakeup_at`、传输重试计数、对应事件和幂等结果必须与账号状态在同一事务中提交。事务失败时不得留下缺少唤醒时间的孤立 `retry_wait`；进程恢复后必须遵守已持久化的 `next_wakeup_at`，不得提前请求交易所。
 
 ### 冲突响应
 

@@ -36,7 +36,12 @@ class StubGateway(ExchangeGateway):
         self.calls += 1
         if self.calls == 1:
             request = httpx.Request("GET", "https://fapi.binance.com/fapi/v1/ticker/bookTicker")
-            response = httpx.Response(429, request=request, text='{"code":-1003,"msg":"Too many requests"}')
+            response = httpx.Response(
+                429,
+                request=request,
+                text='{"code":-1003,"msg":"Too many requests"}',
+                headers={"Retry-After": "12"},
+            )
             raise httpx.HTTPStatusError("rate limited", request=request, response=response)
         return Quote(symbol=symbol, bid_price=Decimal("100"), ask_price=Decimal("101"), event_time=datetime.now(UTC))
 
@@ -73,6 +78,20 @@ async def test_classified_gateway_retries_rate_limit_then_succeeds() -> None:
 
     assert quote.symbol == "BTCUSDT"
     assert gateway._delegate.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_classified_gateway_single_attempt_preserves_rate_limit_metadata() -> None:
+    gateway = ClassifiedExchangeGateway(StubGateway()).single_attempt()
+
+    with pytest.raises(TradingError) as exc_info:
+        await gateway.get_quote("BTCUSDT")
+
+    error = exc_info.value
+    assert gateway._delegate.calls == 1
+    assert error.category == ErrorCategory.RATE_LIMIT
+    assert error.context["http_status"] == 429
+    assert error.context["retry_after_seconds"] == Decimal("12")
 
 
 @pytest.mark.asyncio

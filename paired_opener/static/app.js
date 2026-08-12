@@ -1059,7 +1059,23 @@ function nowTime() {
 }
 
 function request(path, options = {}) {
-  return fetch(path, options).then(async (response) => {
+  const requestOptions = { ...options };
+  const method = String(requestOptions.method || "GET").toUpperCase();
+  const headers = typeof Headers === "function"
+    ? new Headers(requestOptions.headers || {})
+    : { ...(requestOptions.headers || {}) };
+  const token = String(
+    (typeof APP_CONFIG !== "undefined" ? APP_CONFIG.localManagementToken : "") || "",
+  );
+  if (token && method !== "GET" && method !== "HEAD" && isSameOriginRequest(path)) {
+    if (typeof headers.has === "function" && typeof headers.set === "function") {
+      if (!headers.has("X-Local-Management-Token")) headers.set("X-Local-Management-Token", token);
+    } else if (!Object.keys(headers).some((name) => name.toLowerCase() === "x-local-management-token")) {
+      headers["X-Local-Management-Token"] = token;
+    }
+  }
+  requestOptions.headers = headers;
+  return fetch(path, requestOptions).then(async (response) => {
     const text = await response.text();
     if (!response.ok) {
       const safeFallback = unknownErrorMessage();
@@ -1100,6 +1116,14 @@ function request(path, options = {}) {
       return text;
     }
   });
+}
+
+function isSameOriginRequest(path) {
+  try {
+    return new URL(path, window.location.href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
 }
 
 function kanglongManagementHeaders(extra = {}) {
@@ -1733,6 +1757,21 @@ async function controlKanglongBatchRun(action) {
   const run = kanglongBatchState.run;
   if (!run || !(run.available_actions || []).includes(action)) return null;
   if (action === "recover" && run.status !== "needs_abort_recover") return null;
+  let releaseReason = "";
+  if (action === "recover") {
+    const entered = window.prompt(copyOrDefault(
+      "console.kanglong.batch.recover_reason_prompt",
+      "请输入人工检查后的恢复原因（至少 3 个字符）：",
+    ));
+    if (entered === null) return null;
+    releaseReason = String(entered).trim();
+    if (releaseReason.length < 3) {
+      throw new Error(copyOrDefault(
+        "console.kanglong.batch.recover_reason_required",
+        "恢复原因至少需要 3 个字符。",
+      ));
+    }
+  }
   const response = await requestKanglongBatchMutation(
     `${action}:${run.run_id}:${run.action_version}`,
     `/kanglong/batch-simulation/run/${encodeURIComponent(run.run_id)}/${encodeURIComponent(action)}`,
@@ -1740,6 +1779,7 @@ async function controlKanglongBatchRun(action) {
       plan_version: run.plan_version,
       expected_action_version: Number(run.action_version || 0),
       operator: "manual",
+      ...(action === "recover" ? { release_reason: releaseReason } : {}),
     },
   );
   return setKanglongBatchRun(response);

@@ -18,7 +18,7 @@ from paired_opener.kanglong.batch_executor import (
 from paired_opener.kanglong.batch_planner import KanglongBatchPlanner
 from paired_opener.kanglong.models import KanglongRunStatus, available_actions_for_status
 from paired_opener.simulation_matching import OrderbookSnapshot
-from paired_opener.storage import SqliteRepository
+from paired_opener.storage import KanglongActionMutation, SqliteRepository
 
 
 RULES = SymbolRules(
@@ -38,8 +38,12 @@ class FakeGateway:
         self.bid_price = Decimal("100")
         self.ask_price = Decimal("101")
         self.binance_calls: list[SimpleNamespace] = []
+        self.before_symbol_rules = None
 
     async def get_symbol_rules(self, symbol: str):
+        if self.before_symbol_rules is not None:
+            callback, self.before_symbol_rules = self.before_symbol_rules, None
+            callback()
         self.binance_calls.append(SimpleNamespace(method="GET", path="/papi/v1/um/exchangeInfo"))
         return RULES
 
@@ -172,6 +176,89 @@ async def test_second_account_does_not_start_until_first_is_aligned(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_short_retry_preserves_pause_requested_during_sleep(tmp_path: Path) -> None:
+    repository, plan, lease, executor = _setup(tmp_path, account_ids=("a1",))
+
+    async def request_pause(_delay: float) -> None:
+        stored = repository.get_kanglong_run(plan.run_id)
+        repository.commit_kanglong_action(
+            run_id=plan.run_id,
+            mutation=KanglongActionMutation(
+                expected_statuses=(KanglongRunStatus.RUNNING.value,),
+                expected_plan_version=plan.plan_version,
+                expected_action_version=int(stored["progress"].get("action_version", 0)),
+                next_status=KanglongRunStatus.PAUSE_PENDING.value,
+                available_actions=tuple(available_actions_for_status(KanglongRunStatus.PAUSE_PENDING)),
+                increment_action_version=True,
+            ),
+            idempotency_key="pause-during-retry-0001",
+            request_hash="pause-during-retry-0001",
+            response={"run_id": plan.run_id},
+        )
+
+    executor._sleep = request_pause
+    executor._retry_policy = TransportRetryPolicy(jitter=lambda: 1)
+    executor._match = lambda *args, **kwargs: SimpleNamespace(filled_qty=Decimal("0"))
+    try:
+        result = await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        stored = repository.get_kanglong_run(plan.run_id)
+    finally:
+        repository.close()
+
+    assert result["status"] == "pause_pending"
+    assert stored["status"] == "pause_pending"
+    assert stored["progress"]["action_version"] == 1
+    assert "transport_retry_count" not in stored["progress"]
+
+
+@pytest.mark.asyncio
+async def test_worker_progress_commit_preserves_concurrent_pause_action_version(tmp_path: Path) -> None:
+    repository, plan, lease, executor = _setup(tmp_path, account_ids=("a1",))
+    stored = repository.get_kanglong_run(plan.run_id)
+    if stored["status"] == "execution_starting":
+        stored = executor._worker_action(
+            stored,
+            next_status="running",
+            event_type="kanglong_batch_execution_started",
+            lease=SimpleNamespace(
+                lease_token=lease["lease_token"], fencing_token=lease["fencing_token"],
+            ),
+            idempotency_suffix="test-worker-start",
+        )
+    repository.commit_kanglong_action(
+        run_id=plan.run_id,
+        mutation=KanglongActionMutation(
+            expected_statuses=("running",), expected_plan_version=plan.plan_version,
+            expected_action_version=0, next_status="pause_pending",
+            available_actions=tuple(available_actions_for_status("pause_pending")),
+            increment_action_version=True,
+        ),
+        idempotency_key="pause-before-progress-0001",
+        request_hash="pause-before-progress-0001",
+        response={"run_id": plan.run_id},
+    )
+    progress = dict(stored["progress"])
+    progress["transport_retry_count"] = 1
+    try:
+        result = executor._commit_worker_progress(
+            stored, progress,
+            lease=SimpleNamespace(
+                lease_token=lease["lease_token"], fencing_token=lease["fencing_token"],
+            ),
+            idempotency_suffix="concurrent-pause-progress",
+            event_type="kanglong_batch_transport_retry",
+            event_payload={"account_id": "a1", "attempt": 1},
+        )
+        latest = repository.get_kanglong_run(plan.run_id)
+    finally:
+        repository.close()
+
+    assert result["status"] == "pause_pending"
+    assert latest["progress"]["action_version"] == 1
+    assert latest["progress"]["transport_retry_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_restart_resumes_pending_second_leg_without_recounting_first(tmp_path: Path) -> None:
     repository, plan, lease, executor = _setup(tmp_path)
     try:
@@ -219,6 +306,52 @@ async def test_checkpoint_persists_report_without_post_commit_update(tmp_path: P
 
     assert stored["report"]["report_summary"]["generated_from_checkpoint_id"] == latest["checkpoint_id"]
     assert stored["report"]["report_summary"]["source_ledger_hash"] == latest["ledger_hash"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected_status"),
+    [("pause", "pause_pending"), ("stop", "stop_pending")],
+)
+async def test_checkpoint_preserves_control_requested_during_second_leg_io(
+    tmp_path: Path,
+    action: str,
+    expected_status: str,
+) -> None:
+    repository, plan, lease, executor = _setup(tmp_path, account_ids=("a1",))
+    try:
+        await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        before = repository.get_kanglong_run(plan.run_id)
+
+        def request_control() -> None:
+            repository.commit_kanglong_action(
+                run_id=plan.run_id,
+                mutation=KanglongActionMutation(
+                    expected_statuses=("running",),
+                    expected_plan_version=plan.plan_version,
+                    expected_action_version=int(before["progress"].get("action_version", 0)),
+                    next_status=expected_status,
+                    available_actions=("view_report",),
+                    increment_action_version=True,
+                ),
+                idempotency_key=f"control-race-{action}-0001",
+                request_hash=f"control-race-{action}-hash",
+                response={"run_id": plan.run_id},
+            )
+
+        executor._runtime_manager.gateways["a1"].before_symbol_rules = request_control
+        stored = await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        checkpoint = repository.latest_kanglong_checkpoint(plan.run_id)
+        long_qty = repository.sum_kanglong_batch_leg_qty(plan.run_id, "a1", "LONG")
+        short_qty = repository.sum_kanglong_batch_leg_qty(plan.run_id, "a1", "SHORT")
+    finally:
+        repository.close()
+
+    assert checkpoint is not None
+    assert stored["status"] == expected_status
+    assert stored["progress"]["action_version"] == int(before["progress"].get("action_version", 0)) + 1
+    assert long_qty == Decimal("1")
+    assert short_qty == Decimal("1")
 
 
 @pytest.mark.asyncio
@@ -329,18 +462,66 @@ def test_orderbook_snapshot_identity_rejects_duplicate_and_out_of_order_updates(
 
 
 @pytest.mark.asyncio
-async def test_duplicate_book_snapshot_pauses_without_recounting_fill(tmp_path: Path) -> None:
+async def test_duplicate_book_snapshot_waits_then_new_snapshot_completes_without_recounting(tmp_path: Path) -> None:
     repository, plan, lease, executor = _setup(tmp_path, account_ids=("a1",))
     try:
         await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
         gateway = executor._runtime_manager.gateways["a1"]
         gateway.freeze_update_id = True
+        waiting = await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        filled_before_new_snapshot = repository.sum_kanglong_batch_leg_qty(plan.run_id, "a1", "LONG")
+        gateway.freeze_update_id = False
+        completed = await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        long_qty = repository.sum_kanglong_batch_leg_qty(plan.run_id, "a1", "LONG")
+        short_qty = repository.sum_kanglong_batch_leg_qty(plan.run_id, "a1", "SHORT")
+    finally:
+        repository.close()
+    assert waiting["status"] == "running"
+    assert filled_before_new_snapshot == Decimal("0")
+    assert completed["status"] == "completed"
+    assert long_qty == short_qty == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_out_of_order_book_snapshot_pauses_without_recounting_fill(tmp_path: Path) -> None:
+    repository, plan, lease, executor = _setup(tmp_path, account_ids=("a1",))
+    try:
+        await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        gateway = executor._runtime_manager.gateways["a1"]
+        gateway.update_id -= 1
+        gateway.freeze_update_id = True
         paused = await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
         filled = repository.sum_kanglong_batch_leg_qty(plan.run_id, "a1", "LONG")
     finally:
         repository.close()
+
     assert paused["status"] == "paused_market_unstable"
     assert filled == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_retry_idempotency_scope_does_not_collide_between_rounds(tmp_path: Path) -> None:
+    repository, plan, lease, executor = _setup(
+        tmp_path,
+        account_ids=("a1",),
+        round_count=2,
+    )
+    try:
+        gateway = executor._runtime_manager.gateways["a1"]
+        await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        gateway.freeze_update_id = True
+        first_retry = await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        gateway.freeze_update_id = False
+        await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+        gateway.freeze_update_id = True
+        second_retry = await executor.run_next(plan.run_id, lease["lease_token"], lease["fencing_token"])
+    finally:
+        repository.close()
+
+    assert first_retry["status"] == "running"
+    assert second_retry["status"] == "running"
+    assert second_retry["progress"]["transport_retry_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -405,6 +586,17 @@ def test_transport_retry_policy_is_bounded_and_persists_long_waits() -> None:
     assert policy.base_delay_ms == 500
     assert policy.max_delay_ms == 30_000
     decision = policy.on_rate_limit(Decimal("120"))
+    assert decision.persist_retry_wait is True
+    assert decision.next_wakeup_at is not None
+
+
+def test_transport_retry_policy_persists_before_lease_boundary() -> None:
+    policy = TransportRetryPolicy(jitter=lambda: 1)
+    decision = policy.decide(
+        1,
+        retry_after_seconds=Decimal("30"),
+        http_status=429,
+    )
     assert decision.persist_retry_wait is True
     assert decision.next_wakeup_at is not None
 

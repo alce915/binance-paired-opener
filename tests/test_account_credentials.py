@@ -6,12 +6,14 @@ from pathlib import Path
 
 import pytest
 
+import paired_opener.account_credentials as account_credentials
 from paired_opener.account_credentials import (
     AccountCredentialStore,
     CredentialRevisionConflict,
     CredentialStoreState,
     CredentialStoreUnavailable,
     WindowsDpapiProtector,
+    _windows_acl_hardener,
     mask_api_key,
 )
 from paired_opener.config import AccountConfig
@@ -131,6 +133,24 @@ def test_prepare_hardens_parent_directory_before_temporary_file(tmp_path: Path) 
         assert hardened == [path.parent, prepared.temp_path]
     finally:
         prepared.discard()
+
+
+def test_windows_acl_hardener_fails_closed_when_acl_verification_fails(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(account_credentials, "os", type("WindowsOs", (), {"name": "nt"})())
+    calls: list[list[str]] = []
+
+    def failed_run(command, **_kwargs):
+        calls.append(command)
+        return type("Result", (), {"returncode": 1})()
+
+    monkeypatch.setattr("paired_opener.account_credentials.subprocess.run", failed_run)
+    with pytest.raises(OSError, match="cannot restrict credential file ACL"):
+        _windows_acl_hardener(tmp_path / "accounts.secure.json")
+
+    assert len(calls) == 1
+    assert calls[0][:5] == [
+        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"
+    ]
 
 
 def test_upsert_delete_and_reorder_keep_explicit_order(tmp_path: Path) -> None:

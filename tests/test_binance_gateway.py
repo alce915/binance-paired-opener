@@ -344,8 +344,44 @@ async def test_portfolio_margin_precheck_uses_only_read_endpoints() -> None:
     assert result["projected_symbol_exposure"] == Decimal("500000")
     assert result["selected_bracket"]["max_allowed_leverage"] >= 100
     assert result["current_symbol_max_notional_value"] == Decimal("1500000")
+    assert set(result["component_observed_at"]) == {
+        "account",
+        "positions",
+        "open_orders",
+        "symbol_config",
+        "leverage_bracket",
+        "commission_rate",
+    }
+    assert all(
+        observed_at.tzinfo is UTC
+        for observed_at in result["component_observed_at"].values()
+    )
     assert all(method == "GET" and use_papi for method, _, _, use_papi in calls)
     assert not any("/order" in path.lower() or path.endswith("/leverage") for _, path, _, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_portfolio_margin_account_timestamp_uses_oldest_dependency() -> None:
+    gateway = BinanceFuturesGateway(
+        Settings(_env_file=None, binance_api_key="test-key", binance_api_secret="test-secret")
+    )
+    hedge_returned_at: datetime | None = None
+
+    async def fake_signed_request(method, path, params=None, *, use_papi=False):
+        nonlocal hedge_returned_at
+        if path == "/papi/v1/um/positionSide/dual":
+            await asyncio.sleep(0.03)
+            hedge_returned_at = datetime.now(UTC)
+        return _portfolio_margin_payload(path)
+
+    gateway._signed_request = fake_signed_request  # type: ignore[method-assign]
+    try:
+        result = await gateway.get_portfolio_margin_precheck("ETHUSDC", 100, Decimal("500000"))
+    finally:
+        await gateway.close()
+
+    assert hedge_returned_at is not None
+    assert result["component_observed_at"]["account"] < hedge_returned_at
 
 
 @pytest.mark.asyncio

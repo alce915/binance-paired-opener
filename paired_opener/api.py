@@ -38,6 +38,7 @@ from paired_opener.account_runtime import (
     AccountCredentialsLockedByActiveBatch,
     AccountCredentialsNotConfigured,
     AccountRuntimeManager,
+    KanglongReadOnlyRuntimeManager,
     RepositoryAccountMutationGuard,
 )
 from paired_opener.config import AccountConfig, DEFAULT_LEVERAGE, DEFAULT_TRADING_SYMBOL, Settings, settings
@@ -198,16 +199,18 @@ async def lifespan(app: FastAPI):
         )
         repository.prune_event_retention()
         runtime_manager = AccountRuntimeManager(app_settings, repository)
+        kanglong_readonly_runtime_manager = KanglongReadOnlyRuntimeManager(runtime_manager)
         mutation_guard = RepositoryAccountMutationGuard(repository)
         app.state.settings = app_settings
         app.state.repository = repository
         app.state.runtime_manager = runtime_manager
+        app.state.kanglong_readonly_runtime_manager = kanglong_readonly_runtime_manager
         app.state.kanglong_service = KanglongSimulationService(repository)
         app.state.kanglong_batch_defaults_store = KanglongBatchDefaultsStore(
             app_settings.kanglong_batch_defaults_file,
         )
         app.state.capacity_snapshot_coordinator = CapacitySnapshotCoordinator(
-            runtime_manager,
+            kanglong_readonly_runtime_manager,
             fast_ttl_ms=app_settings.kanglong_capacity_fast_ttl_ms,
             slow_ttl_ms=app_settings.kanglong_capacity_slow_ttl_ms,
             private_concurrency=app_settings.kanglong_capacity_private_concurrency,
@@ -227,7 +230,7 @@ async def lifespan(app: FastAPI):
         )
         app.state.kanglong_batch_executor = KanglongBatchExecutor(
             repository,
-            runtime_manager,
+            kanglong_readonly_runtime_manager,
             credential_store.current_revision,
             app.state.capacity_snapshot_coordinator,
             app_settings,
@@ -1795,7 +1798,8 @@ async def precheck_session(request: SessionPrecheckRequest) -> SessionPrecheckRe
 
 
 @app.post('/sessions/open', response_model=SessionSummary)
-async def create_session(request: OpenSessionRequest) -> SessionSummary:
+async def create_session(request: OpenSessionRequest, raw: Request) -> SessionSummary:
+    require_local_management_request(raw)
     runtime = current_runtime(app)
     if runtime.simulation.is_active():
         _raise_simulation_conflict()
@@ -1811,7 +1815,8 @@ async def create_session(request: OpenSessionRequest) -> SessionSummary:
 
 
 @app.post('/sessions/close', response_model=SessionSummary)
-async def create_close_session(request: CloseSessionRequest) -> SessionSummary:
+async def create_close_session(request: CloseSessionRequest, raw: Request) -> SessionSummary:
+    require_local_management_request(raw)
     runtime = current_runtime(app)
     if runtime.simulation.is_active():
         _raise_simulation_conflict()
@@ -1827,7 +1832,8 @@ async def create_close_session(request: CloseSessionRequest) -> SessionSummary:
 
 
 @app.post('/sessions/single-open', response_model=SessionSummary)
-async def create_single_open_session(request: SingleOpenSessionRequest) -> SessionSummary:
+async def create_single_open_session(request: SingleOpenSessionRequest, raw: Request) -> SessionSummary:
+    require_local_management_request(raw)
     runtime = current_runtime(app)
     if runtime.simulation.is_active():
         _raise_simulation_conflict()
@@ -1843,7 +1849,8 @@ async def create_single_open_session(request: SingleOpenSessionRequest) -> Sessi
 
 
 @app.post('/sessions/single-close', response_model=SessionSummary)
-async def create_single_close_session(request: SingleCloseSessionRequest) -> SessionSummary:
+async def create_single_close_session(request: SingleCloseSessionRequest, raw: Request) -> SessionSummary:
+    require_local_management_request(raw)
     runtime = current_runtime(app)
     if runtime.simulation.is_active():
         _raise_simulation_conflict()
@@ -1889,7 +1896,8 @@ async def get_session_updates(session_id: str, after_event_id: int = Query(defau
 
 
 @app.post('/sessions/{session_id}/pause', response_model=SessionActionResponse)
-async def pause_session(session_id: str) -> SessionActionResponse:
+async def pause_session(session_id: str, raw: Request) -> SessionActionResponse:
+    require_local_management_request(raw)
     service = current_runtime(app).service
     try:
         status = await service.pause_session(session_id)
@@ -1906,7 +1914,8 @@ async def pause_session(session_id: str) -> SessionActionResponse:
 
 
 @app.post('/sessions/{session_id}/resume', response_model=SessionActionResponse)
-async def resume_session(session_id: str) -> SessionActionResponse:
+async def resume_session(session_id: str, raw: Request) -> SessionActionResponse:
+    require_local_management_request(raw)
     service = current_runtime(app).service
     try:
         status = await service.resume_session(session_id)
@@ -1925,7 +1934,8 @@ async def resume_session(session_id: str) -> SessionActionResponse:
 
 
 @app.post('/sessions/{session_id}/abort', response_model=SessionActionResponse)
-async def abort_session(session_id: str) -> SessionActionResponse:
+async def abort_session(session_id: str, raw: Request) -> SessionActionResponse:
+    require_local_management_request(raw)
     service = current_runtime(app).service
     try:
         status = await service.abort_session(session_id)
@@ -2255,6 +2265,8 @@ async def preview_kanglong_batch_capacity(
 def _kanglong_batch_run_payload(stored: dict[str, Any]) -> dict[str, Any]:
     status = str(stored["status"])
     actions = list(stored.get("available_actions") or available_actions_for_status(status))
+    if status == KanglongRunStatus.ABORTED_RECOVERED.value:
+        actions = ["view_report"]
     if status != KanglongRunStatus.NEEDS_ABORT_RECOVER.value:
         actions = [action for action in actions if action != "recover"]
     return _decimal_response_strings(
@@ -2392,7 +2404,12 @@ async def _build_kanglong_batch_plan(
             status_code=409,
             detail={"code": "kanglong_batch_capacity_blocked", "accounts": blocked},
         )
-    rules = await app.state.runtime_manager.current(account_ids[0]).gateway.get_symbol_rules(
+    batch_runtime_manager = getattr(
+        app.state,
+        "kanglong_readonly_runtime_manager",
+        app.state.runtime_manager,
+    )
+    rules = await batch_runtime_manager.current(account_ids[0]).gateway.get_symbol_rules(
         request.symbol.strip().upper()
     )
     return planner.plan_open(
@@ -2672,6 +2689,7 @@ async def _control_kanglong_batch_run(
         "stop": (
             (
                 KanglongRunStatus.RUNNING.value,
+                KanglongRunStatus.PAUSE_PENDING.value,
                 KanglongRunStatus.PAUSED_BY_USER.value,
                 KanglongRunStatus.PAUSED_MARKET_UNSTABLE.value,
                 KanglongRunStatus.PAUSED_PLAN_RECHECK_CHANGED.value,
@@ -2682,6 +2700,49 @@ async def _control_kanglong_batch_run(
     }
     expected, next_status = transitions[action]
     key_hash = stable_payload_hash({"action": action, **request.model_dump(mode="json")})
+    progress = None
+    report = None
+    events = (
+        {
+            "event_type": f"kanglong_batch_{action}_requested",
+            "payload": {"operator": request.operator},
+        },
+    )
+    release_frozen_locks = False
+    mark_accounts_needs_recovery = False
+    if action == "recover":
+        recovered_at = datetime.now(UTC).isoformat()
+        recovery_record = {
+            "operator": request.operator,
+            "release_reason": request.release_reason,
+            "previous_status": stored["status"],
+            "recovered_at": recovered_at,
+        }
+        progress = dict(stored.get("progress") or {})
+        progress["abort_recover"] = recovery_record
+        report = dict(stored.get("report") or {})
+        history = list(report.get("abort_recover_history") or [])
+        history.append(recovery_record)
+        report["abort_recover_history"] = history
+        next_status = KanglongRunStatus.ABORTED_RECOVERED.value
+        events = (
+            {
+                "event_type": "kanglong_batch_abort_recovering",
+                "payload": {
+                    **recovery_record,
+                    "message_key": "events.kanglong.batch_abort_recovering",
+                },
+            },
+            {
+                "event_type": "kanglong_batch_aborted_recovered",
+                "payload": {
+                    **recovery_record,
+                    "message_key": "events.kanglong.batch_aborted_recovered",
+                },
+            },
+        )
+        release_frozen_locks = True
+        mark_accounts_needs_recovery = True
     try:
         response = app.state.repository.commit_kanglong_action(
             run_id=run_id,
@@ -2690,21 +2751,25 @@ async def _control_kanglong_batch_run(
                 expected_plan_version=request.plan_version,
                 expected_action_version=request.expected_action_version,
                 next_status=next_status,
-                available_actions=tuple(available_actions_for_status(next_status)),
-                events=(
-                    {
-                        "event_type": f"kanglong_batch_{action}_requested",
-                        "payload": {"operator": request.operator},
-                    },
+                available_actions=(
+                    ("view_report",)
+                    if action == "recover"
+                    else tuple(available_actions_for_status(next_status))
                 ),
+                progress=progress,
+                report=report,
+                result_grade="unsafe_unclosed" if action == "recover" else None,
+                events=events,
                 increment_action_version=True,
-                acquire_frozen_locks=action in {"resume", "stop", "recover"},
+                acquire_frozen_locks=action in {"resume", "stop"},
                 current_credential_revision=(
                     app.state.account_credential_store.current_revision()
-                    if action in {"resume", "stop", "recover"}
+                    if action in {"resume", "stop"}
                     else None
                 ),
                 lock_ttl_ms=600_000,
+                release_frozen_locks=release_frozen_locks,
+                mark_active_batch_accounts_needs_recovery=mark_accounts_needs_recovery,
             ),
             idempotency_key=request.idempotency_key,
             request_hash=key_hash,
@@ -2712,7 +2777,7 @@ async def _control_kanglong_batch_run(
         )
     except BaseException as exc:
         _raise_batch_action_error(exc)
-    if action in {"pause", "resume", "stop", "recover"}:
+    if action in {"pause", "resume", "stop"}:
         app.state.kanglong_execution_task_registry.wake(run_id)
     latest = app.state.repository.get_kanglong_run(run_id)
     return KanglongBatchRunResponse.model_validate({**_kanglong_batch_run_payload(latest), **response})
@@ -3018,7 +3083,8 @@ async def get_whitelist() -> WhitelistResponse:
 
 
 @app.put('/config/whitelist', response_model=WhitelistResponse)
-async def update_whitelist(request: WhitelistUpdateRequest) -> WhitelistResponse:
+async def update_whitelist(request: WhitelistUpdateRequest, raw: Request) -> WhitelistResponse:
+    require_local_management_request(raw)
     service = current_runtime(app).service
     try:
         symbols = await service.update_whitelist(request.symbols)
@@ -3035,7 +3101,8 @@ async def get_accounts() -> AccountListResponse:
 
 
 @app.post('/config/accounts/select', response_model=AccountSelectResponse)
-async def select_account(request: AccountSelectRequest) -> AccountSelectResponse:
+async def select_account(request: AccountSelectRequest, raw: Request) -> AccountSelectResponse:
+    require_local_management_request(raw)
     runtime_manager: AccountRuntimeManager = app.state.runtime_manager
     try:
         payload = await runtime_manager.switch_account(request.account_id)

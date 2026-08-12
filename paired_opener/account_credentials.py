@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import binascii
 import ctypes
-import getpass
 import hashlib
 import json
 import os
@@ -26,7 +25,6 @@ _FILE_VERSION = 1
 _FILE_ENCODING = "dpapi-current-user"
 _UNCONFIGURED_REVISION = "unconfigured"
 _ACCOUNT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-_SID_PATTERN = re.compile(r"S-\d-(?:\d+-)+\d+")
 
 
 class CredentialStoreUnavailable(RuntimeError):
@@ -158,33 +156,66 @@ def mask_api_key(value: str) -> str:
 def _windows_acl_hardener(path: Path) -> None:
     if os.name != "nt":
         raise OSError("Windows ACL is unavailable")
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    identity = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creation_flags,
+    target_b64 = base64.b64encode(str(path).encode("utf-8")).decode("ascii")
+    is_directory = path.is_dir()
+    # Build and verify the DACL through .NET security objects. The subprocess
+    # result is checked only by exit status, so localized command output cannot
+    # accidentally turn a failed verification into success.
+    script = rf"""
+$ErrorActionPreference = 'Stop'
+$target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{target_b64}'))
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$systemSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+$inheritance = if (${str(is_directory).lower()}) {{
+    [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+}} else {{
+    [Security.AccessControl.InheritanceFlags]::None
+}}
+$propagation = [Security.AccessControl.PropagationFlags]::None
+$allow = [Security.AccessControl.AccessControlType]::Allow
+$acl = if (${str(is_directory).lower()}) {{
+    New-Object Security.AccessControl.DirectorySecurity
+}} else {{
+    New-Object Security.AccessControl.FileSecurity
+}}
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($sid in @($currentSid, $systemSid)) {{
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+        $sid,
+        [Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritance,
+        $propagation,
+        $allow
     )
-    sid_match = _SID_PATTERN.search(identity.stdout)
-    if identity.returncode != 0 or sid_match is None:
-        raise OSError(f"cannot resolve current user SID for {getpass.getuser()}")
+    [void]$acl.AddAccessRule($rule)
+}}
+Set-Acl -LiteralPath $target -AclObject $acl
+$actual = Get-Acl -LiteralPath $target
+if (-not $actual.AreAccessRulesProtected) {{ throw 'credential DACL is not protected' }}
+$rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+$explicit = @($rules | Where-Object {{ -not $_.IsInherited }})
+$expected = @($currentSid.Value, $systemSid.Value) | Select-Object -Unique
+if ($explicit.Count -ne $expected.Count -or $rules.Count -ne $expected.Count) {{ throw 'credential DACL contains unexpected ACEs' }}
+foreach ($rule in $explicit) {{
+    if ($expected -notcontains $rule.IdentityReference.Value) {{ throw 'credential DACL contains an unexpected trustee' }}
+    if ($rule.AccessControlType -ne $allow) {{ throw 'credential DACL contains a deny ACE' }}
+    if (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne
+        [Security.AccessControl.FileSystemRights]::FullControl) {{ throw 'credential DACL is missing FullControl' }}
+    if ($rule.InheritanceFlags -ne $inheritance) {{ throw 'credential DACL inheritance does not match target type' }}
+}}
+"""
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     result = subprocess.run(
         [
-            "icacls",
-            str(path),
-            "/inheritance:r",
-            "/grant:r",
-            f"*{sid_match.group(0)}:(F)",
-            "*S-1-5-18:(F)",
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            base64.b64encode(script.encode("utf-16-le")).decode("ascii"),
         ],
         check=False,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         creationflags=creation_flags,
     )
     if result.returncode != 0:

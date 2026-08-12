@@ -155,3 +155,16 @@ def test_openapi_declares_every_batch_route_and_conflict() -> None:
     assert "operator:" in text
     assert "confirmed_plan_hash:" in text
     assert "paused_plan_stale" not in text
+
+
+def test_openapi_declares_real_session_mutation_security_boundary() -> None:
+    text = Path("docs/openapi/kanglong-batch-simulation.yaml").read_text(encoding="utf-8")
+    for route in (
+        "/sessions/open:",
+        "/sessions/close:",
+        "/sessions/single-open:",
+        "/sessions/single-close:",
+        "/sessions/{session_id}/{action}:",
+    ):
+        assert route in text
+    assert "LocalManagementForbidden:" in text

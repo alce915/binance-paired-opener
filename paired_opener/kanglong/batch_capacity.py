@@ -404,17 +404,20 @@ class CapacitySnapshotCoordinator:
 
     def _attach_rate_limit_observer(self, gateway: Any) -> None:
         delegate = getattr(gateway, "_delegate", gateway)
-        identity = id(delegate)
-        if identity in self._observed_gateway_ids or not hasattr(delegate, "_rate_limit_observer"):
+        # 只读 facade 会为能力隔离隐藏完整 gateway；observer 属性本身已代理到
+        # 稳定的底层 Binance gateway，因此以属性所有者而非临时 facade 的 id 去重。
+        observer_owner = getattr(gateway, "_rate_limit_observer_owner", delegate)
+        identity = id(observer_owner)
+        if identity in self._observed_gateway_ids or not hasattr(gateway, "_rate_limit_observer"):
             return
-        previous = delegate._rate_limit_observer
+        previous = gateway._rate_limit_observer
 
         def combined(observation: RateLimitObservation) -> None:
             self._rate_budget.observe(observation)
             if previous is not None:
                 previous(observation)
 
-        delegate._rate_limit_observer = combined
+        gateway._rate_limit_observer = combined
         self._observed_gateway_ids.add(identity)
 
     def _assemble_snapshot(
@@ -430,28 +433,42 @@ class CapacitySnapshotCoordinator:
         order_book, order_book_source = order_book_result
         payload = private.value
         now = datetime.now(UTC)
+        private_observed_at = payload.get("component_observed_at") or {}
+
+        def private_component(name: str) -> _CachedComponent:
+            observed_at = private_observed_at.get(name)
+            if not isinstance(observed_at, datetime):
+                observed_at = private.observed_at
+            elif observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=UTC)
+            return _CachedComponent(
+                value=private.value,
+                observed_at=observed_at,
+                stored_at=private.stored_at,
+            )
+
         component_specs = {
-            "account": (private, private_source, self._fast_ttl_ms, {
+            "account": (private_component("account"), private_source, self._fast_ttl_ms, {
                 "account_status": payload.get("account_status"),
                 "account_equity": payload.get("account_equity"),
                 "available_balance": payload.get("available_balance"),
             }),
-            "positions": (private, private_source, self._fast_ttl_ms, {
+            "positions": (private_component("positions"), private_source, self._fast_ttl_ms, {
                 "count": len(payload.get("positions") or []),
                 "existing_symbol_exposure": payload.get("existing_symbol_exposure"),
             }),
-            "open_orders": (private, private_source, self._fast_ttl_ms, {
+            "open_orders": (private_component("open_orders"), private_source, self._fast_ttl_ms, {
                 "count": len(payload.get("open_orders") or []),
             }),
-            "symbol_config": (private, private_source, self._slow_ttl_ms, {
+            "symbol_config": (private_component("symbol_config"), private_source, self._slow_ttl_ms, {
                 "current_leverage": payload.get("current_leverage"),
                 "max_notional_value": payload.get("current_symbol_max_notional_value"),
             }),
-            "leverage_bracket": (private, private_source, self._slow_ttl_ms, {
+            "leverage_bracket": (private_component("leverage_bracket"), private_source, self._slow_ttl_ms, {
                 "notional_coef": payload.get("notional_coef"),
                 "bracket_count": len(payload.get("brackets") or []),
             }),
-            "commission_rate": (private, private_source, self._slow_ttl_ms, payload.get("commission_rates") or {}),
+            "commission_rate": (private_component("commission_rate"), private_source, self._slow_ttl_ms, payload.get("commission_rates") or {}),
             "quote": (quote, quote_source, self._fast_ttl_ms, {
                 "bid_price": getattr(quote.value, "bid_price", None),
                 "ask_price": getattr(quote.value, "ask_price", None),

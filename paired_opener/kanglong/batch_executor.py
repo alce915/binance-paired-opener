@@ -60,7 +60,8 @@ class TransportRetryPolicy:
         backoff = Decimal(str(exponential_ms * max(min(self.jitter(), 1.0), 0.0))) / Decimal("1000")
         retry_after = max(Decimal(retry_after_seconds or "0"), Decimal("0"))
         delay = retry_after if http_status == 418 else max(backoff, retry_after)
-        persist = delay > Decimal("30")
+        # run lease 为 30 秒；达到 25 秒即持久化等待，给提交和调度保留余量。
+        persist = delay >= Decimal("25")
         reference = now or datetime.now(UTC)
         return RetryDecision(
             delay_seconds=delay,
@@ -73,7 +74,10 @@ class TransportRetryPolicy:
 
 
 class DuplicateOrderbookSnapshot(RuntimeError):
-    pass
+    def __init__(self, identity: str, *, out_of_order: bool = False) -> None:
+        self.identity = identity
+        self.out_of_order = out_of_order
+        super().__init__(identity)
 
 
 class KanglongBatchExecutor:
@@ -116,13 +120,20 @@ class KanglongBatchExecutor:
             if stored is None:
                 raise
             lease = KanglongLeaseExpectation(lease_token=lease_token, fencing_token=fencing_token)
-            return self._worker_action(
-                stored,
-                next_status=KanglongRunStatus.PAUSED_MARKET_UNSTABLE.value,
-                event_type="kanglong_batch_orderbook_rejected",
-                lease=lease,
-                idempotency_suffix=f"orderbook-rejected:{stable_payload_hash(str(exc))[:16]}",
-            )
+            if exc.out_of_order:
+                return self._worker_action(
+                    stored,
+                    next_status=KanglongRunStatus.PAUSED_MARKET_UNSTABLE.value,
+                    event_type="kanglong_batch_orderbook_rejected",
+                    lease=lease,
+                    idempotency_suffix=f"orderbook-rejected:{stable_payload_hash(str(exc))[:16]}",
+                )
+            account_row = self._repository.get_active_kanglong_batch_account(run_id)
+            if account_row is None:
+                raise
+            plan = KanglongBatchPlan.from_payload(stored["plan"])
+            account = plan.accounts[int(account_row["sequence"])]
+            return await self._handle_transient_no_fill(stored, account, lease)
         except Exception as exc:
             retryable = isinstance(exc, (TimeoutError, ConnectionError)) or (
                 isinstance(exc, TradingError) and exc.retryable
@@ -640,6 +651,9 @@ class KanglongBatchExecutor:
                 "status": account_status,
                 "expected_status": account_row["status"],
             },
+            expected_run_status=stored["status"],
+            expected_action_version=int((stored.get("progress") or {}).get("action_version", 0)),
+            preserve_pending_control=True,
         )
         return self._repository.get_kanglong_run(plan.run_id)
 
@@ -673,19 +687,40 @@ class KanglongBatchExecutor:
         progress = dict(stored.get("progress") or {})
         attempts = int(progress.get("transport_retry_count", 0)) + 1
         progress["transport_retry_count"] = attempts
+        account_row = self._repository.get_kanglong_batch_account(
+            stored["run_id"],
+            account.account_id,
+        )
+        round_index = int(
+            ((progress.get("batch_round_indexes") or {}).get(account.account_id, 0))
+        )
+        pending_operation_id = str(
+            ((progress.get("batch_pending_operation") or {}).get("operation_id") or "")
+        )
+        retry_scope = stable_payload_hash(
+            {
+                "account_id": account.account_id,
+                "account_status": (account_row or {}).get("status"),
+                "round_index": round_index,
+                "pending_operation_id": pending_operation_id,
+            }
+        )[:16]
         if attempts >= self._retry_policy.max_attempts:
             checkpoint = self._repository.latest_kanglong_checkpoint(stored["run_id"])
+            unsafe = bool(progress.get("batch_pending_operation")) or (
+                checkpoint is not None and not bool(checkpoint.get("is_safe"))
+            )
             next_status = (
-                KanglongRunStatus.PAUSED_MARKET_UNSTABLE.value
-                if checkpoint is None or bool(checkpoint.get("is_safe"))
-                else KanglongRunStatus.NEEDS_ABORT_RECOVER.value
+                KanglongRunStatus.NEEDS_ABORT_RECOVER.value
+                if unsafe
+                else KanglongRunStatus.PAUSED_MARKET_UNSTABLE.value
             )
             return self._worker_action(
                 stored,
                 next_status=next_status,
                 event_type="kanglong_batch_retry_exhausted",
                 lease=lease,
-                idempotency_suffix=f"retry-exhausted:{account.account_id}:{attempts}",
+                idempotency_suffix=f"retry-exhausted:{account.account_id}:{retry_scope}:{attempts}",
                 progress=progress,
             )
         decision = self._retry_policy.decide(
@@ -695,21 +730,38 @@ class KanglongBatchExecutor:
         )
         if decision.persist_retry_wait:
             progress["next_wakeup_at"] = decision.next_wakeup_at.isoformat()
-            self._repository.update_kanglong_batch_account(
-                run_id=stored["run_id"],
-                account_id=account.account_id,
-                status="retry_wait",
-                fencing_token=lease.fencing_token,
+            # aligning 是未配平恢复阶段；持久化长等待时必须保留该阶段，
+            # 否则唤醒后会误走常规首腿预检/执行路径。
+            account_transition = (
+                {
+                    "account_id": account.account_id,
+                    "status": "retry_wait",
+                    "expected_status": account_row["status"],
+                }
+                if account_row is not None and account_row["status"] != "aligning"
+                else None
             )
         elif decision.delay_seconds > 0:
+            account_transition = None
             await self._sleep(float(decision.delay_seconds))
+            latest = self._repository.get_kanglong_run(stored["run_id"])
+            if latest is None:
+                raise ValueError("kanglong_batch_run_not_found")
+            if latest["status"] in {
+                KanglongRunStatus.PAUSE_PENDING.value,
+                KanglongRunStatus.STOP_PENDING.value,
+            } and not progress.get("batch_pending_operation"):
+                return latest
+        else:
+            account_transition = None
         return self._commit_worker_progress(
             stored,
             progress,
             lease,
-            idempotency_suffix=f"retry:{account.account_id}:{attempts}",
+            idempotency_suffix=f"retry:{account.account_id}:{retry_scope}:{attempts}",
             event_type="kanglong_batch_transport_retry",
             event_payload={"account_id": account.account_id, "attempt": attempts},
+            batch_account_transition=account_transition,
         )
 
     async def _fresh_orderbook(self, account_id: str, symbol: str) -> OrderbookSnapshot:
@@ -730,7 +782,10 @@ class KanglongBatchExecutor:
             previous_kind, previous_value = str(previous).split(":", 1)
             current_kind, current_value = current.split(":", 1)
             if current_kind == previous_kind == "update" and int(current_value) <= int(previous_value):
-                raise DuplicateOrderbookSnapshot(current)
+                raise DuplicateOrderbookSnapshot(
+                    current,
+                    out_of_order=int(current_value) < int(previous_value),
+                )
             if current == previous:
                 raise DuplicateOrderbookSnapshot(current)
         return snapshot
@@ -939,6 +994,7 @@ class KanglongBatchExecutor:
         idempotency_suffix: str,
         event_type: str,
         event_payload: dict[str, Any],
+        batch_account_transition: dict[str, object] | None = None,
     ) -> dict[str, Any]:
         key = f"worker:{stored['run_id']}:{idempotency_suffix}"
         response = self._repository.commit_kanglong_action(
@@ -951,13 +1007,21 @@ class KanglongBatchExecutor:
                 available_actions=tuple(stored.get("available_actions") or available_actions_for_status(stored["status"])),
                 progress=progress,
                 events=({"event_type": event_type, "payload": event_payload},),
+                preserve_pending_control=True,
+                batch_account_transition=batch_account_transition,
             ),
             idempotency_key=key,
-            request_hash=stable_payload_hash({"key": key, "progress": progress}),
+            request_hash=stable_payload_hash(
+                {
+                    "key": key,
+                    "progress": progress,
+                    "batch_account_transition": batch_account_transition,
+                }
+            ),
             response={"run_id": stored["run_id"]},
             lease_expectation=lease,
         )
-        return {**self._repository.get_kanglong_run(stored["run_id"]), **response}
+        return {**response, **self._repository.get_kanglong_run(stored["run_id"])}
 
     def _worker_action(
         self,
@@ -986,7 +1050,7 @@ class KanglongBatchExecutor:
             response={"run_id": stored["run_id"]},
             lease_expectation=lease,
         )
-        return {**self._repository.get_kanglong_run(stored["run_id"]), **response}
+        return {**response, **self._repository.get_kanglong_run(stored["run_id"])}
 
     def _completion_status(self, run_id: str) -> str:
         rows = self._repository.list_kanglong_batch_accounts(run_id)

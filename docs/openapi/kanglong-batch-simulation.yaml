@@ -4,6 +4,50 @@ info:
   version: 1.0.0
   description: Real-market-driven simulation only; no order write endpoint is permitted.
 paths:
+  /sessions/open:
+    post:
+      operationId: createRealPairedOpenSession
+      security: [{localManagementToken: []}]
+      responses:
+        "200": {description: Real paired-open session created}
+        "403": {$ref: "#/components/responses/LocalManagementForbidden"}
+  /sessions/close:
+    post:
+      operationId: createRealPairedCloseSession
+      security: [{localManagementToken: []}]
+      responses:
+        "200": {description: Real paired-close session created}
+        "403": {$ref: "#/components/responses/LocalManagementForbidden"}
+  /sessions/single-open:
+    post:
+      operationId: createRealSingleOpenSession
+      security: [{localManagementToken: []}]
+      responses:
+        "200": {description: Real single-open session created}
+        "403": {$ref: "#/components/responses/LocalManagementForbidden"}
+  /sessions/single-close:
+    post:
+      operationId: createRealSingleCloseSession
+      security: [{localManagementToken: []}]
+      responses:
+        "200": {description: Real single-close session created}
+        "403": {$ref: "#/components/responses/LocalManagementForbidden"}
+  /sessions/{session_id}/{action}:
+    post:
+      operationId: controlRealSession
+      security: [{localManagementToken: []}]
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema: {type: string}
+        - in: path
+          name: action
+          required: true
+          schema: {type: string, enum: [pause, resume, abort]}
+      responses:
+        "200": {description: Real session control requested}
+        "403": {$ref: "#/components/responses/LocalManagementForbidden"}
   /config/kanglong-batch-defaults:
     get:
       operationId: getKanglongBatchDefaults
@@ -170,6 +214,7 @@ paths:
   /kanglong/batch-simulation/run/{run_id}/{action}:
     post:
       operationId: controlKanglongBatchRun
+      description: recover 将不安全执行链终止为 aborted_recovered，释放批次锁且只保留 view_report；再次执行必须创建新批次计划。
       security: [{localManagementToken: []}]
       parameters:
         - {$ref: "#/components/parameters/RunId"}
@@ -218,6 +263,8 @@ components:
       required: true
       schema: {type: string}
   responses:
+    LocalManagementForbidden:
+      description: Loopback, same-origin, host, or local management token validation failed.
     BatchRun:
       description: Current batch run state
       content:
@@ -390,10 +437,13 @@ components:
         run_id: {type: string}
         status:
           type: string
-          enum: [draft_plan, chain_ready, plan_confirmed, execution_starting, running, pause_pending, paused_by_user, paused_market_unstable, stop_pending, stopped_by_user, completed, completed_with_dust_residual, blocked_plan_stale, paused_plan_recheck_changed, needs_abort_recover]
+          enum: [draft_plan, chain_ready, plan_confirmed, execution_starting, running, pause_pending, paused_by_user, paused_market_unstable, stop_pending, stopped_by_user, completed, completed_with_dust_residual, blocked_plan_stale, paused_plan_recheck_changed, needs_abort_recover, abort_recovering, aborted_recovered]
         plan_version: {type: string}
         action_version: {type: integer, minimum: 0}
-        available_actions: {type: array, items: {type: string}}
+        available_actions:
+          type: array
+          description: 当前批次允许的动作；aborted_recovered 仅返回 view_report。
+          items: {type: string}
         report: {type: object}
         plan: {$ref: "#/components/schemas/KanglongBatchPlan"}
     KanglongBatchAccountPlan:

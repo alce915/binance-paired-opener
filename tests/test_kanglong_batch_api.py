@@ -183,6 +183,7 @@ def test_plan_confirm_execute_is_idempotent_and_uses_one_start_event(tmp_path: P
     token = "batch-actions-token"
     monkeypatch.setattr(api_module.app.state, "settings", settings, raising=False)
     monkeypatch.setattr(api_module.app.state, "runtime_manager", runtimes, raising=False)
+    monkeypatch.setattr(api_module.app.state, "kanglong_readonly_runtime_manager", runtimes, raising=False)
     monkeypatch.setattr(api_module.app.state, "account_credential_store", RevisionStore(), raising=False)
     monkeypatch.setattr(api_module.app.state, "capacity_snapshot_coordinator", coordinator, raising=False)
     monkeypatch.setattr(api_module.app.state, "repository", repository, raising=False)
@@ -259,6 +260,7 @@ def test_confirm_marks_original_plan_stale_when_market_recheck_changes(tmp_path:
     token = "batch-stale-token"
     monkeypatch.setattr(api_module.app.state, "settings", settings, raising=False)
     monkeypatch.setattr(api_module.app.state, "runtime_manager", runtimes, raising=False)
+    monkeypatch.setattr(api_module.app.state, "kanglong_readonly_runtime_manager", runtimes, raising=False)
     monkeypatch.setattr(api_module.app.state, "account_credential_store", RevisionStore(), raising=False)
     monkeypatch.setattr(api_module.app.state, "capacity_snapshot_coordinator", coordinator, raising=False)
     monkeypatch.setattr(api_module.app.state, "repository", repository, raising=False)
@@ -399,6 +401,104 @@ def test_pause_wakes_worker_during_round_interval(tmp_path: Path, monkeypatch) -
     assert response.status_code == 200
     assert response.json()["status"] == "pause_pending"
     assert registry.started == [plan.run_id]
+
+
+def test_stop_can_override_pause_pending(tmp_path: Path, monkeypatch) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    plan = KanglongBatchPlanner().plan_open(
+        account_ids=["a1"], credential_revision="revision-api", symbol="ETHUSDC",
+        preferred_side=PositionSide.LONG, leverage=100, per_leg_notional="1000",
+        reference_price="100", rules=SymbolRules(
+            symbol="ETHUSDC", tick_size=Decimal("0.01"), step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"), min_notional=Decimal("5"), max_leverage=125,
+        ), run_id="stop-overrides-pause-api",
+    )
+    repository.save_batch_plan(plan, status="pause_pending")
+    registry = FakeRegistry()
+    token = "stop-overrides-pause-token"
+    monkeypatch.setattr(api_module.app.state, "repository", repository, raising=False)
+    monkeypatch.setattr(api_module.app.state, "kanglong_execution_task_registry", registry, raising=False)
+    monkeypatch.setattr(api_module.app.state, "account_credential_store", RevisionStore(), raising=False)
+    monkeypatch.setattr(api_module.app.state, "local_management_token", token, raising=False)
+    client = _local_client(token, 50138)
+    try:
+        response = client.post(
+            f"/kanglong/batch-simulation/run/{plan.run_id}/stop",
+            json={"plan_version": plan.plan_version, "expected_action_version": 0,
+                  "idempotency_key": "stop-overrides-pause-0001"},
+        )
+    finally:
+        repository.close()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "stop_pending"
+    assert registry.started == [plan.run_id]
+
+
+def test_batch_recover_records_reason_and_releases_locks(tmp_path: Path, monkeypatch) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    plan = KanglongBatchPlanner().plan_open(
+        account_ids=["a1"], credential_revision="revision-api", symbol="ETHUSDC",
+        preferred_side=PositionSide.LONG, leverage=100, per_leg_notional="1000",
+        reference_price="100", rules=SymbolRules(
+            symbol="ETHUSDC", tick_size=Decimal("0.01"), step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"), min_notional=Decimal("5"), max_leverage=125,
+        ), run_id="batch-abort-recover-api",
+    )
+    repository.save_batch_plan(plan, status="needs_abort_recover")
+    repository._connection.execute(
+        "UPDATE kanglong_batch_accounts SET status = 'second_leg' WHERE run_id = ? AND account_id = ?",
+        (plan.run_id, "a1"),
+    )
+    repository._connection.commit()
+    repository.acquire_kanglong_locks(
+        run_id=plan.run_id, lock_scopes=["kanglong:account:a1"], ttl_ms=60_000,
+    )
+    registry = FakeRegistry()
+    token = "batch-recover-token"
+    monkeypatch.setattr(api_module.app.state, "repository", repository, raising=False)
+    monkeypatch.setattr(api_module.app.state, "kanglong_execution_task_registry", registry, raising=False)
+    monkeypatch.setattr(api_module.app.state, "account_credential_store", RevisionStore(), raising=False)
+    monkeypatch.setattr(api_module.app.state, "local_management_token", token, raising=False)
+    client = _local_client(token, 50139)
+    try:
+        response = client.post(
+            f"/kanglong/batch-simulation/run/{plan.run_id}/recover",
+            json={"plan_version": plan.plan_version, "expected_action_version": 0,
+                  "idempotency_key": "batch-abort-recover-0001", "operator": "tester",
+                  "release_reason": "operator reviewed unsafe checkpoint"},
+        )
+        stored = repository.get_kanglong_run(plan.run_id)
+        account = repository.get_kanglong_batch_account(plan.run_id, "a1")
+        events = repository.list_kanglong_events(plan.run_id)["events"]
+        lock = repository.get_kanglong_lock("kanglong:account:a1")
+        repeated = client.post(
+            f"/kanglong/batch-simulation/run/{plan.run_id}/recover",
+            json={"plan_version": plan.plan_version, "expected_action_version": 0,
+                  "idempotency_key": "batch-abort-recover-0001", "operator": "tester",
+                  "release_reason": "operator reviewed unsafe checkpoint"},
+        )
+    finally:
+        repository.close()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "aborted_recovered"
+    assert response.json()["available_actions"] == ["view_report"]
+    assert stored["progress"]["abort_recover"]["release_reason"] == "operator reviewed unsafe checkpoint"
+    assert stored["report"]["abort_recover_history"][0]["operator"] == "tester"
+    assert [event["event_type"] for event in events[-2:]] == [
+        "kanglong_batch_abort_recovering", "kanglong_batch_aborted_recovered",
+    ]
+    assert [event["payload"]["message_key"] for event in events[-2:]] == [
+        "events.kanglong.batch_abort_recovering", "events.kanglong.batch_aborted_recovered",
+    ]
+    assert account["status"] == "needs_recovery"
+    assert lock is None
+    assert registry.started == []
+
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "aborted_recovered"
+    assert repeated.json()["available_actions"] == ["view_report"]
 
 
 def test_batch_api_exposes_recover_only_for_abort_recovery_state(tmp_path: Path, monkeypatch) -> None:

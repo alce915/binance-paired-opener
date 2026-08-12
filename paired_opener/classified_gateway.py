@@ -14,8 +14,13 @@ _T = TypeVar("_T")
 
 
 class ClassifiedExchangeGateway(ExchangeGateway):
-    def __init__(self, delegate: ExchangeGateway) -> None:
+    def __init__(self, delegate: ExchangeGateway, *, max_attempts: int = 3) -> None:
         self._delegate = delegate
+        self._max_attempts = max(1, int(max_attempts))
+
+    def single_attempt(self) -> "ClassifiedExchangeGateway":
+        """Return a classified view that leaves retry ownership to its caller."""
+        return ClassifiedExchangeGateway(self._delegate, max_attempts=1)
 
     async def close(self) -> None:
         close = getattr(self._delegate, "close", None)
@@ -103,6 +108,8 @@ class ClassifiedExchangeGateway(ExchangeGateway):
             raw_code, raw_message = self._extract_http_error(exc)
             message_lower = (raw_message or "").lower()
             response_context = {"operation": operation, **context}
+            if exc.response is not None:
+                response_context["http_status"] = exc.response.status_code
             retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
             if retry_after is not None:
                 try:
@@ -129,7 +136,7 @@ class ClassifiedExchangeGateway(ExchangeGateway):
                     raw_code=raw_code,
                     raw_message=raw_message,
                     operator_action="检查 API Key、Secret 和签名配置后重试。",
-                    context={"operation": operation, **context},
+                    context=response_context,
                 )
             if (exc.response is not None and exc.response.status_code in {403, 451}) or "forbidden" in message_lower or "permission" in message_lower or "restricted" in message_lower:
                 return self._error(
@@ -140,7 +147,7 @@ class ClassifiedExchangeGateway(ExchangeGateway):
                     raw_code=raw_code,
                     raw_message=raw_message,
                     operator_action="检查 API 权限、账户权限或网络出口地区限制。",
-                    context={"operation": operation, **context},
+                    context=response_context,
                 )
             if str(raw_code) in {"-2019", "-2027"} or "insufficient" in message_lower or "balance" in message_lower or "margin" in message_lower:
                 return self._error(
@@ -151,7 +158,7 @@ class ClassifiedExchangeGateway(ExchangeGateway):
                     raw_code=raw_code,
                     raw_message=raw_message,
                     operator_action="补充保证金或降低下单规模后重试。",
-                    context={"operation": operation, **context},
+                    context=response_context,
                 )
             if (exc.response is not None and exc.response.status_code == 400) or str(raw_code) in {"-1100", "-1101", "-1102", "-1111", "-1116", "-1121"}:
                 return self._error(
@@ -162,7 +169,7 @@ class ClassifiedExchangeGateway(ExchangeGateway):
                     raw_code=raw_code,
                     raw_message=raw_message,
                     operator_action="检查交易对、数量、精度和模式参数。",
-                    context={"operation": operation, **context},
+                    context=response_context,
                 )
             return self._error(
                 "Binance 请求失败。",
@@ -172,7 +179,7 @@ class ClassifiedExchangeGateway(ExchangeGateway):
                 raw_code=raw_code,
                 raw_message=raw_message,
                 operator_action="检查交易所响应和服务日志后重试。",
-                context={"operation": operation, **context},
+                context=response_context,
             )
         if isinstance(exc, httpx.TimeoutException):
             return self._error(
@@ -217,12 +224,12 @@ class ClassifiedExchangeGateway(ExchangeGateway):
 
     async def _call(self, operation: str, func: Callable[[], Awaitable[_T]], **context: Any) -> _T:
         last_error: TradingError | None = None
-        for attempt in range(3):
+        for attempt in range(self._max_attempts):
             try:
                 return await func()
             except Exception as exc:
                 last_error = self._classify_exception(exc, operation=operation, context=context)
-            if last_error.retryable and attempt < 2:
+            if last_error.retryable and attempt + 1 < self._max_attempts:
                 delay = float(attempt + 1) if last_error.category == ErrorCategory.RATE_LIMIT else 0.5 * (attempt + 1)
                 await asyncio.sleep(delay)
                 continue

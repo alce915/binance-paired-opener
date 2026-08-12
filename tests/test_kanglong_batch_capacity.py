@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -245,6 +245,94 @@ async def test_raw_snapshot_collection_does_not_apply_internal_125x_blocker() ->
         "revision-1", "a1", "ETHUSDC"
     )
     assert "requested_leverage_exceeds_bracket" not in snapshot.blocked_reasons
+
+
+@pytest.mark.asyncio
+async def test_private_components_keep_their_actual_response_times() -> None:
+    runtimes = FakeRuntimeManager(["a1"])
+    gateway = runtimes.gateways["a1"]
+    original = gateway.get_portfolio_margin_precheck
+    observed = {
+        "account": datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+        "positions": datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC),
+        "open_orders": datetime(2026, 1, 1, 0, 0, 3, tzinfo=UTC),
+        "symbol_config": datetime(2026, 1, 1, 0, 0, 4, tzinfo=UTC),
+        "leverage_bracket": datetime(2026, 1, 1, 0, 0, 5, tzinfo=UTC),
+        "commission_rate": datetime(2026, 1, 1, 0, 0, 6, tzinfo=UTC),
+    }
+
+    async def precheck_with_component_times(*args, **kwargs):
+        payload = await original(*args, **kwargs)
+        payload["component_observed_at"] = observed
+        return payload
+
+    gateway.get_portfolio_margin_precheck = precheck_with_component_times
+    snapshot = await CapacitySnapshotCoordinator(runtimes).get_snapshot(
+        "revision-1", "a1", "ETHUSDC"
+    )
+
+    for name, observed_at in observed.items():
+        assert snapshot.snapshot_components[name]["observed_at"] == observed_at
+    assert snapshot.oldest_component_at == observed["account"]
+
+
+@pytest.mark.asyncio
+async def test_stale_account_dependency_invalidates_capacity_snapshot() -> None:
+    runtimes = FakeRuntimeManager(["a1"])
+    gateway = runtimes.gateways["a1"]
+    original = gateway.get_portfolio_margin_precheck
+
+    async def precheck_with_stale_account(*args, **kwargs):
+        payload = await original(*args, **kwargs)
+        observed_at = datetime.now(UTC)
+        payload["component_observed_at"] = {
+            "account": observed_at - timedelta(seconds=1),
+            "positions": observed_at,
+            "open_orders": observed_at,
+            "symbol_config": observed_at,
+            "leverage_bracket": observed_at,
+            "commission_rate": observed_at,
+        }
+        return payload
+
+    gateway.get_portfolio_margin_precheck = precheck_with_stale_account
+    snapshot = await CapacitySnapshotCoordinator(runtimes, fast_ttl_ms=100).get_snapshot(
+        "revision-1", "a1", "ETHUSDC"
+    )
+
+    assert snapshot.snapshot_components["account"]["valid"] is False
+    assert snapshot.all_components_fresh is False
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_observer_is_installed_once_for_recreated_facades() -> None:
+    runtimes = FakeRuntimeManager(["a1"])
+    gateway = runtimes.gateways["a1"]
+
+    class Facade:
+        def __init__(self, target):
+            self.target = target
+
+        @property
+        def _rate_limit_observer_owner(self):
+            return self.target
+
+        @property
+        def _rate_limit_observer(self):
+            return self.target._rate_limit_observer
+
+        @_rate_limit_observer.setter
+        def _rate_limit_observer(self, value):
+            self.target._rate_limit_observer = value
+
+    gateway._rate_limit_observer = None
+    coordinator = CapacitySnapshotCoordinator(runtimes)
+    coordinator._attach_rate_limit_observer(Facade(gateway))
+    first = gateway._rate_limit_observer
+    coordinator._attach_rate_limit_observer(Facade(gateway))
+
+    assert gateway._rate_limit_observer is first
+    assert len(coordinator._observed_gateway_ids) == 1
 
 
 @pytest.mark.asyncio

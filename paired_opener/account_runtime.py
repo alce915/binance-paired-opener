@@ -16,6 +16,7 @@ from paired_opener.classified_gateway import ClassifiedExchangeGateway
 from paired_opener.config import AccountConfig, Settings
 from paired_opener.engine import PairedClosingEngine, PairedOpeningEngine
 from paired_opener.market_stream import MarketStreamController
+from paired_opener.kanglong.read_only_gateway import KanglongReadOnlyGateway
 from paired_opener.service import OpenSessionService
 from paired_opener.simulation import SimulationService
 from paired_opener.storage import SqliteRepository
@@ -249,6 +250,28 @@ class AccountRuntimeManager:
 
     async def close(self) -> None:
         await self.aclose()
+
+
+@dataclass(frozen=True, slots=True)
+class KanglongReadOnlyRuntime:
+    account: AccountConfig
+    gateway: KanglongReadOnlyGateway
+
+
+class KanglongReadOnlyRuntimeManager:
+    """仅向亢龙模拟链路暴露行情与账户读取能力。"""
+
+    def __init__(self, runtime_manager: AccountRuntimeManager) -> None:
+        self._runtime_manager = runtime_manager
+
+    def current(self, account_id: str | None = None) -> KanglongReadOnlyRuntime:
+        runtime = self._runtime_manager.current(account_id)
+        return KanglongReadOnlyRuntime(
+            account=runtime.account,
+            # 批次执行器统一拥有重试次数和 Retry-After 调度权，避免网关内层
+            # 先产生不可见的额外请求；旧实盘 runtime 仍保留原三次重试行为。
+            gateway=KanglongReadOnlyGateway(runtime.gateway.single_attempt()),
+        )
 
 
 class AccountCredentialCommitCoordinator:

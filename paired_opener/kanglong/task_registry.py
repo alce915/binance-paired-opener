@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from paired_opener.kanglong.models import KanglongRunStatus, available_actions_for_status
+from paired_opener.storage import KanglongActionMutation
 
 
 _FROZEN_LOCK_TTL_MS = 600_000
@@ -53,6 +54,7 @@ class KanglongExecutionTaskRegistry:
         self._transfer_worker = transfer_worker
         self._logger = logger or logging.getLogger(__name__)
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_wakes: set[str] = set()
         self._wake_handles: dict[str, asyncio.TimerHandle] = {}
         self._accepting = True
         self._shutdown_requested = asyncio.Event()
@@ -73,7 +75,13 @@ class KanglongExecutionTaskRegistry:
         task.add_done_callback(lambda completed: self._finish(run_id, completed))
         return True
 
-    wake = start
+    def wake(self, run_id: str) -> bool:
+        if not self._accepting:
+            return False
+        if run_id in self._tasks:
+            self._pending_wakes.add(run_id)
+            return True
+        return self.start(run_id)
 
     def active_run_ids(self) -> set[str]:
         return set(self._tasks)
@@ -101,6 +109,10 @@ class KanglongExecutionTaskRegistry:
                 continue
             if stored["status"] in _BATCH_WORKER_STATUSES and self.start(stored["run_id"]):
                 scheduled.append(stored["run_id"])
+            elif stored["status"] in _BATCH_WORKER_STATUSES and self._repository.has_live_kanglong_lease(
+                stored["run_id"]
+            ):
+                self._schedule_start_after_live_lease(stored["run_id"])
             elif stored["status"] in _BATCH_LOCK_HOLD_STATUSES:
                 self._schedule_paused_lock_heartbeat(stored["run_id"])
         transfer = self._repository.get_active_kanglong_run()
@@ -163,17 +175,136 @@ class KanglongExecutionTaskRegistry:
                 self._schedule_paused_lock_heartbeat(run_id)
 
     def _finish(self, run_id: str, completed: asyncio.Task[None]) -> None:
-        if self._tasks.get(run_id) is completed:
+        current_task = self._tasks.get(run_id) is completed
+        if current_task:
             self._tasks.pop(run_id, None)
         try:
             completed.result()
         except asyncio.CancelledError:
-            return
+            pass
         except Exception as exc:
             self._logger.error(
                 "kanglong_worker_failed",
                 extra={"run_id": run_id, "error_type": type(exc).__name__},
             )
+            self._record_worker_failure(run_id, exc)
+        finally:
+            if current_task and run_id in self._pending_wakes:
+                self._pending_wakes.discard(run_id)
+                stored = self._repository.get_kanglong_run(run_id)
+                if stored is not None and stored.get("status") in _BATCH_WORKER_STATUSES:
+                    if self._repository.has_live_kanglong_lease(run_id):
+                        self._schedule_start_after_live_lease(run_id)
+                    else:
+                        self.start(run_id)
+
+    def _record_worker_failure(self, run_id: str, exc: Exception) -> None:
+        failed_at = datetime.now(UTC).isoformat()
+        error_type = type(exc).__name__
+        error_code = str(getattr(exc, "code", "kanglong_batch_worker_failed"))
+        for _attempt in range(3):
+            stored = self._repository.get_kanglong_run(run_id)
+            if stored is None or stored.get("status") not in _BATCH_WORKER_STATUSES:
+                if stored is not None and stored.get("status") in _BATCH_PAUSED_LOCK_HOLD_STATUSES:
+                    self._schedule_paused_lock_heartbeat(run_id)
+                return
+            progress = dict(stored.get("progress") or {})
+            checkpoint = self._repository.latest_kanglong_checkpoint(run_id)
+            unsafe = bool(progress.get("batch_pending_operation")) or (
+                checkpoint is not None and not bool(checkpoint.get("is_safe"))
+            )
+            pending_control = stored["status"] in {
+                KanglongRunStatus.PAUSE_PENDING.value,
+                KanglongRunStatus.STOP_PENDING.value,
+            }
+            if unsafe:
+                next_status = KanglongRunStatus.NEEDS_ABORT_RECOVER.value
+            elif stored["status"] == KanglongRunStatus.PAUSE_PENDING.value:
+                next_status = KanglongRunStatus.PAUSED_BY_USER.value
+            elif stored["status"] == KanglongRunStatus.STOP_PENDING.value:
+                next_status = KanglongRunStatus.STOPPED_BY_USER.value
+            else:
+                next_status = KanglongRunStatus.PAUSED_PLAN_RECHECK_CHANGED.value
+            failure = {
+                "code": "kanglong_batch_worker_failed",
+                "error_code": error_code,
+                "error_type": error_type,
+                "failed_at": failed_at,
+                "next_status": next_status,
+            }
+            if pending_control and not unsafe:
+                event_type = (
+                    "kanglong_batch_paused"
+                    if next_status == KanglongRunStatus.PAUSED_BY_USER.value
+                    else "kanglong_batch_stopped"
+                )
+                events = ({"event_type": event_type, "payload": {"source": "worker_control_race"}},)
+                next_progress = None
+                key_prefix = "worker-control"
+            else:
+                events = ({"event_type": "kanglong_batch_worker_failed", "payload": failure},)
+                next_progress = {**progress, "worker_failure": failure}
+                key_prefix = "worker-failure"
+            try:
+                self._repository.commit_kanglong_action(
+                    run_id=run_id,
+                    mutation=KanglongActionMutation(
+                        expected_statuses=(stored["status"],),
+                        expected_plan_version=stored["plan_version"],
+                        expected_action_version=None,
+                        next_status=next_status,
+                        available_actions=tuple(available_actions_for_status(next_status)),
+                        progress=next_progress,
+                        events=events,
+                    ),
+                    idempotency_key=f"{key_prefix}:{run_id}:{stored['status']}:{progress.get('action_version', 0)}:{failed_at}",
+                    request_hash=f"{key_prefix}:{run_id}:{stored['status']}:{progress.get('action_version', 0)}:{error_type}:{failed_at}",
+                    response={"run_id": run_id},
+                )
+            except ValueError:
+                continue
+            if next_status == KanglongRunStatus.STOPPED_BY_USER.value:
+                self._repository.release_kanglong_locks(run_id)
+            else:
+                self._schedule_paused_lock_heartbeat(run_id)
+            return
+        latest = self._repository.get_kanglong_run(run_id)
+        if latest is not None and latest.get("status") in _BATCH_WORKER_STATUSES:
+            self.wake(run_id)
+        elif latest is not None and latest.get("status") in _BATCH_PAUSED_LOCK_HOLD_STATUSES:
+            self._schedule_paused_lock_heartbeat(run_id)
+
+    def _schedule_start_after_live_lease(self, run_id: str) -> None:
+        if not self._accepting or self._shutdown_requested.is_set():
+            return
+        previous = self._wake_handles.pop(run_id, None)
+        if previous is not None:
+            previous.cancel()
+
+        def retry_start() -> None:
+            self._wake_handles.pop(run_id, None)
+            stored = self._repository.get_kanglong_run(run_id)
+            if stored is None or stored.get("status") not in _BATCH_WORKER_STATUSES:
+                if stored is not None and stored.get("status") in _BATCH_PAUSED_LOCK_HOLD_STATUSES:
+                    self._schedule_paused_lock_heartbeat(run_id)
+                return
+            if not self._ensure_frozen_locks(run_id):
+                self._record_lock_conflict(run_id)
+                return
+            if self._repository.has_live_kanglong_lease(run_id):
+                self._schedule_start_after_live_lease(run_id)
+                return
+            self.wake(run_id)
+
+        delay = _FROZEN_LOCK_HEARTBEAT_SECONDS
+        lease = self._repository.get_kanglong_lock(f"kanglong:run:{run_id}:lease")
+        if lease is not None and lease.get("expires_at"):
+            expires_at = datetime.fromisoformat(str(lease["expires_at"]).replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            remaining = max((expires_at.astimezone(UTC) - datetime.now(UTC)).total_seconds(), 0)
+            delay = min(delay, remaining)
+        self._wake_handles[run_id] = asyncio.get_running_loop().call_later(delay, retry_start)
 
     def _schedule_wake(self, run_id: str, wake_at: str) -> None:
         if not self._accepting or self._shutdown_requested.is_set():
@@ -194,7 +325,7 @@ class KanglongExecutionTaskRegistry:
                 else:
                     self._record_lock_conflict(run_id)
                 return
-            self.start(run_id)
+            self.wake(run_id)
 
         self._wake_handles[run_id] = asyncio.get_running_loop().call_later(
             min(delay, _FROZEN_LOCK_HEARTBEAT_SECONDS),
@@ -265,6 +396,7 @@ class KanglongExecutionTaskRegistry:
         for handle in self._wake_handles.values():
             handle.cancel()
         self._wake_handles.clear()
+        self._pending_wakes.clear()
         tasks = tuple(self._tasks.values())
         if not tasks:
             return

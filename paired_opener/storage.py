@@ -39,6 +39,10 @@ class KanglongActionMutation:
     acquire_frozen_locks: bool = False
     current_credential_revision: str | None = None
     lock_ttl_ms: int = 60_000
+    preserve_pending_control: bool = False
+    release_frozen_locks: bool = False
+    mark_active_batch_accounts_needs_recovery: bool = False
+    batch_account_transition: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1300,6 +1304,9 @@ class SqliteRepository:
         is_safe: bool = True,
         lease_expectation: KanglongLeaseExpectation | None = None,
         batch_account_transition: dict[str, Any] | None = None,
+        expected_run_status: str | None = None,
+        expected_action_version: int | None = None,
+        preserve_pending_control: bool = False,
     ) -> dict[str, Any]:
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connection:
@@ -1320,6 +1327,39 @@ class SqliteRepository:
                 ).fetchone()
                 if lease is None or lease["lease_token"] != lease_expectation.lease_token:
                     raise ValueError("kanglong_stale_fencing_token")
+            run_row = self._connection.execute(
+                "SELECT status, available_actions_json, progress_json FROM kanglong_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise ValueError("kanglong_run_not_found")
+            current_status = str(run_row["status"])
+            current_progress = _json_load(run_row["progress_json"], {})
+            current_action_version = int(current_progress.get("action_version", 0))
+            control_pending = current_status in {"pause_pending", "stop_pending"}
+            if expected_run_status is not None and current_status != expected_run_status:
+                if not (preserve_pending_control and control_pending):
+                    raise ValueError("kanglong_run_status_conflict")
+            if expected_action_version is not None and current_action_version != int(expected_action_version):
+                if not (preserve_pending_control and control_pending):
+                    raise ValueError("kanglong_stale_action_version")
+            if preserve_pending_control and control_pending:
+                status = current_status
+                available_actions = _json_load(run_row["available_actions_json"], [])
+                if progress is not None:
+                    progress = {
+                        **progress,
+                        "action_version": current_action_version,
+                    }
+                    if "control_request" in current_progress:
+                        progress["control_request"] = current_progress["control_request"]
+                if report is not None:
+                    report = dict(report)
+                    summary = dict(report.get("report_summary") or {})
+                    summary["summary_status"] = current_status
+                    report["report_summary"] = summary
+                if report_summary is not None:
+                    report_summary = {**report_summary, "summary_status": current_status}
             latest = self._connection.execute(
                 """
                 SELECT * FROM kanglong_run_checkpoints
@@ -1857,7 +1897,9 @@ class SqliteRepository:
                 raise ValueError("kanglong_run_not_found")
             if row["plan_version"] != mutation.expected_plan_version:
                 raise ValueError("plan_version_conflict")
-            if row["status"] not in mutation.expected_statuses:
+            control_pending = row["status"] in {"pause_pending", "stop_pending"}
+            preserve_pending_control = mutation.preserve_pending_control and control_pending
+            if row["status"] not in mutation.expected_statuses and not preserve_pending_control:
                 raise ValueError("kanglong_action_status_conflict")
             stored_progress = _json_load(row["progress_json"], {})
             current_action_version = int(stored_progress.get("action_version", 0))
@@ -1952,6 +1994,14 @@ class SqliteRepository:
                     )
             next_action_version = current_action_version + int(mutation.increment_action_version)
             next_progress = dict(mutation.progress) if mutation.progress is not None else stored_progress
+            next_status = mutation.next_status
+            next_available_actions = list(mutation.available_actions)
+            if preserve_pending_control:
+                next_status = str(row["status"])
+                next_available_actions = _json_load(row["available_actions_json"], [])
+                next_action_version = current_action_version
+                if "control_request" in stored_progress:
+                    next_progress["control_request"] = stored_progress["control_request"]
             next_progress["action_version"] = next_action_version
             plan = mutation.plan if mutation.plan is not None else _json_load(row["plan_json"], {})
             report = mutation.report if mutation.report is not None else _json_load(row["report_json"], {})
@@ -1970,8 +2020,8 @@ class SqliteRepository:
                 WHERE run_id = ?
                 """,
                 (
-                    mutation.next_status,
-                    _json_dumps(list(mutation.available_actions)),
+                    next_status,
+                    _json_dumps(next_available_actions),
                     _json_dumps(plan),
                     _json_dumps(next_progress),
                     next_plan_version,
@@ -1998,6 +2048,67 @@ class SqliteRepository:
                         now,
                     ),
                 )
+            if mutation.batch_account_transition is not None:
+                account_id = str(mutation.batch_account_transition["account_id"])
+                account_status = str(mutation.batch_account_transition["status"])
+                expected_account_status = mutation.batch_account_transition.get("expected_status")
+                account_row = self._connection.execute(
+                    """
+                    SELECT * FROM kanglong_batch_accounts
+                    WHERE run_id = ? AND account_id = ?
+                    """,
+                    (run_id, account_id),
+                ).fetchone()
+                if account_row is None:
+                    raise ValueError("kanglong_batch_account_not_found")
+                if expected_account_status is not None and account_row["status"] != expected_account_status:
+                    raise ValueError("kanglong_batch_account_status_conflict")
+                if account_status != "pending" and int(account_row["sequence"]) > 0:
+                    incomplete = self._connection.execute(
+                        """
+                        SELECT account_id FROM kanglong_batch_accounts
+                        WHERE run_id = ? AND sequence < ?
+                          AND status NOT IN ('completed', 'completed_with_dust')
+                        LIMIT 1
+                        """,
+                        (run_id, int(account_row["sequence"])),
+                    ).fetchone()
+                    if incomplete is not None:
+                        raise ValueError("kanglong_batch_cursor_out_of_order")
+                started_at = account_row["started_at"]
+                if account_status not in {"pending", "blocked_precheck"} and started_at is None:
+                    started_at = now
+                completed_at = (
+                    now
+                    if account_status in {"completed", "completed_with_dust"}
+                    else account_row["completed_at"]
+                )
+                self._connection.execute(
+                    """
+                    UPDATE kanglong_batch_accounts
+                    SET status = ?, started_at = ?, completed_at = ?
+                    WHERE run_id = ? AND account_id = ?
+                    """,
+                    (account_status, started_at, completed_at, run_id, account_id),
+                )
+            if mutation.mark_active_batch_accounts_needs_recovery:
+                self._connection.execute(
+                    """
+                    UPDATE kanglong_batch_accounts
+                    SET status = 'needs_recovery'
+                    WHERE run_id = ?
+                      AND status NOT IN ('completed', 'completed_with_dust', 'stopped', 'needs_recovery')
+                    """,
+                    (run_id,),
+                )
+            if mutation.release_frozen_locks:
+                self._connection.execute(
+                    """
+                    DELETE FROM kanglong_locks
+                    WHERE run_id = ? AND (lease_token IS NULL OR lease_token = '')
+                    """,
+                    (run_id,),
+                )
             if "after_run_update_before_idempotency_insert" in self._test_failpoints:
                 raise RuntimeError("injected crash: after_run_update_before_idempotency_insert")
             latest_event_id = int(
@@ -2008,7 +2119,7 @@ class SqliteRepository:
             )
             stored_response: dict[str, object] = {
                 **response,
-                "status": mutation.next_status,
+                "status": next_status,
                 "action_version": next_action_version,
                 "latest_event_id": latest_event_id,
             }

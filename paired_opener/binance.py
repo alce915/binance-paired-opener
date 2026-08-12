@@ -485,23 +485,35 @@ class BinanceFuturesGateway(ExchangeGateway):
         target = symbol.upper()
         if requested_leverage <= 0 or additional_gross_notional < 0:
             raise ValueError("requested leverage and notional must be positive")
+
+        async def observe(awaitable):
+            value = await awaitable
+            return value, datetime.now(UTC)
+
         (
-            account_payload,
-            hedge_payload,
-            symbol_config_payload,
-            bracket_payload,
-            positions_payload,
-            open_orders,
-            commission_rates,
+            account_result,
+            hedge_result,
+            symbol_config_result,
+            bracket_result,
+            positions_result,
+            open_orders_result,
+            commission_result,
         ) = await asyncio.gather(
-            self._signed_request("GET", "/papi/v1/account", use_papi=True),
-            self._signed_request("GET", "/papi/v1/um/positionSide/dual", use_papi=True),
-            self._signed_request("GET", "/papi/v1/um/symbolConfig", {"symbol": target}, use_papi=True),
-            self._signed_request("GET", "/papi/v1/um/leverageBracket", {"symbol": target}, use_papi=True),
-            self._signed_request("GET", "/papi/v1/um/positionRisk", {"symbol": target}, use_papi=True),
-            self.get_portfolio_margin_open_orders(target),
-            self.get_commission_rates(target),
+            observe(self._signed_request("GET", "/papi/v1/account", use_papi=True)),
+            observe(self._signed_request("GET", "/papi/v1/um/positionSide/dual", use_papi=True)),
+            observe(self._signed_request("GET", "/papi/v1/um/symbolConfig", {"symbol": target}, use_papi=True)),
+            observe(self._signed_request("GET", "/papi/v1/um/leverageBracket", {"symbol": target}, use_papi=True)),
+            observe(self._signed_request("GET", "/papi/v1/um/positionRisk", {"symbol": target}, use_papi=True)),
+            observe(self.get_portfolio_margin_open_orders(target)),
+            observe(self.get_commission_rates(target)),
         )
+        account_payload, account_observed_at = account_result
+        hedge_payload, hedge_observed_at = hedge_result
+        symbol_config_payload, symbol_config_observed_at = symbol_config_result
+        bracket_payload, bracket_observed_at = bracket_result
+        positions_payload, positions_observed_at = positions_result
+        open_orders, open_orders_observed_at = open_orders_result
+        commission_rates, commission_observed_at = commission_result
         if not isinstance(account_payload, dict) or not isinstance(hedge_payload, dict):
             raise ExchangeStateError("Binance portfolio-margin account response is invalid")
         symbol_config = self._select_symbol_payload(symbol_config_payload, target)
@@ -560,6 +572,15 @@ class BinanceFuturesGateway(ExchangeGateway):
             "positions": positions,
             "open_orders": open_orders,
             "commission_rates": commission_rates,
+            "component_observed_at": {
+                # Account validity also depends on the hedge-mode response.
+                "account": min(account_observed_at, hedge_observed_at),
+                "positions": positions_observed_at,
+                "open_orders": open_orders_observed_at,
+                "symbol_config": symbol_config_observed_at,
+                "leverage_bracket": bracket_observed_at,
+                "commission_rate": commission_observed_at,
+            },
             "blocked_reasons": blockers,
             "ok": not blockers,
         }

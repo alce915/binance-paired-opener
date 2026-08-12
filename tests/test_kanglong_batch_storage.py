@@ -467,6 +467,48 @@ def test_action_failpoint_rolls_back_run_event_and_idempotency(tmp_path: Path) -
     assert remembered is None
 
 
+def test_retry_wait_transition_rolls_back_with_run_progress_and_event(tmp_path: Path) -> None:
+    repository = SqliteRepository(tmp_path / "db.sqlite3")
+    try:
+        plan = _plan(run_id="retry-wait-atomic", account_ids=("a1",))
+        repository.save_batch_plan(plan, status="running")
+        repository.enable_failpoint("after_run_update_before_idempotency_insert")
+        with pytest.raises(RuntimeError, match="injected crash"):
+            repository.commit_kanglong_action(
+                run_id=plan.run_id,
+                mutation=KanglongActionMutation(
+                    expected_statuses=("running",),
+                    expected_plan_version=plan.plan_version,
+                    expected_action_version=None,
+                    next_status="running",
+                    available_actions=("pause", "stop", "view_report"),
+                    progress={"next_wakeup_at": "2026-08-12T01:00:00+00:00", "transport_retry_count": 1},
+                    events=({"event_type": "kanglong_batch_transport_retry", "payload": {}},),
+                    batch_account_transition={
+                        "account_id": "a1",
+                        "status": "retry_wait",
+                        "expected_status": "pending",
+                    },
+                ),
+                idempotency_key="retry-wait-atomic-0001",
+                request_hash="retry-wait-atomic-hash",
+                response={"run_id": plan.run_id},
+            )
+        stored = repository.get_kanglong_run(plan.run_id)
+        account = repository.get_kanglong_batch_account(plan.run_id, "a1")
+        event_count = repository.latest_kanglong_event_id(plan.run_id)
+        remembered = repository.get_kanglong_idempotency(
+            "retry-wait-atomic-0001", "retry-wait-atomic-hash",
+        )
+    finally:
+        repository.close()
+
+    assert stored["progress"].get("next_wakeup_at") is None
+    assert account["status"] == "pending"
+    assert event_count == 0
+    assert remembered is None
+
+
 def test_worker_action_rejects_stale_fencing_token(tmp_path: Path) -> None:
     repository = SqliteRepository(tmp_path / "db.sqlite3")
     try:

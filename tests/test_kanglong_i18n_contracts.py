@@ -285,8 +285,13 @@ def test_kanglong_batch_and_credential_ui_copy_is_complete() -> None:
         "console.kanglong.batch.current_leverage_used",
         "console.kanglong.batch.close_capacity_note",
         "console.kanglong.batch.cost_summary",
+        "console.kanglong.batch.action.recover",
+        "console.kanglong.batch.recover_reason_prompt",
+        "console.kanglong.batch.recover_reason_required",
         "events.kanglong.batch_plan_confirmed",
         "events.kanglong.batch_execution_starting",
+        "events.kanglong.batch_abort_recovering",
+        "events.kanglong.batch_aborted_recovered",
         "reasons.kanglong.batch_capacity_blocked",
         "reasons.kanglong.credential_revision_conflict",
         "reasons.kanglong.action_version_conflict",
@@ -294,6 +299,8 @@ def test_kanglong_batch_and_credential_ui_copy_is_complete() -> None:
     assert required.issubset(catalog)
     assert event_registry()["kanglong_batch_plan_confirmed"]["key"] == "events.kanglong.batch_plan_confirmed"
     assert event_registry()["kanglong_batch_execution_starting"]["key"] == "events.kanglong.batch_execution_starting"
+    assert event_registry()["kanglong_batch_abort_recovering"]["key"] == "events.kanglong.batch_abort_recovering"
+    assert event_registry()["kanglong_batch_aborted_recovered"]["key"] == "events.kanglong.batch_aborted_recovered"
     assert reason_registry()["kanglong_batch_capacity_blocked"]["key"] == "reasons.kanglong.batch_capacity_blocked"
     assert reason_registry()["credential_revision_conflict"]["key"] == "reasons.kanglong.credential_revision_conflict"
     assert reason_registry()["action_version_conflict"]["key"] == "reasons.kanglong.action_version_conflict"
